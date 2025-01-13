@@ -571,6 +571,12 @@ pub enum ClientExtension {
     CertificateCompressionAlgorithms(Vec<CertificateCompressionAlgorithm>),
     EncryptedClientHello(EncryptedClientHello),
     EncryptedClientHelloOuterExtensions(Vec<ExtensionType>),
+    ReservedGrease(),
+    SignedCertificateTimestamp(),
+    DelegatedCredentials(PayloadU16),
+    RecordSizeLimit(u16),
+    ApplicationSettings(PayloadU16),
+    RenegotiationInfo(PayloadU8),
     AuthorityNames(Vec<DistinguishedName>),
     Unknown(UnknownExtension),
 }
@@ -601,6 +607,12 @@ impl ClientExtension {
             Self::EncryptedClientHelloOuterExtensions(_) => {
                 ExtensionType::EncryptedClientHelloOuterExtensions
             }
+            Self::ReservedGrease() => ExtensionType::ReservedGrease,
+            Self::DelegatedCredentials(_) => ExtensionType::DelegatedCredentials,
+            Self::RecordSizeLimit(_) => ExtensionType::RecordSizeLimit,
+            Self::SignedCertificateTimestamp() => ExtensionType::SignedCertificateTimestamp,
+            Self::ApplicationSettings(_) => ExtensionType::ApplicationSettings,
+            Self::RenegotiationInfo(_) => ExtensionType::RenegotiationInfo,
             Self::AuthorityNames(_) => ExtensionType::CertificateAuthorities,
             Self::Unknown(ref r) => r.typ,
         }
@@ -636,6 +648,12 @@ impl Codec<'_> for ClientExtension {
             Self::CertificateCompressionAlgorithms(ref r) => r.encode(nested.buf),
             Self::EncryptedClientHello(ref r) => r.encode(nested.buf),
             Self::EncryptedClientHelloOuterExtensions(ref r) => r.encode(nested.buf),
+            Self::ReservedGrease() => {}
+            Self::SignedCertificateTimestamp() => {}
+            Self::DelegatedCredentials(ref r) => r.encode(nested.buf),
+            Self::RecordSizeLimit(ref r) => r.encode(nested.buf),
+            Self::ApplicationSettings(ref r) => r.encode(nested.buf),
+            Self::RenegotiationInfo(ref r) => r.encode(nested.buf),
             Self::AuthorityNames(ref r) => r.encode(nested.buf),
             Self::Unknown(ref r) => r.encode(nested.buf),
         }

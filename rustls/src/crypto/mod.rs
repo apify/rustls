@@ -2,10 +2,19 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Debug;
+#[cfg(feature = "impit")]
+use emulation::{
+    CHROME_CIPHER_SUITES, CHROME_SIGNATURE_VERIFICATION_ALGOS, FIREFOX_CIPHER_SUITES,
+    FIREFOX_SIGNATURE_VERIFICATION_ALGOS,
+};
 
 use pki_types::PrivateKeyDer;
 use zeroize::Zeroize;
 
+#[cfg(feature = "impit")]
+use crate::client::builder::BrowserType;
+#[cfg(feature = "impit")]
+use crate::client::BrowserEmulator;
 use crate::msgs::ffdhe_groups::FfdheGroup;
 use crate::sign::SigningKey;
 pub use crate::webpki::{
@@ -28,6 +37,9 @@ pub mod ring;
 /// aws-lc-rs-based CryptoProvider.
 #[cfg(feature = "aws_lc_rs")]
 pub mod aws_lc_rs;
+
+/// retch-specific CryptoProvider.
+pub mod emulation;
 
 /// TLS message encryption/decryption interfaces.
 pub mod cipher;
@@ -216,7 +228,61 @@ pub struct CryptoProvider {
     pub key_provider: &'static dyn KeyProvider,
 }
 
+/// Convenience builder for `CryptoProvider`.
+#[cfg(feature = "impit")]
+pub struct CryptoProviderBuilder {
+    browser_emulator: Option<BrowserEmulator>,
+}
+
+#[cfg(feature = "impit")]
+impl CryptoProviderBuilder {
+    /// Sets the browser emulator to use for this provider.
+    pub fn with_browser_emulator(mut self, browser_emulator: &BrowserEmulator) -> Self {
+        self.browser_emulator = Some(browser_emulator.clone());
+        self
+    }
+
+    /// Builds the `CryptoProvider`.
+    pub fn build(self) -> CryptoProvider {
+        match self.browser_emulator {
+            Some(BrowserEmulator {
+                browser_type: BrowserType::Chrome,
+                version: _,
+            }) => {
+                let provider = CryptoProvider {
+                    cipher_suites: CHROME_CIPHER_SUITES.to_vec(),
+                    signature_verification_algorithms: CHROME_SIGNATURE_VERIFICATION_ALGOS,
+                    ..aws_lc_rs::default_provider()
+                };
+
+                provider
+            }
+            Some(BrowserEmulator {
+                browser_type: BrowserType::Firefox,
+                version: _,
+            }) => {
+                let provider = CryptoProvider {
+                    cipher_suites: FIREFOX_CIPHER_SUITES.to_vec(),
+                    signature_verification_algorithms: FIREFOX_SIGNATURE_VERIFICATION_ALGOS,
+                    ..aws_lc_rs::default_provider()
+                };
+
+                provider
+            }
+            None => aws_lc_rs::default_provider(),
+        }
+    }
+}
+
 impl CryptoProvider {
+    /// Returns a new `CryptoProviderBuilder`.
+    #[cfg(feature = "impit")]
+    pub fn builder() -> CryptoProviderBuilder {
+        CryptoProviderBuilder {
+            browser_emulator: None,
+        }
+    }
+
     /// Sets this `CryptoProvider` as the default for this process.
     ///
     /// This can be called successfully at most once in any process execution.
