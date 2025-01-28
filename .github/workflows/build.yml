@@ -469,7 +469,6 @@ jobs:
       - run: ./admin/clippy -- --allow clippy::disallowed_types --allow clippy::incompatible_msrv
       - run: cargo clippy -p rustls
 
-
   clippy-nightly:
     name: Clippy (Nightly)
     runs-on: ubuntu-latest

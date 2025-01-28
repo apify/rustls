@@ -29,7 +29,7 @@ ring = ["dep:ring", "webpki/ring"]
 std = ["webpki/std", "pki-types/std", "once_cell/std"]
 tls12 = []
 zlib = ["dep:zlib-rs"]
-impit = ["aws_lc_rs","ring","brotli"]
+impit = ["aws_lc_rs", "ring", "brotli"]
 
 [build-dependencies]
 rustversion = { version = "1.0.6", optional = true }
@@ -48,7 +48,6 @@ webpki = { workspace = true }
 pki-types = { workspace = true }
 zeroize = { workspace = true }
 zlib-rs = { workspace = true, optional = true }
-
 
 [dev-dependencies]
 base64 = { workspace = true }
