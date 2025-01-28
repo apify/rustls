@@ -1,6 +1,5 @@
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Deref;
@@ -43,6 +42,7 @@ use crate::msgs::handshake::{
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
+use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::{NamedGroup, SupportedCipherSuite};
 
@@ -375,10 +375,14 @@ fn emit_client_hello_for_retry(
         debug_assert!(support_tls13);
         let mut shares = vec![KeyShareEntry::new(key_share.group(), key_share.pub_key())];
 
-        if retryreq.is_none() {
-            // Only for the initial client hello, see if we can send a second KeyShare
-            // for "free".  We only do this if the same algorithm is also supported
-            // separately by our provider for this version (`find_kx_group` looks that up).
+        if !retryreq
+            .map(|rr| rr.requested_key_share_group().is_some())
+            .unwrap_or_default()
+        {
+            // Only for the initial client hello, or a HRR that does not specify a kx group,
+            // see if we can send a second KeyShare for "free".  We only do this if the same
+            // algorithm is also supported separately by our provider for this version
+            // (`find_kx_group` looks that up).
             if let Some((component_group, component_share)) =
                 key_share
                     .hybrid_component()
@@ -1055,13 +1059,24 @@ impl ExpectServerHelloOrHelloRetryRequest {
 
         // A retry request is illegal if it contains no cookie and asks for
         // retry of a group we already sent.
-        if cookie.is_none() && req_group == Some(offered_key_share.group()) {
-            return Err({
-                cx.common.send_fatal_alert(
-                    AlertDescription::IllegalParameter,
-                    PeerMisbehaved::IllegalHelloRetryRequestWithOfferedGroup,
-                )
-            });
+        let config = &self.next.input.config;
+
+        if let (None, Some(req_group)) = (cookie, req_group) {
+            let offered_hybrid = offered_key_share
+                .hybrid_component()
+                .and_then(|(group_name, _)| {
+                    config.find_kx_group(group_name, ProtocolVersion::TLSv1_3)
+                })
+                .map(|skxg| skxg.name());
+
+            if req_group == offered_key_share.group() || Some(req_group) == offered_hybrid {
+                return Err({
+                    cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::IllegalHelloRetryRequestWithOfferedGroup,
+                    )
+                });
+            }
         }
 
         // Or has an empty cookie.
@@ -1142,7 +1157,6 @@ impl ExpectServerHelloOrHelloRetryRequest {
         }
 
         // Or asks us to use a ciphersuite we didn't offer.
-        let config = &self.next.input.config;
         let Some(cs) = config.find_cipher_suite(hrr.cipher_suite) else {
             return Err({
                 cx.common.send_fatal_alert(

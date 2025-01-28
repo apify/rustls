@@ -3,13 +3,14 @@
 #![allow(clippy::duplicate_mod)]
 
 use std::fmt::Debug;
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, BufRead, IoSlice, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::{fmt, mem};
 
 use pki_types::{CertificateDer, IpAddr, ServerName, UnixTime};
+
 use rustls::client::{verify_server_cert_signed_by_trust_anchor, ResolvesClientCert, Resumption};
 use rustls::crypto::{ActiveKeyExchange, CryptoProvider, SharedSecret, SupportedKxGroup};
 use rustls::internal::msgs::base::Payload;
@@ -36,7 +37,7 @@ use rustls::{
     ConnectionCommon, ConnectionTrafficSecrets, ContentType, DistinguishedName, Error,
     HandshakeKind, HandshakeType, InconsistentKeys, InvalidMessage, KeyLog, NamedGroup,
     PeerIncompatible, PeerMisbehaved, ProtocolVersion, ServerConfig, ServerConnection, SideData,
-    SignatureScheme, Stream, StreamOwned, SupportedCipherSuite,
+    SignatureScheme, Stream, StreamOwned, SupportedCipherSuite, SupportedProtocolVersion,
 };
 
 use super::*;
@@ -609,6 +610,18 @@ fn check_read_err(reader: &mut dyn io::Read, err_kind: io::ErrorKind) {
     assert!(matches!(err, err  if err.kind()  == err_kind))
 }
 
+fn check_fill_buf(reader: &mut dyn io::BufRead, bytes: &[u8]) {
+    let b = reader.fill_buf().unwrap();
+    assert_eq!(b, bytes);
+    let len = b.len();
+    reader.consume(len);
+}
+
+fn check_fill_buf_err(reader: &mut dyn io::BufRead, err_kind: io::ErrorKind) {
+    let err = reader.fill_buf().unwrap_err();
+    assert!(matches!(err, err  if err.kind()  == err_kind))
+}
+
 #[cfg(read_buf)]
 fn check_read_buf(reader: &mut dyn io::Read, bytes: &[u8]) {
     use core::io::BorrowedBuf;
@@ -904,10 +917,6 @@ fn server_can_get_client_cert_after_resumption() {
 
 #[test]
 fn resumption_combinations() {
-    let expected_kx = match provider_is_fips() {
-        true => NamedGroup::secp256r1,
-        false => NamedGroup::X25519,
-    };
     for kt in ALL_KEY_TYPES {
         let server_config = make_server_config(*kt);
         for version in rustls::ALL_VERSIONS {
@@ -915,6 +924,8 @@ fn resumption_combinations() {
             let (mut client, mut server) =
                 make_pair_for_configs(client_config.clone(), server_config.clone());
             do_handshake(&mut client, &mut server);
+
+            let expected_kx = expected_kx_for_version(version);
 
             assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
             assert_eq!(server.handshake_kind(), Some(HandshakeKind::Full));
@@ -2446,6 +2457,37 @@ fn client_respects_buffer_limit_post_handshake() {
     check_read(&mut server.reader(), b"01234567890123456789012345");
 }
 
+#[test]
+fn buf_read() {
+    let (mut client, mut server) = make_pair(KeyType::Rsa2048);
+
+    do_handshake(&mut client, &mut server);
+
+    // Write two separate messages
+    assert_eq!(client.writer().write(b"hello").unwrap(), 5);
+    transfer(&mut client, &mut server);
+    assert_eq!(client.writer().write(b"world").unwrap(), 5);
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+
+    let mut reader = server.reader();
+    // fill_buf() returns each record separately (this is an implementation detail)
+    assert_eq!(reader.fill_buf().unwrap(), b"hello");
+    // partially consuming the buffer is OK
+    reader.consume(1);
+    assert_eq!(reader.fill_buf().unwrap(), b"ello");
+    // Read::read is compatible with BufRead
+    let mut b = [0u8; 2];
+    reader.read_exact(&mut b).unwrap();
+    assert_eq!(b, *b"el");
+    assert_eq!(reader.fill_buf().unwrap(), b"lo");
+    reader.consume(2);
+    // once the first packet is consumed, the next one is available
+    assert_eq!(reader.fill_buf().unwrap(), b"world");
+    reader.consume(5);
+    check_fill_buf_err(&mut reader, io::ErrorKind::WouldBlock);
+}
+
 struct OtherSession<'a, C, S>
 where
     C: DerefMut + Deref<Target = ConnectionCommon<S>>,
@@ -2580,6 +2622,20 @@ fn server_read_returns_wouldblock_when_no_data() {
 fn client_read_returns_wouldblock_when_no_data() {
     let (mut client, _) = make_pair(KeyType::Rsa2048);
     assert!(matches!(client.reader().read(&mut [0u8; 1]),
+                     Err(err) if err.kind() == io::ErrorKind::WouldBlock));
+}
+
+#[test]
+fn server_fill_buf_returns_wouldblock_when_no_data() {
+    let (_, mut server) = make_pair(KeyType::Rsa2048);
+    assert!(matches!(server.reader().fill_buf(),
+                     Err(err) if err.kind() == io::ErrorKind::WouldBlock));
+}
+
+#[test]
+fn client_fill_buf_returns_wouldblock_when_no_data() {
+    let (mut client, _) = make_pair(KeyType::Rsa2048);
+    assert!(matches!(client.reader().fill_buf(),
                      Err(err) if err.kind() == io::ErrorKind::WouldBlock));
 }
 
@@ -2911,6 +2967,8 @@ fn client_stream_read() {
         test_client_stream_read(StreamKind::Ref, ReadKind::BorrowedBuf);
         test_client_stream_read(StreamKind::Owned, ReadKind::BorrowedBuf);
     }
+    test_client_stream_read(StreamKind::Ref, ReadKind::BufRead);
+    test_client_stream_read(StreamKind::Owned, ReadKind::BufRead);
 }
 
 #[test]
@@ -2922,6 +2980,8 @@ fn server_stream_read() {
         test_server_stream_read(StreamKind::Ref, ReadKind::BorrowedBuf);
         test_server_stream_read(StreamKind::Owned, ReadKind::BorrowedBuf);
     }
+    test_server_stream_read(StreamKind::Ref, ReadKind::BufRead);
+    test_server_stream_read(StreamKind::Owned, ReadKind::BufRead);
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -2929,9 +2989,10 @@ enum ReadKind {
     Buf,
     #[cfg(read_buf)]
     BorrowedBuf,
+    BufRead,
 }
 
-fn test_stream_read(read_kind: ReadKind, mut stream: impl Read, data: &[u8]) {
+fn test_stream_read(read_kind: ReadKind, mut stream: impl BufRead, data: &[u8]) {
     match read_kind {
         ReadKind::Buf => {
             check_read(&mut stream, data);
@@ -2941,6 +3002,10 @@ fn test_stream_read(read_kind: ReadKind, mut stream: impl Read, data: &[u8]) {
         ReadKind::BorrowedBuf => {
             check_read_buf(&mut stream, data);
             check_read_buf_err(&mut stream, io::ErrorKind::UnexpectedEof)
+        }
+        ReadKind::BufRead => {
+            check_fill_buf(&mut stream, data);
+            check_fill_buf_err(&mut stream, io::ErrorKind::UnexpectedEof)
         }
     }
 }
@@ -2955,7 +3020,7 @@ fn test_client_stream_read(stream_kind: StreamKind, read_kind: ReadKind) {
             let mut pipe = OtherSession::new(&mut server);
             transfer_eof(&mut client);
 
-            let stream: Box<dyn Read> = match stream_kind {
+            let stream: Box<dyn BufRead> = match stream_kind {
                 StreamKind::Ref => Box::new(Stream::new(&mut client, &mut pipe)),
                 StreamKind::Owned => Box::new(StreamOwned::new(client, pipe)),
             };
@@ -2975,7 +3040,7 @@ fn test_server_stream_read(stream_kind: StreamKind, read_kind: ReadKind) {
             let mut pipe = OtherSession::new(&mut client);
             transfer_eof(&mut server);
 
-            let stream: Box<dyn Read> = match stream_kind {
+            let stream: Box<dyn BufRead> = match stream_kind {
                 StreamKind::Ref => Box::new(Stream::new(&mut server, &mut pipe)),
                 StreamKind::Owned => Box::new(StreamOwned::new(server, pipe)),
             };
@@ -3710,16 +3775,12 @@ fn test_ciphersuites() -> Vec<(
 
 #[test]
 fn negotiated_ciphersuite_default() {
-    let expected_kx = match provider_is_fips() {
-        true => NamedGroup::secp256r1,
-        false => NamedGroup::X25519,
-    };
     for kt in ALL_KEY_TYPES {
         do_suite_and_kx_test(
             make_client_config(*kt),
             make_server_config(*kt),
             find_suite(CipherSuite::TLS13_AES_256_GCM_SHA384),
-            expected_kx,
+            expected_kx_for_version(&rustls::version::TLS13),
             ProtocolVersion::TLSv1_3,
         );
     }
@@ -3735,10 +3796,6 @@ fn all_suites_covered() {
 
 #[test]
 fn negotiated_ciphersuite_client() {
-    let expected_kx = match provider_is_fips() {
-        true => NamedGroup::secp256r1,
-        false => NamedGroup::X25519,
-    };
     for (version, kt, suite) in test_ciphersuites() {
         let scs = find_suite(suite);
         let client_config = finish_client_config(
@@ -3758,7 +3815,7 @@ fn negotiated_ciphersuite_client() {
             client_config,
             make_server_config(kt),
             scs,
-            expected_kx,
+            expected_kx_for_version(version),
             version.version,
         );
     }
@@ -3766,10 +3823,6 @@ fn negotiated_ciphersuite_client() {
 
 #[test]
 fn negotiated_ciphersuite_server() {
-    let expected_kx = match provider_is_fips() {
-        true => NamedGroup::secp256r1,
-        false => NamedGroup::X25519,
-    };
     for (version, kt, suite) in test_ciphersuites() {
         let scs = find_suite(suite);
         let server_config = finish_server_config(
@@ -3789,7 +3842,7 @@ fn negotiated_ciphersuite_server() {
             make_client_config(kt),
             server_config,
             scs,
-            expected_kx,
+            expected_kx_for_version(version),
             version.version,
         );
     }
@@ -3797,10 +3850,6 @@ fn negotiated_ciphersuite_server() {
 
 #[test]
 fn negotiated_ciphersuite_server_ignoring_client_preference() {
-    let expected_kx = match provider_is_fips() {
-        true => NamedGroup::secp256r1,
-        false => NamedGroup::X25519,
-    };
     for (version, kt, suite) in test_ciphersuites() {
         let scs = find_suite(suite);
         let scs_other = if scs.suite() == CipherSuite::TLS13_AES_256_GCM_SHA384 {
@@ -3839,9 +3888,22 @@ fn negotiated_ciphersuite_server_ignoring_client_preference() {
             client_config,
             server_config,
             scs,
-            expected_kx,
+            expected_kx_for_version(version),
             version.version,
         );
+    }
+}
+
+fn expected_kx_for_version(version: &SupportedProtocolVersion) -> NamedGroup {
+    match (
+        version.version,
+        provider_is_aws_lc_rs(),
+        provider_is_fips(),
+        cfg!(feature = "prefer-post-quantum"),
+    ) {
+        (ProtocolVersion::TLSv1_3, true, _, true) => NamedGroup::X25519MLKEM768,
+        (_, _, true, _) => NamedGroup::secp256r1,
+        (_, _, _, _) => NamedGroup::X25519,
     }
 }
 

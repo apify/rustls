@@ -1,6 +1,6 @@
 [package]
 name = "rustls"
-version = "0.23.21"
+version = "0.23.22"
 edition = "2021"
 rust-version = "1.71"
 license = "Apache-2.0 OR ISC OR MIT"
@@ -13,6 +13,23 @@ autobenches = false
 autotests = false
 exclude = ["src/testdata", "tests/**"]
 build = "build.rs"
+
+[features]
+default = ["aws_lc_rs", "logging", "std", "tls12"]
+
+aws-lc-rs = ["aws_lc_rs"] # Alias because Cargo features commonly use `-`
+aws_lc_rs = ["dep:aws-lc-rs", "webpki/aws_lc_rs"]
+brotli = ["dep:brotli", "dep:brotli-decompressor", "std"]
+custom-provider = []
+fips = ["aws_lc_rs", "aws-lc-rs?/fips"]
+logging = ["log"]
+prefer-post-quantum = ["aws_lc_rs"]
+read_buf = ["rustversion", "std"]
+ring = ["dep:ring", "webpki/ring"]
+std = ["webpki/std", "pki-types/std", "once_cell/std"]
+tls12 = []
+zlib = ["dep:zlib-rs"]
+impit = ["aws_lc_rs","ring","brotli"]
 
 [build-dependencies]
 rustversion = { version = "1.0.6", optional = true }
@@ -32,20 +49,6 @@ pki-types = { workspace = true }
 zeroize = { workspace = true }
 zlib-rs = { workspace = true, optional = true }
 
-[features]
-default = ["aws_lc_rs", "logging", "std", "tls12"]
-std = ["webpki/std", "pki-types/std", "once_cell/std"]
-logging = ["log"]
-aws_lc_rs = ["dep:aws-lc-rs", "webpki/aws_lc_rs"]
-aws-lc-rs = ["aws_lc_rs"] # Alias because Cargo features commonly use `-`
-brotli = ["dep:brotli", "dep:brotli-decompressor", "std"]
-ring = ["dep:ring", "webpki/ring"]
-custom-provider = []
-tls12 = []
-read_buf = ["rustversion", "std"]
-fips = ["aws_lc_rs", "aws-lc-rs?/fips"]
-zlib = ["dep:zlib-rs"]
-impit = ["aws_lc_rs","ring","brotli"]
 
 [dev-dependencies]
 base64 = { workspace = true }
@@ -116,6 +119,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [
-    "rustls_pki_types",
-    "rustls_pki_types::*",
+  # ---
+  "rustls_pki_types",
+  "rustls_pki_types::*",
 ]
