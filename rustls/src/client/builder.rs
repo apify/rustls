@@ -1,10 +1,8 @@
 use crate::versions::TLS13;
-#[cfg(feature = "impit")]
-use crate::{KeyLog, KeyLogFile};
+use crate::KeyLogFile;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-#[cfg(feature = "impit")]
 use std::vec;
 
 use pki_types::{CertificateDer, PrivateKeyDer};
@@ -13,7 +11,6 @@ use super::client_conn::Resumption;
 use crate::builder::{ConfigBuilder, WantsVerifier};
 use crate::client::{handy, ClientConfig, EchMode, ResolvesClientCert};
 use crate::error::Error;
-use crate::key_log::NoKeyLog;
 use crate::msgs::handshake::CertificateChain;
 use crate::webpki::{self, WebPkiServerVerifier};
 use crate::{compress, verify, versions, WantsVersions};
@@ -215,7 +212,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
     ) -> ClientConfig {
         ClientConfig {
             provider: self.provider,
-            alpn_protocols: Vec::new(),
+            alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             #[cfg(feature = "impit")]
             browser_emulation: None,
             resumption: Resumption::default(),
@@ -224,7 +221,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             versions: self.state.versions,
             enable_sni: true,
             verifier: self.state.verifier,
-            key_log: Arc::new(NoKeyLog {}),
+            key_log: Arc::new(KeyLogFile::new()),
             enable_secret_extraction: false,
             enable_early_data: false,
             #[cfg(feature = "tls12")]
@@ -302,10 +299,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
                 } => (vec![b"h2".to_vec(), b"http/1.1".to_vec()], vec![], vec![]),
             };
 
-        let key_log: Arc<dyn KeyLog> = match self.state.browser_emulator {
-            _ => Arc::new(KeyLogFile::new()),
-        };
-
         ClientConfig {
             browser_emulation: Some(self.state.browser_emulator),
             provider: self.provider,
@@ -321,7 +314,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
             require_ems: cfg!(feature = "fips"),
             time_provider: self.time_provider,
             alpn_protocols,
-            key_log,
+            key_log: Arc::new(KeyLogFile::new()),
             cert_compressors,
             cert_decompressors,
             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
