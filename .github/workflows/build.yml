@@ -463,10 +463,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # - we want to be free of any warnings, so deny them (note: not for impit)
-      # - disable incompatible_msrv as it does not understand that we apply our
-      #   MSRV to the just the core crate.
-      - run: ./admin/clippy -- --allow clippy::incompatible_msrv
+        # - we want to be free of any warnings, so deny them (note: not for impit)
+        # - disable incompatible_msrv as it does not understand that we apply our
+        #   MSRV to the just the core crate.
+      - run: ./admin/clippy -- --allow clippy::disallowed_types --allow clippy::incompatible_msrv
+      - run: cargo clippy -p rustls
+
 
   clippy-nightly:
     name: Clippy (Nightly)
@@ -485,8 +487,12 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy
-      # do not deny warnings, as nightly clippy sometimes has false negatives
-      - run: ./admin/clippy
+      # Do not deny warnings, as nightly clippy sometimes has false negatives.
+      # - Ignore `clippy::disallowed_types` as a workaround since `disallowed_types` configured in `.clippy.toml`
+      #   is only intended for main `rustls` crate.
+      - run: ./admin/clippy -- --allow clippy::disallowed_types
+      # Check the main crate for any Clippy nightly warnings, but do not deny them.
+      - run: cargo clippy -p rustls
 
   check-external-types:
     name: Validate external types appearing in public API
@@ -505,6 +511,20 @@ jobs:
       - name: run cargo-check-external-types for rustls/
         working-directory: rustls/
         run: cargo check-external-types
+
+  taplo:
+      name: Taplo
+      runs-on: ubuntu-latest
+      steps:
+        - name: Checkout sources
+          uses: actions/checkout@v4
+          with:
+            persist-credentials: false
+
+        - name: Install rust toolchain
+          uses: dtolnay/rust-toolchain@stable
+        - run: cargo install taplo-cli --locked
+        - run: taplo format --check
 
   openssl-tests:
     name: Run openssl-tests

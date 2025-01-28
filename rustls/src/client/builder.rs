@@ -97,10 +97,10 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
 
 /// Container for unsafe APIs
 pub(super) mod danger {
-    use alloc::sync::Arc;
     use core::marker::PhantomData;
 
     use crate::client::WantsClientCert;
+    use crate::sync::Arc;
     use crate::{verify, ClientConfig, ConfigBuilder, WantsVerifier};
 
     /// Accessor for dangerous configuration options.
