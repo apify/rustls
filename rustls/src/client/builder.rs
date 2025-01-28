@@ -1,8 +1,10 @@
 use crate::versions::TLS13;
+#[cfg(feature = "impit")]
 use crate::KeyLogFile;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
+#[cfg(feature = "impit")]
 use std::vec;
 
 use pki_types::{CertificateDer, PrivateKeyDer};
@@ -13,7 +15,7 @@ use crate::client::{handy, ClientConfig, EchMode, ResolvesClientCert};
 use crate::error::Error;
 use crate::msgs::handshake::CertificateChain;
 use crate::webpki::{self, WebPkiServerVerifier};
-use crate::{compress, verify, versions, WantsVersions};
+use crate::{compress, verify, versions, NoKeyLog, WantsVersions};
 
 impl ConfigBuilder<ClientConfig, WantsVersions> {
     /// Enable Encrypted Client Hello (ECH) in the given mode.
@@ -212,7 +214,10 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
     ) -> ClientConfig {
         ClientConfig {
             provider: self.provider,
+            #[cfg(feature = "impit")]
             alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            #[cfg(not(feature = "impit"))]
+            alpn_protocols: Vec::new(),
             #[cfg(feature = "impit")]
             browser_emulation: None,
             resumption: Resumption::default(),
@@ -221,7 +226,10 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             versions: self.state.versions,
             enable_sni: true,
             verifier: self.state.verifier,
+            #[cfg(feature = "impit")]
             key_log: Arc::new(KeyLogFile::new()),
+            #[cfg(not(feature = "impit"))]
+            key_log: Arc::new(NoKeyLog {}),
             enable_secret_extraction: false,
             enable_early_data: false,
             #[cfg(feature = "tls12")]
