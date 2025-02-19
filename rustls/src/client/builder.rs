@@ -1,7 +1,8 @@
+#[cfg(feature = "impit")]
+use crate::msgs::handshake::CertificateChain;
 use crate::versions::TLS13;
 #[cfg(feature = "impit")]
 use crate::KeyLogFile;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 #[cfg(feature = "impit")]
@@ -13,11 +14,8 @@ use super::client_conn::Resumption;
 use crate::builder::{ConfigBuilder, WantsVerifier};
 use crate::client::{handy, ClientConfig, EchMode, ResolvesClientCert};
 use crate::error::Error;
-use crate::msgs::handshake::CertificateChain;
-use crate::key_log::NoKeyLog;
 use crate::sign::{CertifiedKey, SingleCertAndKey};
 use crate::sync::Arc;
-use crate::versions::TLS13;
 use crate::webpki::{self, WebPkiServerVerifier};
 use crate::{compress, verify, versions, NoKeyLog, WantsVersions};
 
