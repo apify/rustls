@@ -20,7 +20,7 @@ use crate::log::trace;
 use crate::msgs::enums::NamedGroup;
 use crate::msgs::handshake::ClientExtension;
 use crate::msgs::persist;
-use crate::suites::SupportedCipherSuite;
+use crate::suites::{ExtractedSecrets, SupportedCipherSuite};
 use crate::sync::Arc;
 #[cfg(feature = "std")]
 use crate::time_provider::DefaultTimeProvider;
@@ -153,7 +153,7 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
 ///
 /// * [`ClientConfig::max_fragment_size`]: the default is `None` (meaning 16kB).
 /// * [`ClientConfig::resumption`]: supports resumption with up to 256 server names, using session
-///    ids or tickets, with a max of eight tickets per server.
+///   ids or tickets, with a max of eight tickets per server.
 /// * [`ClientConfig::alpn_protocols`]: the default is empty -- no ALPN protocol is negotiated.
 /// * [`ClientConfig::key_log`]: key material is not logged.
 /// * [`ClientConfig::cert_decompressors`]: depends on the crate features, see [`compress::default_cert_decompressors()`].
@@ -856,6 +856,12 @@ impl UnbufferedClientConnection {
         Ok(Self {
             inner: ConnectionCore::for_client(config, name, Vec::new(), Protocol::Tcp)?.into(),
         })
+    }
+
+    /// Extract secrets, so they can be used when configuring kTLS, for example.
+    /// Should be used with care as it exposes secret key material.
+    pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
+        self.inner.dangerous_extract_secrets()
     }
 }
 
