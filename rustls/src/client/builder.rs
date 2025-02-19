@@ -1,7 +1,8 @@
 use crate::versions::TLS13;
 #[cfg(feature = "impit")]
 use crate::KeyLogFile;
-use alloc::sync::Arc;
+#[cfg(not(feature = "impit"))]
+use crate::NoKeyLog;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 #[cfg(feature = "impit")]
@@ -13,9 +14,10 @@ use super::client_conn::Resumption;
 use crate::builder::{ConfigBuilder, WantsVerifier};
 use crate::client::{handy, ClientConfig, EchMode, ResolvesClientCert};
 use crate::error::Error;
-use crate::msgs::handshake::CertificateChain;
+use crate::sign::{CertifiedKey, SingleCertAndKey};
+use crate::sync::Arc;
 use crate::webpki::{self, WebPkiServerVerifier};
-use crate::{compress, verify, versions, NoKeyLog, WantsVersions};
+use crate::{compress, verify, versions, WantsVersions};
 
 impl ConfigBuilder<ClientConfig, WantsVersions> {
     /// Enable Encrypted Client Hello (ECH) in the given mode.
@@ -193,13 +195,8 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
         cert_chain: Vec<CertificateDer<'static>>,
         key_der: PrivateKeyDer<'static>,
     ) -> Result<ClientConfig, Error> {
-        let private_key = self
-            .provider
-            .key_provider
-            .load_private_key(key_der)?;
-        let resolver =
-            handy::AlwaysResolvesClientCert::new(private_key, CertificateChain(cert_chain))?;
-        Ok(self.with_client_cert_resolver(Arc::new(resolver)))
+        let certified_key = CertifiedKey::from_der(cert_chain, key_der, &self.provider)?;
+        Ok(self.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
     }
 
     /// Do not support client auth.
@@ -214,9 +211,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
     ) -> ClientConfig {
         ClientConfig {
             provider: self.provider,
-            #[cfg(feature = "impit")]
-            alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-            #[cfg(not(feature = "impit"))]
             alpn_protocols: Vec::new(),
             #[cfg(feature = "impit")]
             browser_emulation: None,
@@ -272,13 +266,8 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
         cert_chain: Vec<CertificateDer<'static>>,
         key_der: PrivateKeyDer<'static>,
     ) -> Result<ClientConfig, Error> {
-        let private_key = self
-            .provider
-            .key_provider
-            .load_private_key(key_der)?;
-        let resolver =
-            handy::AlwaysResolvesClientCert::new(private_key, CertificateChain(cert_chain))?;
-        Ok(self.with_client_cert_resolver(Arc::new(resolver)))
+        let certified_key = CertifiedKey::from_der(cert_chain, key_der, &self.provider)?;
+        Ok(self.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
     }
 
     /// Do not support client auth.
