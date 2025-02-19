@@ -211,9 +211,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
     ) -> ClientConfig {
         ClientConfig {
             provider: self.provider,
-            #[cfg(feature = "impit")]
-            alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-            #[cfg(not(feature = "impit"))]
             alpn_protocols: Vec::new(),
             #[cfg(feature = "impit")]
             browser_emulation: None,
