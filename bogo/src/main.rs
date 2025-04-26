@@ -4,20 +4,26 @@
 // https://boringssl.googlesource.com/boringssl/+/master/ssl/test
 //
 
+#![allow(clippy::disallowed_types)]
+
 use std::fmt::{Debug, Formatter};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::{env, net, process, thread, time};
 
-use base64::prelude::{Engine, BASE64_STANDARD};
+use base64::prelude::{BASE64_STANDARD, Engine};
+#[cfg(unix)]
+use nix::sys::signal::{self, Signal};
+#[cfg(unix)]
+use nix::unistd::Pid;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{
     ClientConfig, ClientConnection, EchConfig, EchGreaseConfig, EchMode, EchStatus, Resumption,
-    WebPkiServerVerifier,
+    Tls12Resumption, WebPkiServerVerifier,
 };
 use rustls::crypto::aws_lc_rs::hpke;
 use rustls::crypto::hpke::{Hpke, HpkePublicKey};
-use rustls::crypto::{aws_lc_rs, ring, CryptoProvider};
+use rustls::crypto::{CryptoProvider, aws_lc_rs, ring};
 use rustls::internal::msgs::codec::{Codec, Reader};
 use rustls::internal::msgs::handshake::EchConfigPayload;
 use rustls::internal::msgs::persist::ServerSessionValue;
@@ -28,10 +34,10 @@ use rustls::server::{
     ClientHello, ProducesTickets, ServerConfig, ServerConnection, WebPkiClientVerifier,
 };
 use rustls::{
-    client, compress, server, sign, version, AlertDescription, CertificateCompressionAlgorithm,
-    CertificateError, Connection, DigitallySignedStruct, DistinguishedName, Error, HandshakeKind,
-    InvalidMessage, NamedGroup, PeerIncompatible, PeerMisbehaved, ProtocolVersion, RootCertStore,
-    Side, SignatureAlgorithm, SignatureScheme, SupportedProtocolVersion,
+    AlertDescription, CertificateCompressionAlgorithm, CertificateError, Connection,
+    DigitallySignedStruct, DistinguishedName, Error, HandshakeKind, InvalidMessage, NamedGroup,
+    PeerIncompatible, PeerMisbehaved, ProtocolVersion, RootCertStore, Side, SignatureAlgorithm,
+    SignatureScheme, SupportedProtocolVersion, client, compress, server, sign, version,
 };
 
 static BOGO_NACK: i32 = 89;
@@ -107,6 +113,7 @@ struct Options {
     expect_curve_id: Option<NamedGroup>,
     on_initial_expect_curve_id: Option<NamedGroup>,
     on_resume_expect_curve_id: Option<NamedGroup>,
+    wait_for_debugger: bool,
 }
 
 impl Options {
@@ -176,6 +183,7 @@ impl Options {
             expect_curve_id: None,
             on_initial_expect_curve_id: None,
             on_resume_expect_curve_id: None,
+            wait_for_debugger: false,
         }
     }
 
@@ -808,7 +816,11 @@ fn make_client_cfg(opts: &Options) -> Arc<ClientConfig> {
         });
     }
 
-    cfg.resumption = Resumption::store(ClientCacheWithoutKxHints::new(opts.resumption_delay));
+    cfg.resumption = Resumption::store(ClientCacheWithoutKxHints::new(opts.resumption_delay))
+        .tls12_resumption(match opts.tickets {
+            true => Tls12Resumption::SessionIdOrTickets,
+            false => Tls12Resumption::SessionIdOnly,
+        });
     cfg.enable_sni = opts.use_sni;
     cfg.max_fragment_size = opts.max_fragment;
     cfg.require_ems = opts.require_ems;
@@ -876,6 +888,10 @@ fn handle_err(opts: &Options, err: Error) -> ! {
             InvalidMessage::TrailingData("ChangeCipherSpecPayload") | InvalidMessage::InvalidCcs,
         ) => quit(":BAD_CHANGE_CIPHER_SPEC:"),
         Error::InvalidMessage(
+            InvalidMessage::EmptyTicketValue | InvalidMessage::IllegalEmptyList(_),
+        ) => quit(":DECODE_ERROR:"),
+        Error::InvalidMessage(InvalidMessage::IllegalEmptyValue) => quit(":ILLEGAL_EMPTY_VALUE:"),
+        Error::InvalidMessage(
             InvalidMessage::InvalidKeyUpdate
             | InvalidMessage::MissingData(_)
             | InvalidMessage::TrailingData(_)
@@ -942,6 +958,9 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         }
         Error::PeerMisbehaved(PeerMisbehaved::TooManyKeyUpdateRequests) => {
             quit(":TOO_MANY_KEY_UPDATES:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::ServerEchoedCompatibilitySessionId) => {
+            quit(":SERVER_ECHOED_INVALID_SESSION_ID:")
         }
         Error::PeerMisbehaved(PeerMisbehaved::TooManyEmptyFragments) => {
             quit(":TOO_MANY_EMPTY_FRAGMENTS:")
@@ -1018,7 +1037,7 @@ fn read_n_bytes(opts: &Options, sess: &mut Connection, conn: &mut net::TcpStream
             sess.read_tls(&mut io::Cursor::new(&mut bytes[..count]))
                 .expect("read_tls not expected to fail reading from buffer");
         }
-        Err(ref err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
         Err(err) => panic!("invalid read: {}", err),
     };
 
@@ -1028,7 +1047,7 @@ fn read_n_bytes(opts: &Options, sess: &mut Connection, conn: &mut net::TcpStream
 fn read_all_bytes(opts: &Options, sess: &mut Connection, conn: &mut net::TcpStream) {
     match sess.read_tls(conn) {
         Ok(_) => {}
-        Err(ref err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
         Err(err) => panic!("invalid read: {}", err),
     };
 
@@ -1089,7 +1108,7 @@ fn exec(opts: &Options, mut sess: Connection, count: usize) {
         }
 
         if opts.side == Side::Server && opts.enable_early_data {
-            if let Some(ref mut ed) = server(&mut sess).early_data() {
+            if let Some(ed) = &mut server(&mut sess).early_data() {
                 let mut data = Vec::new();
                 let data_len = ed
                     .read_to_end(&mut data)
@@ -1600,6 +1619,16 @@ pub fn main() {
             "-server-preference" => {
                 opts.server_preference = true;
             }
+            "-wait-for-debugger" => {
+                #[cfg(windows)]
+                {
+                    panic("-wait-for-debugger not supported on Windows");
+                }
+                #[cfg(unix)]
+                {
+                    opts.wait_for_debugger = true;
+                }
+            }
 
             // defaults:
             "-enable-all-curves" |
@@ -1610,6 +1639,7 @@ pub fn main() {
             "-handoff" |
             "-ipv6" |
             "-decline-alpn" |
+            "-permute-extensions" |
             "-expect-no-session" |
             "-expect-ticket-renewal" |
             "-enable-ocsp-stapling" |
@@ -1669,9 +1699,12 @@ pub fn main() {
             "-wpa-202304" |
             "-cnsa-202407" |
             "-srtp-profiles" |
-            "-permute-extensions" |
+            "-use-ticket-aead-callback" |
             "-signed-cert-timestamps" |
             "-on-initial-expect-peer-cert-file" |
+            "-resumption-across-names-enabled" |
+            "-expect-resumable-across-names" |
+            "-expect-not-resumable-across-names" |
             "-use-custom-verify-callback" => {
                 println!("NYI option {:?}", arg);
                 process::exit(BOGO_NACK);
@@ -1693,6 +1726,14 @@ pub fn main() {
 
     println!("opts {:?}", opts);
 
+    #[cfg(unix)]
+    if opts.wait_for_debugger {
+        // On Unix systems when -wait-for-debugger is passed from the BoGo runner
+        // we should SIGSTOP ourselves to allow a debugger to attach to the shim to
+        // continue the testing process.
+        signal::kill(Pid::from_raw(process::id() as i32), Signal::SIGSTOP).unwrap();
+    }
+
     let (mut client_cfg, mut server_cfg) = match opts.side {
         Side::Client => (Some(make_client_cfg(&opts)), None),
         Side::Server => (None, Some(make_server_cfg(&opts))),
@@ -1704,9 +1745,10 @@ pub fn main() {
         ccfg: &Option<Arc<ClientConfig>>,
     ) -> Connection {
         assert!(opts.quic_transport_params.is_empty());
-        assert!(opts
-            .expect_quic_transport_params
-            .is_empty());
+        assert!(
+            opts.expect_quic_transport_params
+                .is_empty()
+        );
 
         if opts.side == Side::Server {
             let scfg = Arc::clone(scfg.as_ref().unwrap());
@@ -1730,7 +1772,11 @@ pub fn main() {
         exec(&opts, sess, i);
         if opts.resume_with_tickets_disabled {
             opts.tickets = false;
-            server_cfg = Some(make_server_cfg(&opts));
+
+            match opts.side {
+                Side::Server => server_cfg = Some(make_server_cfg(&opts)),
+                Side::Client => client_cfg = Some(make_client_cfg(&opts)),
+            };
         }
         if opts.on_resume_ech_config_list.is_some() {
             opts.ech_config_list

@@ -6,9 +6,11 @@ use core::ops::Deref;
 
 use pki_types::ServerName;
 
+use super::ResolvesClientCert;
+use super::Tls12Resumption;
 #[cfg(feature = "tls12")]
 use super::tls12;
-use super::Tls12Resumption;
+use crate::SupportedCipherSuite;
 #[cfg(feature = "logging")]
 use crate::bs_debug;
 use crate::check::inappropriate_handshake_message;
@@ -31,7 +33,7 @@ use crate::msgs::base::Payload;
 #[cfg(feature = "impit")]
 use crate::msgs::base::{PayloadU16, PayloadU8};
 use crate::msgs::enums::{
-    CertificateType, Compression, ECPointFormat, ExtensionType, PSKKeyExchangeMode,
+    CertificateType, Compression, ECPointFormat, ExtensionType, PskKeyExchangeMode,
 };
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtension, ClientHelloPayload, ClientSessionTicket,
@@ -43,6 +45,7 @@ use crate::msgs::persist;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::{NamedGroup, SupportedCipherSuite};
+use crate::verify::ServerCertVerifier;
 
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
@@ -70,6 +73,9 @@ fn find_session(
 
             #[cfg(not(feature = "tls12"))]
             None
+        })
+        .and_then(|resuming| {
+            resuming.compatible_config(&config.verifier, &config.client_auth_cert_resolver)
         })
         .and_then(|resuming| {
             let now = config
@@ -125,25 +131,27 @@ pub(super) fn start_handshake(
         None
     };
 
-    let session_id = if let Some(_resuming) = &mut resuming {
-        debug!("Resuming session");
-
-        match &mut _resuming.value {
-            #[cfg(feature = "tls12")]
-            ClientSessionValue::Tls12(inner) => {
-                // If we have a ticket, we use the sessionid as a signal that
-                // we're  doing an abbreviated handshake.  See section 3.4 in
-                // RFC5077.
-                if !inner.ticket().0.is_empty() {
-                    inner.session_id = SessionId::random(config.provider.secure_random)?;
+    let session_id = match &mut resuming {
+        Some(_resuming) => {
+            debug!("Resuming session");
+            match &mut _resuming.value {
+                #[cfg(feature = "tls12")]
+                ClientSessionValue::Tls12(inner) => {
+                    // If we have a ticket, we use the sessionid as a signal that
+                    // we're  doing an abbreviated handshake.  See section 3.4 in
+                    // RFC5077.
+                    if !inner.ticket().0.is_empty() {
+                        inner.session_id = SessionId::random(config.provider.secure_random)?;
+                    }
+                    Some(inner.session_id)
                 }
-                Some(inner.session_id)
+                _ => None,
             }
-            _ => None,
         }
-    } else {
-        debug!("Not resuming any session");
-        None
+        _ => {
+            debug!("Not resuming any session");
+            None
+        }
     };
 
     // https://tools.ietf.org/html/rfc8446#appendix-D.4
@@ -197,7 +205,14 @@ pub(super) fn start_handshake(
 struct ExpectServerHello {
     input: ClientHelloInput,
     transcript_buffer: HandshakeHashBuffer,
-    early_key_schedule: Option<KeyScheduleEarly>,
+    // The key schedule for sending early data.
+    //
+    // If the server accepts the PSK used for early data then
+    // this is used to compute the rest of the key schedule.
+    // Otherwise, it is thrown away.
+    //
+    // If this is `None` then we do not support early data.
+    early_data_key_schedule: Option<KeyScheduleEarly>,
     offered_key_share: Option<Box<dyn ActiveKeyExchange>>,
     suite: Option<SupportedCipherSuite>,
     ech_state: Option<EchState>,
@@ -221,6 +236,11 @@ struct ClientHelloInput {
     prev_ech_ext: Option<ClientExtension>,
 }
 
+/// Emits the initial ClientHello or a ClientHello in response to
+/// a HelloRetryRequest.
+///
+/// `retryreq` and `suite` are `None` if this is the initial
+/// ClientHello.
 fn emit_client_hello_for_retry(
     mut transcript_buffer: HandshakeHashBuffer,
     retryreq: Option<&HelloRetryRequest>,
@@ -406,7 +426,7 @@ fn emit_client_hello_for_retry(
     if support_tls13 {
         // We could support PSK_KE here too. Such connections don't
         // have forward secrecy, and are similar to TLS1.2 resumption.
-        let psk_modes = vec![PSKKeyExchangeMode::PSK_DHE_KE];
+        let psk_modes = vec![PskKeyExchangeMode::PSK_DHE_KE];
         exts.push(ClientExtension::PresharedKeyModes(psk_modes));
     }
 
@@ -581,7 +601,7 @@ fn emit_client_hello_for_retry(
         payload: HandshakePayload::ClientHello(chp_payload),
     };
 
-    let early_key_schedule = match (ech_state.as_mut(), tls13_session) {
+    let tls13_early_data_key_schedule = match (ech_state.as_mut(), tls13_session) {
         // If we're performing ECH and resuming, then the PSK binder will have been dealt with
         // separately, and we need to take the early_data_key_schedule computed for the inner hello.
         (Some(ech_state), Some(tls13_session)) => ech_state
@@ -628,37 +648,38 @@ fn emit_client_hello_for_retry(
     cx.common.send_msg(ch, false);
 
     // Calculate the hash of ClientHello and use it to derive EarlyTrafficSecret
-    let early_key_schedule = early_key_schedule.map(|(resuming_suite, schedule)| {
-        if !cx.data.early_data.is_enabled() {
-            return schedule;
-        }
+    let early_data_key_schedule =
+        tls13_early_data_key_schedule.map(|(resuming_suite, schedule)| {
+            if !cx.data.early_data.is_enabled() {
+                return schedule;
+            }
 
-        let (transcript_buffer, random) = match &ech_state {
-            // When using ECH the early data key schedule is derived based on the inner
-            // hello transcript and random.
-            Some(ech_state) => (
-                &ech_state.inner_hello_transcript,
-                &ech_state.inner_hello_random.0,
-            ),
-            None => (&transcript_buffer, &input.random.0),
-        };
+            let (transcript_buffer, random) = match &ech_state {
+                // When using ECH the early data key schedule is derived based on the inner
+                // hello transcript and random.
+                Some(ech_state) => (
+                    &ech_state.inner_hello_transcript,
+                    &ech_state.inner_hello_random.0,
+                ),
+                None => (&transcript_buffer, &input.random.0),
+            };
 
-        tls13::derive_early_traffic_secret(
-            &*config.key_log,
-            cx,
-            resuming_suite,
-            &schedule,
-            &mut input.sent_tls13_fake_ccs,
-            transcript_buffer,
-            random,
-        );
-        schedule
-    });
+            tls13::derive_early_traffic_secret(
+                &*config.key_log,
+                cx,
+                resuming_suite,
+                &schedule,
+                &mut input.sent_tls13_fake_ccs,
+                transcript_buffer,
+                random,
+            );
+            schedule
+        });
 
     let next = ExpectServerHello {
         input,
         transcript_buffer,
-        early_key_schedule,
+        early_data_key_schedule,
         offered_key_share: key_share,
         suite,
         ech_state,
@@ -671,7 +692,12 @@ fn emit_client_hello_for_retry(
     })
 }
 
-/// Prepare resumption with the session state retrieved from storage.
+/// Prepares `exts` and `cx` with TLS 1.2 or TLS 1.3 session
+/// resumption.
+///
+/// - `suite` is `None` if this is the initial ClientHello, or
+///   `Some` if we're retrying in response to
+///   a HelloRetryRequest.
 ///
 /// This function will push onto `exts` to
 ///
@@ -680,10 +706,7 @@ fn emit_client_hello_for_retry(
 /// (c) send a request for 1.3 early data if allowed and
 /// (d) send a 1.3 preshared key if we have one.
 ///
-/// For resumption to work, the currently negotiated cipher suite (if available) must be
-/// able to resume from the resuming session's cipher suite.
-///
-/// If 1.3 resumption can continue, returns the 1.3 session value for further processing.
+/// It returns the TLS 1.3 PSKs, if any, for further processing.
 fn prepare_resumption<'a>(
     resuming: &'a Option<persist::Retrieved<ClientSessionValue>>,
     exts: &mut Vec<ClientExtension>,
@@ -979,7 +1002,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
                     randoms,
                     suite,
                     transcript,
-                    self.early_key_schedule,
+                    self.early_data_key_schedule,
                     self.input.hello,
                     // We always send a key share when TLS 1.3 is enabled.
                     self.offered_key_share.unwrap(),
@@ -990,6 +1013,23 @@ impl State<ClientConnectionData> for ExpectServerHello {
             }
             #[cfg(feature = "tls12")]
             SupportedCipherSuite::Tls12(suite) => {
+                // If we didn't have an input session to resume, and we sent a session ID,
+                // that implies we sent a TLS 1.3 legacy_session_id for compatibility purposes.
+                // In this instance since we're now continuing a TLS 1.2 handshake the server
+                // should not have echoed it back: it's a randomly generated session ID it couldn't
+                // have known.
+                if self.input.resuming.is_none()
+                    && !self.input.session_id.is_empty()
+                    && self.input.session_id == server_hello.session_id
+                {
+                    return Err({
+                        cx.common.send_fatal_alert(
+                            AlertDescription::IllegalParameter,
+                            PeerMisbehaved::ServerEchoedCompatibilitySessionId,
+                        )
+                    });
+                }
+
                 let resuming_session = self
                     .input
                     .resuming
@@ -1309,6 +1349,22 @@ impl ClientSessionValue {
             Self::Tls13(v) => Some(v),
             #[cfg(feature = "tls12")]
             Self::Tls12(_) => None,
+        }
+    }
+
+    fn compatible_config(
+        self,
+        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
+        client_creds: &Arc<dyn ResolvesClientCert>,
+    ) -> Option<Self> {
+        match &self {
+            Self::Tls13(v) => v
+                .compatible_config(server_cert_verifier, client_creds)
+                .then_some(self),
+            #[cfg(feature = "tls12")]
+            Self::Tls12(v) => v
+                .compatible_config(server_cert_verifier, client_creds)
+                .then_some(self),
         }
     }
 }

@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use std::env;
 use std::sync::Mutex;
 
@@ -39,7 +41,7 @@ fn serialized(f: impl FnOnce()) {
     let _guard = MUTEX.lock().unwrap();
 
     // XXX: NOT thread safe.
-    env::set_var("SSLKEYLOGFILE", "./sslkeylogfile.txt");
+    unsafe { env::set_var("SSLKEYLOGFILE", "./sslkeylogfile.txt") };
 
     f()
 }

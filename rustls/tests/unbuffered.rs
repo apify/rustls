@@ -1,4 +1,4 @@
-#![allow(clippy::duplicate_mod)]
+#![allow(clippy::disallowed_types, clippy::duplicate_mod)]
 
 use std::num::NonZeroUsize;
 
@@ -147,9 +147,11 @@ fn app_data_client_to_server() {
             &mut NO_ACTIONS.clone(),
         );
 
-        assert!(client_actions
-            .app_data_to_send
-            .is_none());
+        assert!(
+            client_actions
+                .app_data_to_send
+                .is_none()
+        );
         assert_eq!(
             [expected],
             outcome
@@ -179,9 +181,11 @@ fn app_data_server_to_client() {
             &mut server_actions,
         );
 
-        assert!(server_actions
-            .app_data_to_send
-            .is_none());
+        assert!(
+            server_actions
+                .app_data_to_send
+                .is_none()
+        );
         assert_eq!(
             [expected],
             outcome
@@ -253,9 +257,11 @@ fn early_data() {
             "WriteTraffic"
         ]
     );
-    assert!(client_actions
-        .early_data_to_send
-        .is_none());
+    assert!(
+        client_actions
+            .early_data_to_send
+            .is_none()
+    );
     assert_eq!(
         [expected],
         outcome
@@ -526,11 +532,13 @@ fn junk_after_close_notify_received() {
     let mut server = outcome.server.take().unwrap();
 
     let mut client_send_buf = [0u8; 128];
-    let mut len = dbg!(write_traffic(
-        client.process_tls_records(&mut []),
-        |mut wt: WriteTraffic<_>| wt.queue_close_notify(&mut client_send_buf),
-    )
-    .unwrap());
+    let mut len = dbg!(
+        write_traffic(
+            client.process_tls_records(&mut []),
+            |mut wt: WriteTraffic<_>| wt.queue_close_notify(&mut client_send_buf),
+        )
+        .unwrap()
+    );
 
     client_send_buf[len..len + 4].copy_from_slice(&[0x17, 0x03, 0x03, 0x01]);
     len += 4;
@@ -909,6 +917,53 @@ fn rejects_junk() {
         ]
     );
     confirm_transmit_tls_data(server.process_tls_records(&mut []));
+}
+
+#[test]
+fn read_traffic_not_consumed_too_early() {
+    let mut outcome = handshake(&rustls::version::TLS13);
+    let mut client = outcome.client.take().unwrap();
+    let mut server = outcome.server.take().unwrap();
+
+    let mut client_to_server_buf = Buffer::default();
+    write_traffic(client.process_tls_records(&mut []), |mut wt| {
+        encrypt(&mut wt, b"hello", &mut client_to_server_buf)
+    });
+
+    // if we just peek, we are presented the same data again
+    let (_, discard) = read_traffic(
+        server.process_tls_records(client_to_server_buf.filled()),
+        |rt| assert_eq!(rt.peek_len(), NonZeroUsize::new(5)),
+    );
+    assert!(discard > 0);
+    client_to_server_buf.discard(discard);
+
+    // ditto
+    let (_, discard) = read_traffic(
+        server.process_tls_records(client_to_server_buf.filled()),
+        |rt| assert_eq!(rt.peek_len(), NonZeroUsize::new(5)),
+    );
+    assert_eq!(discard, 0);
+
+    // now consume
+    let (data, discard) = read_traffic(
+        server.process_tls_records(client_to_server_buf.filled()),
+        |mut rt| {
+            rt.next_record()
+                .unwrap()
+                .unwrap()
+                .payload
+                .to_vec()
+        },
+    );
+    assert_eq!(discard, 0);
+    assert_eq!(data, b"hello");
+
+    // server is now idle
+    write_traffic(
+        server.process_tls_records(client_to_server_buf.filled()),
+        |_| (),
+    );
 }
 
 fn write_traffic<T: SideData, R, F: FnMut(WriteTraffic<T>) -> R>(
