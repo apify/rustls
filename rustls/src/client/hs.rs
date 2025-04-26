@@ -307,8 +307,10 @@ fn emit_client_hello_for_retry(
             browser_type: BrowserType::Chrome,
             version: _,
         }) => {
-            // TODO: needs to actually use the data - u8-length-prefixed list of ALPN protocols
-            let application_settings: PayloadU16 = PayloadU16::new(vec![0x02, 0x68, 0x32]);
+            // hack - to avoid `Unexpected Message` when communicating with BoringSSL-based servers,
+            // we cannot send an actual ALPN protocol name list
+            let application_settings: PayloadU16 =
+                PayloadU16::new(vec![0x05, 0x69, 0x6d, 0x70, 0x69, 0x74]);
 
             exts.push(ClientExtension::ReservedGrease());
             exts.push(ClientExtension::SignedCertificateTimestamp());
