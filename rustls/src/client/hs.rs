@@ -10,6 +10,7 @@ use super::ResolvesClientCert;
 use super::Tls12Resumption;
 #[cfg(feature = "tls12")]
 use super::tls12;
+use crate::NamedGroup;
 use crate::SupportedCipherSuite;
 #[cfg(feature = "logging")]
 use crate::bs_debug;
@@ -45,7 +46,6 @@ use crate::msgs::persist;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::verify::ServerCertVerifier;
-use crate::NamedGroup;
 
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
