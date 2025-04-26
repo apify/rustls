@@ -10,12 +10,12 @@ use emulation::{
 use pki_types::PrivateKeyDer;
 use zeroize::Zeroize;
 
-#[cfg(feature = "impit")]
-use crate::client::builder::BrowserType;
-#[cfg(feature = "impit")]
-use crate::client::BrowserEmulator;
 #[cfg(all(doc, feature = "tls12"))]
 use crate::Tls12CipherSuite;
+#[cfg(feature = "impit")]
+use crate::client::BrowserEmulator;
+#[cfg(feature = "impit")]
+use crate::client::builder::BrowserType;
 use crate::msgs::ffdhe_groups::FfdheGroup;
 use crate::sign::SigningKey;
 use crate::sync::Arc;

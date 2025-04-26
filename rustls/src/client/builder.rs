@@ -1,8 +1,8 @@
-use crate::versions::TLS13;
 #[cfg(feature = "impit")]
 use crate::KeyLogFile;
 #[cfg(not(feature = "impit"))]
 use crate::NoKeyLog;
+use crate::versions::TLS13;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 #[cfg(feature = "impit")]

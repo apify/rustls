@@ -5,10 +5,10 @@ use core::{fmt, mem};
 
 use pki_types::{ServerName, UnixTime};
 
-use super::handy::NoClientSessionStorage;
-use super::hs;
 #[cfg(feature = "impit")]
 use super::BrowserEmulator;
+use super::handy::NoClientSessionStorage;
+use super::hs;
 #[cfg(feature = "std")]
 use crate::WantsVerifier;
 use crate::builder::ConfigBuilder;

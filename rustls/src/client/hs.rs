@@ -15,13 +15,13 @@ use crate::SupportedCipherSuite;
 use crate::bs_debug;
 use crate::check::inappropriate_handshake_message;
 #[cfg(feature = "impit")]
+use crate::client::BrowserEmulator;
+#[cfg(feature = "impit")]
 use crate::client::builder::BrowserType;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
 use crate::client::ech::EchState;
-#[cfg(feature = "impit")]
-use crate::client::BrowserEmulator;
-use crate::client::{tls13, ClientConfig, EchMode, EchStatus};
+use crate::client::{ClientConfig, EchMode, EchStatus, tls13};
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
 use crate::conn::ConnectionRandoms;
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
@@ -31,7 +31,7 @@ use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
 use crate::msgs::base::Payload;
 #[cfg(feature = "impit")]
-use crate::msgs::base::{PayloadU16, PayloadU8};
+use crate::msgs::base::{PayloadU8, PayloadU16};
 use crate::msgs::enums::{
     CertificateType, Compression, ECPointFormat, ExtensionType, PskKeyExchangeMode,
 };
@@ -44,8 +44,8 @@ use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleEarly;
-use crate::{NamedGroup, SupportedCipherSuite};
 use crate::verify::ServerCertVerifier;
+use crate::{NamedGroup, SupportedCipherSuite};
 
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
