@@ -309,7 +309,8 @@ fn emit_client_hello_for_retry(
         }) => {
             // hack - to avoid `Unexpected Message` when communicating with BoringSSL-based servers,
             // we cannot send an actual ALPN protocol name list
-            let application_settings: PayloadU16 = PayloadU16::new(vec![0x05, 0x69, 0x6d, 0x70, 0x69, 0x74]);
+            let application_settings: PayloadU16 =
+                PayloadU16::new(vec![0x05, 0x69, 0x6d, 0x70, 0x69, 0x74]);
 
             exts.push(ClientExtension::ReservedGrease());
             exts.push(ClientExtension::SignedCertificateTimestamp());
