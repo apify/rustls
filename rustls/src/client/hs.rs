@@ -45,7 +45,7 @@ use crate::msgs::persist;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::verify::ServerCertVerifier;
-use crate::{NamedGroup, SupportedCipherSuite};
+use crate::NamedGroup;
 
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
