@@ -1,7 +1,7 @@
 #![cfg(feature = "impit")]
 use crate::{SignatureScheme, SupportedCipherSuite};
 
-use super::{aws_lc_rs, WebPkiSupportedAlgorithms};
+use super::{WebPkiSupportedAlgorithms, aws_lc_rs};
 use webpki::aws_lc_rs as webpki_algs_aws;
 use webpki::ring as webpki_algs;
 

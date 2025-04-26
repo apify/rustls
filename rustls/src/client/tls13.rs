@@ -10,7 +10,7 @@ use super::hs::ClientContext;
 use crate::check::inappropriate_handshake_message;
 use crate::client::common::{ClientAuthDetails, ClientHelloDetails, ServerCertDetails};
 use crate::client::ech::{self, EchState, EchStatus};
-use crate::client::{hs, ClientConfig, ClientSessionStore};
+use crate::client::{ClientConfig, ClientSessionStore, hs};
 use crate::common_state::{
     CommonState, HandshakeFlightTls13, HandshakeKind, KxState, Protocol, Side, State,
 };
@@ -27,10 +27,10 @@ use crate::msgs::ccs::ChangeCipherSpecPayload;
 use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::{ExtensionType, KeyUpdateRequest};
 use crate::msgs::handshake::{
-    CertificatePayloadTls13, ClientExtension, EchConfigPayload, HandshakeMessagePayload,
-    HandshakePayload, HasServerExtensions, KeyShareEntry, NewSessionTicketPayloadTls13,
-    PresharedKeyIdentity, PresharedKeyOffer, ServerExtension, ServerHelloPayload,
-    CERTIFICATE_MAX_SIZE_LIMIT,
+    CERTIFICATE_MAX_SIZE_LIMIT, CertificatePayloadTls13, ClientExtension, EchConfigPayload,
+    HandshakeMessagePayload, HandshakePayload, HasServerExtensions, KeyShareEntry,
+    NewSessionTicketPayloadTls13, PresharedKeyIdentity, PresharedKeyOffer, ServerExtension,
+    ServerHelloPayload,
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
@@ -42,10 +42,10 @@ use crate::tls13::key_schedule::{
     ResumptionSecret,
 };
 use crate::tls13::{
-    construct_client_verify_message, construct_server_verify_message, Tls13CipherSuite,
+    Tls13CipherSuite, construct_client_verify_message, construct_server_verify_message,
 };
 use crate::verify::{self, DigitallySignedStruct};
-use crate::{compress, crypto, KeyLog};
+use crate::{KeyLog, compress, crypto};
 
 // Extensions we expect in plaintext in the ServerHello.
 static ALLOWED_PLAINTEXT_EXTS: &[ExtensionType] = &[
@@ -63,6 +63,8 @@ static DISALLOWED_TLS13_EXTS: &[ExtensionType] = &[
     ExtensionType::ExtendedMasterSecret,
 ];
 
+/// `early_data_key_schedule` is `Some` if we sent the
+/// "early_data" extension to the server.
 pub(super) fn handle_server_hello(
     config: Arc<ClientConfig>,
     cx: &mut ClientContext<'_>,
@@ -72,7 +74,7 @@ pub(super) fn handle_server_hello(
     mut randoms: ConnectionRandoms,
     suite: &'static Tls13CipherSuite,
     mut transcript: HandshakeHash,
-    early_key_schedule: Option<KeyScheduleEarly>,
+    early_data_key_schedule: Option<KeyScheduleEarly>,
     mut hello: ClientHelloDetails,
     our_key_share: Box<dyn ActiveKeyExchange>,
     mut sent_tls13_fake_ccs: bool,
@@ -98,52 +100,56 @@ pub(super) fn handle_server_hello(
             )
         })?;
 
-    let key_schedule_pre_handshake = if let (Some(selected_psk), Some(early_key_schedule)) =
-        (server_hello.psk_index(), early_key_schedule)
-    {
-        if let Some(ref resuming) = resuming_session {
-            let Some(resuming_suite) = suite.can_resume_from(resuming.suite()) else {
-                return Err({
-                    cx.common.send_fatal_alert(
-                        AlertDescription::IllegalParameter,
-                        PeerMisbehaved::ResumptionOfferedWithIncompatibleCipherSuite,
-                    )
-                });
-            };
+    let key_schedule_pre_handshake = match (server_hello.psk_index(), early_data_key_schedule) {
+        (Some(selected_psk), Some(early_key_schedule)) => {
+            match &resuming_session {
+                Some(resuming) => {
+                    let Some(resuming_suite) = suite.can_resume_from(resuming.suite()) else {
+                        return Err({
+                            cx.common.send_fatal_alert(
+                                AlertDescription::IllegalParameter,
+                                PeerMisbehaved::ResumptionOfferedWithIncompatibleCipherSuite,
+                            )
+                        });
+                    };
 
-            // If the server varies the suite here, we will have encrypted early data with
-            // the wrong suite.
-            if cx.data.early_data.is_enabled() && resuming_suite != suite {
-                return Err({
-                    cx.common.send_fatal_alert(
-                        AlertDescription::IllegalParameter,
-                        PeerMisbehaved::EarlyDataOfferedWithVariedCipherSuite,
-                    )
-                });
+                    // If the server varies the suite here, we will have encrypted early data with
+                    // the wrong suite.
+                    if cx.data.early_data.is_enabled() && resuming_suite != suite {
+                        return Err({
+                            cx.common.send_fatal_alert(
+                                AlertDescription::IllegalParameter,
+                                PeerMisbehaved::EarlyDataOfferedWithVariedCipherSuite,
+                            )
+                        });
+                    }
+
+                    if selected_psk != 0 {
+                        return Err({
+                            cx.common.send_fatal_alert(
+                                AlertDescription::IllegalParameter,
+                                PeerMisbehaved::SelectedInvalidPsk,
+                            )
+                        });
+                    }
+
+                    debug!("Resuming using PSK");
+                    // The key schedule has been initialized and set in fill_in_psk_binder()
+                }
+                _ => {
+                    return Err(PeerMisbehaved::SelectedUnofferedPsk.into());
+                }
             }
-
-            if selected_psk != 0 {
-                return Err({
-                    cx.common.send_fatal_alert(
-                        AlertDescription::IllegalParameter,
-                        PeerMisbehaved::SelectedInvalidPsk,
-                    )
-                });
-            }
-
-            debug!("Resuming using PSK");
-            // The key schedule has been initialized and set in fill_in_psk_binder()
-        } else {
-            return Err(PeerMisbehaved::SelectedUnofferedPsk.into());
+            KeySchedulePreHandshake::from(early_key_schedule)
         }
-        KeySchedulePreHandshake::from(early_key_schedule)
-    } else {
-        debug!("Not resuming");
-        // Discard the early data key schedule.
-        cx.data.early_data.rejected();
-        cx.common.early_traffic = false;
-        resuming_session.take();
-        KeySchedulePreHandshake::new(suite)
+        _ => {
+            debug!("Not resuming");
+            // Discard the early data key schedule.
+            cx.data.early_data.rejected();
+            cx.common.early_traffic = false;
+            resuming_session.take();
+            KeySchedulePreHandshake::new(suite)
+        }
     };
 
     cx.common.kx_state.complete();
@@ -319,7 +325,7 @@ pub(super) fn fill_in_psk_binder(
     let key_schedule = KeyScheduleEarly::new(suite, resuming.secret());
     let real_binder = key_schedule.resumption_psk_binder_key_and_sign_verify_data(&handshake_hash);
 
-    if let HandshakePayload::ClientHello(ref mut ch) = hmp.payload {
+    if let HandshakePayload::ClientHello(ch) = &mut hmp.payload {
         ch.set_psk_binder(real_binder.as_ref());
     };
 
@@ -335,7 +341,6 @@ pub(super) fn prepare_resumption(
 ) {
     let resuming_suite = resuming_session.suite();
     cx.common.suite = Some(resuming_suite.into());
-    cx.data.resumption_ciphersuite = Some(resuming_suite.into());
     // The EarlyData extension MUST be supplied together with the
     // PreSharedKey extension.
     let max_early_data_size = resuming_session.max_early_data_size();
@@ -479,7 +484,7 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
                 return Err(cx.common.send_fatal_alert(
                     AlertDescription::UnsupportedExtension,
                     PeerMisbehaved::UnsolicitedEchExtension,
-                ))
+                ));
             }
             // If we offered ECH, and it was rejected, store the retry configs (if any) from
             // the server's ECH extension. We will return them in an error produced at the end
@@ -500,75 +505,78 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
             }
         }
 
-        if let Some(resuming_session) = self.resuming_session {
-            let was_early_traffic = cx.common.early_traffic;
-            if was_early_traffic {
-                if exts.early_data_extension_offered() {
-                    cx.data.early_data.accepted();
-                } else {
-                    cx.data.early_data.rejected();
-                    cx.common.early_traffic = false;
+        match self.resuming_session {
+            Some(resuming_session) => {
+                let was_early_traffic = cx.common.early_traffic;
+                if was_early_traffic {
+                    if exts.early_data_extension_offered() {
+                        cx.data.early_data.accepted();
+                    } else {
+                        cx.data.early_data.rejected();
+                        cx.common.early_traffic = false;
+                    }
                 }
-            }
 
-            if was_early_traffic && !cx.common.early_traffic {
-                // If no early traffic, set the encryption key for handshakes
-                self.key_schedule
-                    .set_handshake_encrypter(cx.common);
-            }
+                if was_early_traffic && !cx.common.early_traffic {
+                    // If no early traffic, set the encryption key for handshakes
+                    self.key_schedule
+                        .set_handshake_encrypter(cx.common);
+                }
 
-            cx.common.peer_certificates = Some(
-                resuming_session
-                    .server_cert_chain()
-                    .clone(),
-            );
-            cx.common.handshake_kind = Some(HandshakeKind::Resumed);
+                cx.common.peer_certificates = Some(
+                    resuming_session
+                        .server_cert_chain()
+                        .clone(),
+                );
+                cx.common.handshake_kind = Some(HandshakeKind::Resumed);
 
-            // We *don't* reverify the certificate chain here: resumption is a
-            // continuation of the previous session in terms of security policy.
-            let cert_verified = verify::ServerCertVerified::assertion();
-            let sig_verified = verify::HandshakeSignatureValid::assertion();
-            Ok(Box::new(ExpectFinished {
-                config: self.config,
-                server_name: self.server_name,
-                randoms: self.randoms,
-                suite: self.suite,
-                transcript: self.transcript,
-                key_schedule: self.key_schedule,
-                client_auth: None,
-                cert_verified,
-                sig_verified,
-                ech_retry_configs,
-            }))
-        } else {
-            if exts.early_data_extension_offered() {
-                return Err(PeerMisbehaved::EarlyDataExtensionWithoutResumption.into());
-            }
-            cx.common
-                .handshake_kind
-                .get_or_insert(HandshakeKind::Full);
-
-            Ok(if self.hello.offered_cert_compression {
-                Box::new(ExpectCertificateOrCompressedCertificateOrCertReq {
+                // We *don't* reverify the certificate chain here: resumption is a
+                // continuation of the previous session in terms of security policy.
+                let cert_verified = verify::ServerCertVerified::assertion();
+                let sig_verified = verify::HandshakeSignatureValid::assertion();
+                Ok(Box::new(ExpectFinished {
                     config: self.config,
                     server_name: self.server_name,
                     randoms: self.randoms,
                     suite: self.suite,
                     transcript: self.transcript,
                     key_schedule: self.key_schedule,
+                    client_auth: None,
+                    cert_verified,
+                    sig_verified,
                     ech_retry_configs,
+                }))
+            }
+            _ => {
+                if exts.early_data_extension_offered() {
+                    return Err(PeerMisbehaved::EarlyDataExtensionWithoutResumption.into());
+                }
+                cx.common
+                    .handshake_kind
+                    .get_or_insert(HandshakeKind::Full);
+
+                Ok(if self.hello.offered_cert_compression {
+                    Box::new(ExpectCertificateOrCompressedCertificateOrCertReq {
+                        config: self.config,
+                        server_name: self.server_name,
+                        randoms: self.randoms,
+                        suite: self.suite,
+                        transcript: self.transcript,
+                        key_schedule: self.key_schedule,
+                        ech_retry_configs,
+                    })
+                } else {
+                    Box::new(ExpectCertificateOrCertReq {
+                        config: self.config,
+                        server_name: self.server_name,
+                        randoms: self.randoms,
+                        suite: self.suite,
+                        transcript: self.transcript,
+                        key_schedule: self.key_schedule,
+                        ech_retry_configs,
+                    })
                 })
-            } else {
-                Box::new(ExpectCertificateOrCertReq {
-                    config: self.config,
-                    server_name: self.server_name,
-                    randoms: self.randoms,
-                    suite: self.suite,
-                    transcript: self.transcript,
-                    key_schedule: self.key_schedule,
-                    ech_retry_configs,
-                })
-            })
+            }
         }
     }
 
@@ -1479,6 +1487,8 @@ impl ExpectTraffic {
                 .peer_certificates
                 .clone()
                 .unwrap_or_default(),
+            &self.config.verifier,
+            &self.config.client_auth_cert_resolver,
             now,
             nst.lifetime,
             nst.age_add,
@@ -1493,7 +1503,7 @@ impl ExpectTraffic {
                 }
             }
 
-            if let Some(ref quic_params) = &cx.common.quic.params {
+            if let Some(quic_params) = &cx.common.quic.params {
                 value.set_quic_params(quic_params);
             }
         }
@@ -1546,19 +1556,19 @@ impl State<ClientConnectionData> for ExpectTraffic {
             MessagePayload::Handshake {
                 parsed:
                     HandshakeMessagePayload {
-                        payload: HandshakePayload::NewSessionTicketTls13(ref new_ticket),
+                        payload: HandshakePayload::NewSessionTicketTls13(new_ticket),
                         ..
                     },
                 ..
-            } => self.handle_new_ticket_tls13(cx, new_ticket)?,
+            } => self.handle_new_ticket_tls13(cx, &new_ticket)?,
             MessagePayload::Handshake {
                 parsed:
                     HandshakeMessagePayload {
-                        payload: HandshakePayload::KeyUpdate(ref key_update),
+                        payload: HandshakePayload::KeyUpdate(key_update),
                         ..
                     },
                 ..
-            } => self.handle_key_update(cx.common, key_update)?,
+            } => self.handle_key_update(cx.common, &key_update)?,
             payload => {
                 return Err(inappropriate_handshake_message(
                     &payload,

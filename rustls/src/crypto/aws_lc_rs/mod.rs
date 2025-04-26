@@ -156,12 +156,11 @@ pub mod cipher_suite {
 
     #[cfg(feature = "impit")]
     pub use super::tls13::{
-        TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
-        TLS13_RESERVED_GREASE, TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-        TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-        TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA, TLS_RSA_WITH_AES_128_CBC_SHA,
-        TLS_RSA_WITH_AES_128_GCM_SHA256, TLS_RSA_WITH_AES_256_CBC_SHA,
-        TLS_RSA_WITH_AES_256_GCM_SHA384,
+        TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+        TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+        TLS_RSA_WITH_AES_128_CBC_SHA, TLS_RSA_WITH_AES_128_GCM_SHA256,
+        TLS_RSA_WITH_AES_256_CBC_SHA, TLS_RSA_WITH_AES_256_GCM_SHA384, TLS13_AES_128_GCM_SHA256,
+        TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256, TLS13_RESERVED_GREASE,
     };
 }
 
@@ -309,9 +308,11 @@ mod tests {
     #[cfg(feature = "fips")]
     #[test]
     fn default_suites_are_fips() {
-        assert!(super::DEFAULT_CIPHER_SUITES
-            .iter()
-            .all(|scs| scs.fips()));
+        assert!(
+            super::DEFAULT_CIPHER_SUITES
+                .iter()
+                .all(|scs| scs.fips())
+        );
     }
 
     #[cfg(not(feature = "fips"))]
