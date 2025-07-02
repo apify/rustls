@@ -515,6 +515,10 @@ enum_builder! {
         RSA_PSS_SHA512 => 0x0806,
         ED25519 => 0x0807,
         ED448 => 0x0808,
+        // https://datatracker.ietf.org/doc/html/draft-ietf-tls-mldsa-00#name-iana-considerations
+        ML_DSA_44 => 0x0904,
+        ML_DSA_65 => 0x0905,
+        ML_DSA_87 => 0x0906,
     }
 }
 
@@ -606,6 +610,19 @@ enum_builder! {
 }
 
 enum_builder! {
+    /// The `CertificateType` enum sent in the cert_type extensions.
+    /// Values in this enum are taken from the various RFCs covering TLS, and are listed by IANA.
+    ///
+    /// [RFC 6091 Section 5]: <https://datatracker.ietf.org/doc/html/rfc6091#section-5>
+    /// [RFC 7250 Section 7]: <https://datatracker.ietf.org/doc/html/rfc7250#section-7>
+    #[repr(u8)]
+    pub enum CertificateType {
+        X509 => 0x00,
+        RawPublicKey => 0x02,
+    }
+}
+
+enum_builder! {
     /// The type of Encrypted Client Hello (`EchClientHelloType`).
     ///
     /// Specified in [draft-ietf-tls-esni Section 5].
@@ -636,6 +653,7 @@ mod tests {
             CertificateCompressionAlgorithm::Zlib,
             CertificateCompressionAlgorithm::Zstd,
         );
+        test_enum8::<CertificateType>(CertificateType::X509, CertificateType::RawPublicKey);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use pki_types::{ServerName, UnixTime};
 #[cfg(feature = "impit")]
 use super::BrowserEmulator;
 use super::handy::NoClientSessionStorage;
-use super::hs;
+use super::hs::{self, ClientHelloInput};
 #[cfg(feature = "std")]
 use crate::WantsVerifier;
 use crate::builder::ConfigBuilder;
@@ -18,9 +18,10 @@ use crate::conn::{ConnectionCore, UnbufferedConnectionCommon};
 use crate::crypto::{CryptoProvider, SupportedKxGroup};
 use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::error::Error;
+use crate::kernel::KernelConnection;
 use crate::log::trace;
 use crate::msgs::enums::NamedGroup;
-use crate::msgs::handshake::ClientExtension;
+use crate::msgs::handshake::ClientExtensionsInput;
 use crate::msgs::persist;
 use crate::suites::{ExtractedSecrets, SupportedCipherSuite};
 use crate::sync::Arc;
@@ -322,9 +323,9 @@ impl ClientConfig {
         // Safety assumptions:
         // 1. that the provider has been installed (explicitly or implicitly)
         // 2. that the process-level default provider is usable with the supplied protocol versions.
-        Self::builder_with_provider(Arc::clone(
-            CryptoProvider::get_default_or_install_from_crate_features(),
-        ))
+        Self::builder_with_provider(
+            CryptoProvider::get_default_or_install_from_crate_features().clone(),
+        )
         .with_protocol_versions(versions)
         .unwrap()
     }
@@ -404,6 +405,10 @@ impl ClientConfig {
     /// extra care.
     pub fn dangerous(&mut self) -> danger::DangerousClientConfig<'_> {
         danger::DangerousClientConfig { cfg: self }
+    }
+
+    pub(super) fn needs_key_share(&self) -> bool {
+        self.supports_version(ProtocolVersion::TLSv1_3)
     }
 
     /// We support a given TLS version if it's quoted in the configured
@@ -643,7 +648,7 @@ mod connection {
 
     use pki_types::ServerName;
 
-    use super::ClientConnectionData;
+    use super::{ClientConnectionData, ClientExtensionsInput};
     use crate::ClientConfig;
     use crate::client::EchStatus;
     use crate::common_state::Protocol;
@@ -712,11 +717,24 @@ mod connection {
         /// we behave in the TLS protocol, `name` is the
         /// name of the server we want to talk to.
         pub fn new(config: Arc<ClientConfig>, name: ServerName<'static>) -> Result<Self, Error> {
-            Ok(Self {
-                inner: ConnectionCore::for_client(config, name, Vec::new(), Protocol::Tcp)?.into(),
-            })
+            Self::new_with_alpn(config.clone(), name, config.alpn_protocols.clone())
         }
 
+        /// Make a new ClientConnection with custom ALPN protocols.
+        pub fn new_with_alpn(
+            config: Arc<ClientConfig>,
+            name: ServerName<'static>,
+            alpn_protocols: Vec<Vec<u8>>,
+        ) -> Result<Self, Error> {
+            Ok(Self {
+                inner: ConnectionCommon::from(ConnectionCore::for_client(
+                    config,
+                    name,
+                    ClientExtensionsInput::from_alpn(alpn_protocols),
+                    Protocol::Tcp,
+                )?),
+            })
+        }
         /// Returns an `io::Write` implementer you can write bytes to
         /// to send TLS1.3 early data (a.k.a. "0-RTT data") to the server.
         ///
@@ -767,6 +785,11 @@ mod connection {
         /// Return the connection's Encrypted Client Hello (ECH) status.
         pub fn ech_status(&self) -> EchStatus {
             self.inner.core.data.ech_status
+        }
+
+        /// Returns the number of TLS1.3 tickets that have been received.
+        pub fn tls13_tickets_received(&self) -> u32 {
+            self.inner.tls13_tickets_received
         }
 
         /// Return true if the connection was made with a `ClientConfig` that is FIPS compatible.
@@ -831,7 +854,7 @@ impl ConnectionCore<ClientConnectionData> {
     pub(crate) fn for_client(
         config: Arc<ClientConfig>,
         name: ServerName<'static>,
-        extra_exts: Vec<ClientExtension>,
+        extra_exts: ClientExtensionsInput<'static>,
         proto: Protocol,
     ) -> Result<Self, Error> {
         let mut common_state = CommonState::new(Side::Client);
@@ -848,7 +871,8 @@ impl ConnectionCore<ClientConnectionData> {
             sendable_plaintext: None,
         };
 
-        let state = hs::start_handshake(name, extra_exts, config, &mut cx)?;
+        let input = ClientHelloInput::new(name, &extra_exts, &mut cx, config)?;
+        let state = input.start_handshake(extra_exts, &mut cx)?;
         Ok(Self::new(state, data, common_state))
     }
 
@@ -869,15 +893,69 @@ impl UnbufferedClientConnection {
     /// Make a new ClientConnection. `config` controls how we behave in the TLS protocol, `name` is
     /// the name of the server we want to talk to.
     pub fn new(config: Arc<ClientConfig>, name: ServerName<'static>) -> Result<Self, Error> {
+        Self::new_with_extensions(
+            config.clone(),
+            name,
+            ClientExtensionsInput::from_alpn(config.alpn_protocols.clone()),
+        )
+    }
+
+    /// Make a new UnbufferedClientConnection with custom ALPN protocols.
+    pub fn new_with_alpn(
+        config: Arc<ClientConfig>,
+        name: ServerName<'static>,
+        alpn_protocols: Vec<Vec<u8>>,
+    ) -> Result<Self, Error> {
+        Self::new_with_extensions(
+            config,
+            name,
+            ClientExtensionsInput::from_alpn(alpn_protocols),
+        )
+    }
+
+    fn new_with_extensions(
+        config: Arc<ClientConfig>,
+        name: ServerName<'static>,
+        extensions: ClientExtensionsInput<'static>,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            inner: ConnectionCore::for_client(config, name, Vec::new(), Protocol::Tcp)?.into(),
+            inner: UnbufferedConnectionCommon::from(ConnectionCore::for_client(
+                config,
+                name,
+                extensions,
+                Protocol::Tcp,
+            )?),
         })
     }
 
     /// Extract secrets, so they can be used when configuring kTLS, for example.
     /// Should be used with care as it exposes secret key material.
+    #[deprecated = "dangerous_extract_secrets() does not support session tickets or \
+                    key updates, use dangerous_into_kernel_connection() instead"]
     pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
         self.inner.dangerous_extract_secrets()
+    }
+
+    /// Extract secrets and a [`KernelConnection`] object.
+    ///
+    /// This allows you use rustls to manage keys and then manage encryption and
+    /// decryption yourself (e.g. for kTLS).
+    ///
+    /// Should be used with care as it exposes secret key material.
+    ///
+    /// See the [`crate::kernel`] documentations for details on prerequisites
+    /// for calling this method.
+    pub fn dangerous_into_kernel_connection(
+        self,
+    ) -> Result<(ExtractedSecrets, KernelConnection<ClientConnectionData>), Error> {
+        self.inner
+            .core
+            .dangerous_into_kernel_connection()
+    }
+
+    /// Returns the number of TLS1.3 tickets that have been received.
+    pub fn tls13_tickets_received(&self) -> u32 {
+        self.inner.tls13_tickets_received
     }
 }
 

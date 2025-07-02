@@ -27,7 +27,7 @@ use std::{process, str};
 use clap::Parser;
 use mio::net::TcpStream;
 use rustls::RootCertStore;
-use rustls::crypto::{CryptoProvider, aws_lc_rs as provider};
+use rustls::crypto::{CryptoProvider, SupportedKxGroup, aws_lc_rs as provider};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
@@ -93,7 +93,7 @@ impl TlsClient {
                 if error.kind() == io::ErrorKind::WouldBlock {
                     return;
                 }
-                println!("TLS read error: {:?}", error);
+                println!("TLS read error: {error:?}");
                 self.closing = true;
                 return;
             }
@@ -232,6 +232,10 @@ struct Args {
     #[clap(long)]
     suite: Vec<String>,
 
+    /// Disable default key exchange list, and use KX instead. Maybe be used multiple times.
+    #[clap(long)]
+    key_exchange: Vec<String>,
+
     /// Send ALPN extension containing PROTOCOL.
     /// May be used multiple times to offer several protocols.
     #[clap(long)]
@@ -283,6 +287,19 @@ fn find_suite(name: &str) -> Option<rustls::SupportedCipherSuite> {
     None
 }
 
+/// Find a key exchange with the given name
+fn find_key_exchange(name: &str) -> &'static dyn SupportedKxGroup {
+    for kx_group in provider::ALL_KX_GROUPS {
+        let kx_name = format!("{:?}", kx_group.name()).to_lowercase();
+
+        if kx_name == name.to_string().to_lowercase() {
+            return *kx_group;
+        }
+    }
+
+    panic!("cannot find key exchange with name '{name}'");
+}
+
 /// Make a vector of ciphersuites named in `suites`
 fn lookup_suites(suites: &[String]) -> Vec<rustls::SupportedCipherSuite> {
     let mut out = Vec::new();
@@ -291,7 +308,7 @@ fn lookup_suites(suites: &[String]) -> Vec<rustls::SupportedCipherSuite> {
         let scs = find_suite(csname);
         match scs {
             Some(s) => out.push(s),
-            None => panic!("cannot look up ciphersuite '{}'", csname),
+            None => panic!("cannot look up ciphersuite '{csname}'"),
         }
     }
 
@@ -306,10 +323,7 @@ fn lookup_versions(versions: &[String]) -> Vec<&'static rustls::SupportedProtoco
         let version = match vname.as_ref() {
             "1.2" => &rustls::version::TLS12,
             "1.3" => &rustls::version::TLS13,
-            _ => panic!(
-                "cannot look up version '{}', valid are '1.2' and '1.3'",
-                vname
-            ),
+            _ => panic!("cannot look up version '{vname}', valid are '1.2' and '1.3'"),
         };
         out.push(version);
     }
@@ -415,6 +429,14 @@ fn make_config(args: &Args) -> Arc<rustls::ClientConfig> {
         provider::DEFAULT_CIPHER_SUITES.to_vec()
     };
 
+    let kx_groups = match args.key_exchange.as_slice() {
+        [] => provider::DEFAULT_KX_GROUPS.to_vec(),
+        items => items
+            .iter()
+            .map(|kx| find_key_exchange(kx))
+            .collect::<Vec<&'static dyn SupportedKxGroup>>(),
+    };
+
     let versions = if !args.protover.is_empty() {
         lookup_versions(&args.protover)
     } else {
@@ -424,6 +446,7 @@ fn make_config(args: &Args) -> Arc<rustls::ClientConfig> {
     let config = rustls::ClientConfig::builder_with_provider(
         CryptoProvider {
             cipher_suites: suites,
+            kx_groups,
             ..provider::default_provider()
         }
         .into(),
@@ -526,7 +549,7 @@ fn main() {
             // Polling can be interrupted (e.g. by a debugger) - retry if so.
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                panic!("poll failed: {:?}", e)
+                panic!("poll failed: {e:?}")
             }
         }
 

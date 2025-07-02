@@ -1,6 +1,6 @@
 #![allow(clippy::upper_case_acronyms)]
 #![allow(non_camel_case_types)]
-use crate::crypto::KeyExchangeAlgorithm;
+use crate::crypto::{KeyExchangeAlgorithm, hash};
 use crate::msgs::codec::{Codec, Reader};
 
 enum_builder! {
@@ -16,6 +16,32 @@ enum_builder! {
         SHA256 => 0x04,
         SHA384 => 0x05,
         SHA512 => 0x06,
+    }
+}
+
+impl HashAlgorithm {
+    /// Returns the hash of the empty input.
+    ///
+    /// This returns `None` for some hash algorithms, so the caller
+    /// should be prepared to do the computation themselves in this case.
+    pub(crate) fn hash_for_empty_input(&self) -> Option<hash::Output> {
+        match self {
+            Self::SHA256 => Some(hash::Output::new(
+                b"\xe3\xb0\xc4\x42\x98\xfc\x1c\x14\
+                  \x9a\xfb\xf4\xc8\x99\x6f\xb9\x24\
+                  \x27\xae\x41\xe4\x64\x9b\x93\x4c\
+                  \xa4\x95\x99\x1b\x78\x52\xb8\x55",
+            )),
+            Self::SHA384 => Some(hash::Output::new(
+                b"\x38\xb0\x60\xa7\x51\xac\x96\x38\
+                  \x4c\xd9\x32\x7e\xb1\xb1\xe3\x6a\
+                  \x21\xfd\xb7\x11\x14\xbe\x07\x43\
+                  \x4c\x0c\xc7\xbf\x63\xf6\xe1\xda\
+                  \x27\x4e\xde\xbf\xe7\x6f\x65\xfb\
+                  \xd5\x1a\xd2\xf1\x48\x98\xb9\x5b",
+            )),
+            _ => None,
+        }
     }
 }
 
@@ -260,10 +286,6 @@ enum_builder! {
     }
 }
 
-impl ECPointFormat {
-    pub(crate) const SUPPORTED: [Self; 1] = [Self::Uncompressed];
-}
-
 enum_builder! {
     /// The `HeartbeatMode` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
@@ -316,19 +338,6 @@ enum_builder! {
     #[repr(u8)]
     pub enum CertificateStatusType {
         OCSP => 0x01,
-    }
-}
-
-enum_builder! {
-    /// The `CertificateType` enum sent in the cert_type extensions.
-    /// Values in this enum are taken from the various RFCs covering TLS, and are listed by IANA.
-    ///
-    /// [RFC 6091 Section 5]: <https://datatracker.ietf.org/doc/html/rfc6091#section-5>
-    /// [RFC 7250 Section 7]: <https://datatracker.ietf.org/doc/html/rfc7250#section-7>
-    #[repr(u8)]
-    pub enum CertificateType {
-        X509 => 0x00,
-        RawPublicKey => 0x02,
     }
 }
 
@@ -464,7 +473,6 @@ pub(crate) mod tests {
             CertificateStatusType::OCSP,
             CertificateStatusType::OCSP,
         );
-        test_enum8::<CertificateType>(CertificateType::X509, CertificateType::RawPublicKey);
     }
 
     pub(crate) fn test_enum8<T: for<'a> Codec<'a>>(first: T, last: T) {

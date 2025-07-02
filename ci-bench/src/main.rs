@@ -1,8 +1,23 @@
+#![warn(
+    clippy::alloc_instead_of_core,
+    clippy::manual_let_else,
+    clippy::std_instead_of_core,
+    clippy::use_self,
+    clippy::upper_case_acronyms,
+    elided_lifetimes_in_paths,
+    trivial_casts,
+    trivial_numeric_casts,
+    unreachable_pub,
+    unused_import_braces,
+    unused_extern_crates,
+    unused_qualifications
+)]
+
+use core::hint::black_box;
+use core::mem;
 use std::collections::HashMap;
 use std::fs::File;
-use std::hint::black_box;
 use std::io::{self, BufRead, BufReader, Write};
-use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,20 +32,18 @@ use rayon::iter::Either;
 use rayon::prelude::*;
 use rustls::client::Resumption;
 use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom, aws_lc_rs, ring};
-use rustls::pki_types::CertificateDer;
-use rustls::pki_types::pem::PemObject;
 use rustls::server::{NoServerSessionStorage, ServerSessionMemoryCache, WebPkiClientVerifier};
 use rustls::{
     CipherSuite, ClientConfig, ClientConnection, HandshakeKind, ProtocolVersion, RootCertStore,
     ServerConfig, ServerConnection,
 };
+use rustls_test::KeyType;
 
 use crate::benchmark::{
-    Benchmark, BenchmarkKind, BenchmarkParams, ResumptionKind, get_reported_instr_count,
-    validate_benchmarks,
+    AuthKeySource, Benchmark, BenchmarkKind, BenchmarkParams, ResumptionKind,
+    get_reported_instr_count, validate_benchmarks,
 };
 use crate::callgrind::{CallgrindRunner, CountInstructions};
-use crate::util::KeyType;
 use crate::util::async_io::{self, AsyncRead, AsyncWrite};
 use crate::util::transport::{
     read_handshake_message, read_plaintext_to_end_bounded, send_handshake_message,
@@ -104,8 +117,8 @@ impl Side {
     /// Returns the string representation of the side
     pub fn as_str(self) -> &'static str {
         match self {
-            Side::Client => "client",
-            Side::Server => "server",
+            Self::Client => "client",
+            Self::Server => "server",
         }
     }
 }
@@ -301,12 +314,14 @@ fn all_benchmarks_params() -> Vec<BenchmarkParams> {
         (
             derandomize(ring::default_provider()),
             ring::ALL_CIPHER_SUITES,
+            #[allow(trivial_casts)]
             &(ring_ticketer as fn() -> Arc<dyn rustls::server::ProducesTickets>),
             "ring",
         ),
         (
             derandomize(aws_lc_rs::default_provider()),
             aws_lc_rs::ALL_CIPHER_SUITES,
+            #[allow(trivial_casts)]
             &(aws_lc_rs_ticketer as fn() -> Arc<dyn rustls::server::ProducesTickets>),
             "aws_lc_rs",
         ),
@@ -358,13 +373,35 @@ fn all_benchmarks_params() -> Vec<BenchmarkParams> {
             all.push(BenchmarkParams::new(
                 provider.clone(),
                 ticketer,
-                key_type,
+                AuthKeySource::KeyType(key_type),
                 find_suite(suites, suite_name),
                 version,
                 format!("{provider_name}_{name}"),
             ));
         }
     }
+
+    #[allow(trivial_casts)] // false positive
+    let make_ticketer = &((|| Arc::new(rustls_fuzzing_provider::Ticketer))
+        as fn() -> Arc<dyn rustls::server::ProducesTickets>);
+
+    all.push(BenchmarkParams::new(
+        rustls_fuzzing_provider::provider(),
+        make_ticketer,
+        AuthKeySource::FuzzingProvider,
+        rustls_fuzzing_provider::TLS13_FUZZING_SUITE,
+        &rustls::version::TLS13,
+        "1.3_no_crypto".to_string(),
+    ));
+
+    all.push(BenchmarkParams::new(
+        rustls_fuzzing_provider::provider(),
+        make_ticketer,
+        AuthKeySource::FuzzingProvider,
+        rustls_fuzzing_provider::TLS_FUZZING_SUITE,
+        &rustls::version::TLS12,
+        "1.2_no_crypto".to_string(),
+    ));
 
     all
 }
@@ -503,14 +540,8 @@ struct ClientSideStepper<'a> {
 impl ClientSideStepper<'_> {
     fn make_config(params: &BenchmarkParams, resume: ResumptionKind) -> Arc<ClientConfig> {
         assert_eq!(params.ciphersuite.version(), params.version);
-        let mut root_store = RootCertStore::empty();
-        root_store.add_parsable_certificates(
-            CertificateDer::pem_file_iter(params.key_type.path_for("ca.cert"))
-                .unwrap()
-                .map(|result| result.unwrap()),
-        );
 
-        let mut cfg = ClientConfig::builder_with_provider(
+        let cfg = ClientConfig::builder_with_provider(
             CryptoProvider {
                 cipher_suites: vec![params.ciphersuite],
                 ..params.provider.clone()
@@ -518,9 +549,24 @@ impl ClientSideStepper<'_> {
             .into(),
         )
         .with_protocol_versions(&[params.version])
-        .unwrap()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .unwrap();
+
+        let mut cfg = match params.auth_key {
+            AuthKeySource::KeyType(key_type) => {
+                let mut root_store = RootCertStore::empty();
+                root_store
+                    .add(key_type.ca_cert())
+                    .unwrap();
+
+                cfg.with_root_certificates(root_store)
+                    .with_no_client_auth()
+            }
+
+            AuthKeySource::FuzzingProvider => cfg
+                .dangerous()
+                .with_custom_certificate_verifier(rustls_fuzzing_provider::server_verifier())
+                .with_no_client_auth(),
+        };
 
         if resume != ResumptionKind::No {
             cfg.resumption = Resumption::in_memory_sessions(128);
@@ -590,12 +636,20 @@ impl ServerSideStepper<'_> {
     fn make_config(params: &BenchmarkParams, resume: ResumptionKind) -> Arc<ServerConfig> {
         assert_eq!(params.ciphersuite.version(), params.version);
 
-        let mut cfg = ServerConfig::builder_with_provider(params.provider.clone().into())
+        let cfg = ServerConfig::builder_with_provider(params.provider.clone().into())
             .with_protocol_versions(&[params.version])
-            .unwrap()
-            .with_client_cert_verifier(WebPkiClientVerifier::no_client_auth())
-            .with_single_cert(params.key_type.get_chain(), params.key_type.get_key())
-            .expect("bad certs/private key?");
+            .unwrap();
+
+        let mut cfg = match params.auth_key {
+            AuthKeySource::KeyType(key_type) => cfg
+                .with_client_cert_verifier(WebPkiClientVerifier::no_client_auth())
+                .with_single_cert(key_type.get_chain(), key_type.get_key())
+                .expect("bad certs/private key?"),
+
+            AuthKeySource::FuzzingProvider => cfg
+                .with_client_cert_verifier(WebPkiClientVerifier::no_client_auth())
+                .with_cert_resolver(rustls_fuzzing_provider::server_cert_resolver()),
+        };
 
         if resume == ResumptionKind::SessionId {
             cfg.session_storage = ServerSessionMemoryCache::new(128);
