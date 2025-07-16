@@ -40,8 +40,8 @@ use crate::sign::{CertifiedKey, Signer};
 use crate::suites::PartiallyExtractedSecrets;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::{
-    KeyScheduleEarly, KeyScheduleHandshake, KeySchedulePreHandshake, KeyScheduleTraffic,
-    ResumptionSecret,
+    KeyScheduleEarly, KeyScheduleHandshake, KeySchedulePreHandshake, KeyScheduleResumption,
+    KeyScheduleTraffic,
 };
 use crate::tls13::{
     Tls13CipherSuite, construct_client_verify_message, construct_server_verify_message,
@@ -180,9 +180,21 @@ pub(super) fn handle_server_hello(
 
     // If we have ECH state, check that the server accepted our offer.
     if let Some(ech_state) = ech_state {
+        let Message {
+            payload:
+                MessagePayload::Handshake {
+                    encoded: server_hello_encoded,
+                    ..
+                },
+            ..
+        } = &server_hello_msg
+        else {
+            unreachable!("ServerHello is a handshake message");
+        };
         cx.data.ech_status = match ech_state.confirm_acceptance(
             &mut key_schedule,
             server_hello,
+            server_hello_encoded,
             suite.common.hash_provider,
         )? {
             // The server accepted our ECH offer, so complete the inner transcript with the
@@ -1410,7 +1422,8 @@ impl State<ClientConnectionData> for ExpectFinished {
 
         /* Now move to our application traffic keys. */
         cx.common.check_aligned_handshake()?;
-        let key_schedule_traffic = key_schedule_pre_finished.into_traffic(cx.common);
+        let (key_schedule, resumption) =
+            key_schedule_pre_finished.into_traffic(cx.common, st.transcript.current_hash());
         cx.common
             .start_traffic(&mut cx.sendable_plaintext);
 
@@ -1426,8 +1439,8 @@ impl State<ClientConnectionData> for ExpectFinished {
             session_storage: st.config.resumption.store.clone(),
             server_name: st.server_name,
             suite: st.suite,
-            transcript: st.transcript,
-            key_schedule: key_schedule_traffic,
+            key_schedule,
+            resumption,
             _cert_verified: st.cert_verified,
             _sig_verified: st.sig_verified,
             _fin_verified: fin,
@@ -1452,8 +1465,8 @@ struct ExpectTraffic {
     session_storage: Arc<dyn ClientSessionStore>,
     server_name: ServerName<'static>,
     suite: &'static Tls13CipherSuite,
-    transcript: HandshakeHash,
     key_schedule: KeyScheduleTraffic,
+    resumption: KeyScheduleResumption,
     _cert_verified: verify::ServerCertVerified,
     _sig_verified: verify::HandshakeSignatureValid,
     _fin_verified: verify::FinishedMessageVerified,
@@ -1465,8 +1478,8 @@ impl ExpectTraffic {
         cx: &mut KernelContext<'_>,
         nst: &NewSessionTicketPayloadTls13,
     ) -> Result<(), Error> {
-        let handshake_hash = self.transcript.current_hash();
-        let secret = ResumptionSecret::new(&self.key_schedule, &handshake_hash)
+        let secret = self
+            .resumption
             .derive_ticket_psk(&nst.nonce.0);
 
         let now = self.config.current_time()?;
