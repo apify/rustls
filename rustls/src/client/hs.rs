@@ -8,8 +8,8 @@ use pki_types::ServerName;
 
 #[cfg(feature = "tls12")]
 use super::tls12;
-use crate::NamedGroup;
 use super::{ResolvesClientCert, Tls12Resumption};
+use crate::NamedGroup;
 use crate::SupportedCipherSuite;
 #[cfg(feature = "logging")]
 use crate::bs_debug;
@@ -34,9 +34,7 @@ use crate::log::{debug, trace};
 use crate::msgs::base::Payload;
 #[cfg(feature = "impit")]
 use crate::msgs::base::{PayloadU8, PayloadU16};
-use crate::msgs::enums::{
-    Compression, ExtensionType,
-};
+use crate::msgs::enums::{Compression, ExtensionType};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
     ClientSessionTicket, EncryptedClientHello, HandshakeMessagePayload, HandshakePayload,
