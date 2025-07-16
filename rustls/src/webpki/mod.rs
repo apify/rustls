@@ -4,7 +4,9 @@ use core::fmt;
 use pki_types::CertificateRevocationListDer;
 use webpki::{CertRevocationList, InvalidNameContext, OwnedCertRevocationList};
 
-use crate::error::{CertRevocationListError, CertificateError, Error, OtherError};
+use crate::error::{
+    CertRevocationListError, CertificateError, Error, ExtendedKeyPurpose, OtherError,
+};
 #[cfg(feature = "std")]
 use crate::sync::Arc;
 
@@ -46,7 +48,7 @@ impl fmt::Display for VerifierBuilderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoRootAnchors => write!(f, "no root trust anchors were provided"),
-            Self::InvalidCrl(e) => write!(f, "provided CRL could not be parsed: {:?}", e),
+            Self::InvalidCrl(e) => write!(f, "provided CRL could not be parsed: {e:?}"),
         }
     }
 }
@@ -81,17 +83,28 @@ fn pki_error(error: webpki::Error) -> Error {
         }
         IssuerNotCrlSigner => CertRevocationListError::IssuerInvalidForCrl.into(),
 
-        InvalidSignatureForPublicKey
-        | UnsupportedSignatureAlgorithm
-        | UnsupportedSignatureAlgorithmForPublicKey => CertificateError::BadSignature.into(),
-
-        InvalidCrlSignatureForPublicKey
-        | UnsupportedCrlSignatureAlgorithm
-        | UnsupportedCrlSignatureAlgorithmForPublicKey => {
-            CertRevocationListError::BadSignature.into()
+        InvalidSignatureForPublicKey => CertificateError::BadSignature.into(),
+        UnsupportedSignatureAlgorithm | UnsupportedSignatureAlgorithmForPublicKey => {
+            CertificateError::UnsupportedSignatureAlgorithm.into()
         }
 
+        InvalidCrlSignatureForPublicKey => CertRevocationListError::BadSignature.into(),
+        UnsupportedCrlSignatureAlgorithm | UnsupportedCrlSignatureAlgorithmForPublicKey => {
+            CertRevocationListError::UnsupportedSignatureAlgorithm.into()
+        }
+
+        #[allow(deprecated)]
         RequiredEkuNotFound => CertificateError::InvalidPurpose.into(),
+        RequiredEkuNotFoundContext(webpki::RequiredEkuNotFoundContext { required, present }) => {
+            CertificateError::InvalidPurposeContext {
+                required: ExtendedKeyPurpose::for_values(required.oid_values()),
+                presented: present
+                    .into_iter()
+                    .map(|eku| ExtendedKeyPurpose::for_values(eku.into_iter()))
+                    .collect(),
+            }
+            .into()
+        }
 
         _ => CertificateError::Other(OtherError(
             #[cfg(feature = "std")]
@@ -104,9 +117,10 @@ fn pki_error(error: webpki::Error) -> Error {
 fn crl_error(e: webpki::Error) -> CertRevocationListError {
     use webpki::Error::*;
     match e {
-        InvalidCrlSignatureForPublicKey
-        | UnsupportedCrlSignatureAlgorithm
-        | UnsupportedCrlSignatureAlgorithmForPublicKey => CertRevocationListError::BadSignature,
+        InvalidCrlSignatureForPublicKey => CertRevocationListError::BadSignature,
+        UnsupportedCrlSignatureAlgorithm | UnsupportedCrlSignatureAlgorithmForPublicKey => {
+            CertRevocationListError::UnsupportedSignatureAlgorithm
+        }
         InvalidCrlNumber => CertRevocationListError::InvalidCrlNumber,
         InvalidSerialNumber => CertRevocationListError::InvalidRevokedCertSerialNumber,
         IssuerNotCrlSigner => CertRevocationListError::IssuerInvalidForCrl,
@@ -145,11 +159,15 @@ mod tests {
         );
         assert_eq!(
             pki_error(webpki::Error::UnsupportedCrlSignatureAlgorithm),
-            Error::InvalidCertRevocationList(CertRevocationListError::BadSignature),
+            Error::InvalidCertRevocationList(
+                CertRevocationListError::UnsupportedSignatureAlgorithm
+            ),
         );
         assert_eq!(
             pki_error(webpki::Error::UnsupportedCrlSignatureAlgorithmForPublicKey),
-            Error::InvalidCertRevocationList(CertRevocationListError::BadSignature),
+            Error::InvalidCertRevocationList(
+                CertRevocationListError::UnsupportedSignatureAlgorithm
+            ),
         );
 
         // Revoked cert errors should be turned into Revoked.
@@ -174,11 +192,11 @@ mod tests {
             (webpki::Error::InvalidCrlSignatureForPublicKey, BadSignature),
             (
                 webpki::Error::UnsupportedCrlSignatureAlgorithm,
-                BadSignature,
+                UnsupportedSignatureAlgorithm,
             ),
             (
                 webpki::Error::UnsupportedCrlSignatureAlgorithmForPublicKey,
-                BadSignature,
+                UnsupportedSignatureAlgorithm,
             ),
             (webpki::Error::InvalidCrlNumber, InvalidCrlNumber),
             (

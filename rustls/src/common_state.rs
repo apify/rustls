@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 
 use pki_types::CertificateDer;
 
+use crate::conn::kernel::KernelState;
 use crate::crypto::SupportedKxGroup;
 use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
 use crate::error::{Error, InvalidMessage, PeerMisbehaved};
@@ -13,7 +14,7 @@ use crate::msgs::base::Payload;
 use crate::msgs::codec::Codec;
 use crate::msgs::enums::{AlertLevel, KeyUpdateRequest};
 use crate::msgs::fragmenter::MessageFragmenter;
-use crate::msgs::handshake::{CertificateChain, HandshakeMessagePayload};
+use crate::msgs::handshake::{CertificateChain, HandshakeMessagePayload, ProtocolName};
 use crate::msgs::message::{
     Message, MessagePayload, OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage,
     PlainMessage,
@@ -34,7 +35,7 @@ pub struct CommonState {
     pub(crate) record_layer: record_layer::RecordLayer,
     pub(crate) suite: Option<SupportedCipherSuite>,
     pub(crate) kx_state: KxState,
-    pub(crate) alpn_protocol: Option<Vec<u8>>,
+    pub(crate) alpn_protocol: Option<ProtocolName>,
     pub(crate) aligned_handshake: bool,
     pub(crate) may_send_application_data: bool,
     pub(crate) may_receive_application_data: bool,
@@ -59,6 +60,7 @@ pub struct CommonState {
     temper_counters: TemperCounters,
     pub(crate) refresh_traffic_keys_pending: bool,
     pub(crate) fips: bool,
+    pub(crate) tls13_tickets_received: u32,
 }
 
 impl CommonState {
@@ -91,6 +93,7 @@ impl CommonState {
             temper_counters: TemperCounters::default(),
             refresh_traffic_keys_pending: false,
             fips: false,
+            tls13_tickets_received: 0,
         }
     }
 
@@ -502,7 +505,7 @@ impl CommonState {
     }
 
     fn send_warning_alert(&mut self, desc: AlertDescription) {
-        warn!("Sending warning alert {:?}", desc);
+        warn!("Sending warning alert {desc:?}");
         self.send_warning_alert_no_log(desc);
     }
 
@@ -866,6 +869,10 @@ pub(crate) trait State<Data>: Send + Sync {
     }
 
     fn handle_decrypt_error(&self) {}
+
+    fn into_external_state(self: Box<Self>) -> Result<Box<dyn KernelState + 'static>, Error> {
+        Err(Error::HandshakeNotComplete)
+    }
 
     fn into_owned(self: Box<Self>) -> Box<dyn State<Data> + 'static>;
 }

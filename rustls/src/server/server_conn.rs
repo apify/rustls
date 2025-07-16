@@ -20,12 +20,12 @@ use crate::conn::{ConnectionCommon, ConnectionCore, UnbufferedConnectionCommon};
 #[cfg(doc)]
 use crate::crypto;
 use crate::crypto::CryptoProvider;
-use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
+use crate::enums::{CertificateType, CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::error::Error;
+use crate::kernel::KernelConnection;
 use crate::log::trace;
 use crate::msgs::base::Payload;
-use crate::msgs::enums::CertificateType;
-use crate::msgs::handshake::{ClientHelloPayload, ProtocolName, ServerExtension};
+use crate::msgs::handshake::{ClientHelloPayload, ProtocolName, ServerExtensionsInput};
 use crate::msgs::message::Message;
 use crate::suites::ExtractedSecrets;
 use crate::sync::Arc;
@@ -33,7 +33,9 @@ use crate::sync::Arc;
 use crate::time_provider::DefaultTimeProvider;
 use crate::time_provider::TimeProvider;
 use crate::vecbuf::ChunkVecBuffer;
-use crate::{DistinguishedName, KeyLog, WantsVersions, compress, sign, verify, versions};
+use crate::{
+    DistinguishedName, KeyLog, NamedGroup, WantsVersions, compress, sign, verify, versions,
+};
 
 /// A trait for the ability to store server session data.
 ///
@@ -145,6 +147,7 @@ pub struct ClientHello<'a> {
     ///
     /// [certificate_authorities]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
     pub(super) certificate_authorities: Option<&'a [DistinguishedName]>,
+    pub(super) named_groups: Option<&'a [NamedGroup]>,
 }
 
 impl<'a> ClientHello<'a> {
@@ -215,6 +218,27 @@ impl<'a> ClientHello<'a> {
     /// [certificate_authorities]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
     pub fn certificate_authorities(&self) -> Option<&'a [DistinguishedName]> {
         self.certificate_authorities
+    }
+
+    /// Get the [`named_groups`] extension sent by the client.
+    ///
+    /// This means different things in different versions of TLS:
+    ///
+    /// Originally it was introduced as the "[`elliptic_curves`]" extension for TLS1.2.
+    /// It described the elliptic curves supported by a client for all purposes: key
+    /// exchange, signature verification (for server authentication), and signing (for
+    /// client auth).  Later [RFC7919] extended this to include FFDHE "named groups",
+    /// but FFDHE groups in this context only relate to key exchange.
+    ///
+    /// In TLS1.3 it was renamed to "[`named_groups`]" and now describes all types
+    /// of key exchange mechanisms, and does not relate at all to elliptic curves
+    /// used for signatures.
+    ///
+    /// [`elliptic_curves`]: https://datatracker.ietf.org/doc/html/rfc4492#section-5.1.1
+    /// [RFC7919]: https://datatracker.ietf.org/doc/html/rfc7919#section-2
+    /// [`named_groups`]:https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.7
+    pub fn named_groups(&self) -> Option<&'a [NamedGroup]> {
+        self.named_groups
     }
 }
 
@@ -454,9 +478,9 @@ impl ServerConfig {
         // Safety assumptions:
         // 1. that the provider has been installed (explicitly or implicitly)
         // 2. that the process-level default provider is usable with the supplied protocol versions.
-        Self::builder_with_provider(Arc::clone(
-            CryptoProvider::get_default_or_install_from_crate_features(),
-        ))
+        Self::builder_with_provider(
+            CryptoProvider::get_default_or_install_from_crate_features().clone(),
+        )
         .with_protocol_versions(versions)
         .unwrap()
     }
@@ -560,13 +584,15 @@ impl ServerConfig {
 #[cfg(feature = "std")]
 mod connection {
     use alloc::boxed::Box;
-    use alloc::vec::Vec;
     use core::fmt;
     use core::fmt::{Debug, Formatter};
     use core::ops::{Deref, DerefMut};
     use std::io;
 
-    use super::{Accepted, Accepting, EarlyDataState, ServerConfig, ServerConnectionData};
+    use super::{
+        Accepted, Accepting, EarlyDataState, ServerConfig, ServerConnectionData,
+        ServerExtensionsInput,
+    };
     use crate::common_state::{CommonState, Context, Side};
     use crate::conn::{ConnectionCommon, ConnectionCore};
     use crate::error::Error;
@@ -614,7 +640,10 @@ mod connection {
         /// we behave in the TLS protocol.
         pub fn new(config: Arc<ServerConfig>) -> Result<Self, Error> {
             Ok(Self {
-                inner: ConnectionCommon::from(ConnectionCore::for_server(config, Vec::new())?),
+                inner: ConnectionCommon::from(ConnectionCore::for_server(
+                    config,
+                    ServerExtensionsInput::default(),
+                )?),
             })
         }
 
@@ -919,15 +948,34 @@ impl UnbufferedServerConnection {
         Ok(Self {
             inner: UnbufferedConnectionCommon::from(ConnectionCore::for_server(
                 config,
-                Vec::new(),
+                ServerExtensionsInput::default(),
             )?),
         })
     }
 
     /// Extract secrets, so they can be used when configuring kTLS, for example.
     /// Should be used with care as it exposes secret key material.
+    #[deprecated = "dangerous_extract_secrets() does not support session tickets or \
+                    key updates, use dangerous_into_kernel_connection() instead"]
     pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
         self.inner.dangerous_extract_secrets()
+    }
+
+    /// Extract secrets and an [`KernelConnection`] object.
+    ///
+    /// This allows you use rustls to manage keys and then manage encryption and
+    /// decryption yourself (e.g. for kTLS).
+    ///
+    /// Should be used with care as it exposes secret key material.
+    ///
+    /// See the [`crate::kernel`] documentations for details on prerequisites
+    /// for calling this method.
+    pub fn dangerous_into_kernel_connection(
+        self,
+    ) -> Result<(ExtractedSecrets, KernelConnection<ServerConnectionData>), Error> {
+        self.inner
+            .core
+            .dangerous_into_kernel_connection()
     }
 }
 
@@ -971,11 +1019,18 @@ impl Accepted {
         let ch = ClientHello {
             server_name: &self.connection.core.data.sni,
             signature_schemes: &self.sig_schemes,
-            alpn: payload.alpn_extension(),
-            server_cert_types: payload.server_certificate_extension(),
-            client_cert_types: payload.client_certificate_extension(),
+            alpn: payload.protocols.as_ref(),
+            server_cert_types: payload
+                .server_certificate_types
+                .as_deref(),
+            client_cert_types: payload
+                .client_certificate_types
+                .as_deref(),
             cipher_suites: &payload.cipher_suites,
-            certificate_authorities: payload.certificate_authorities_extension(),
+            certificate_authorities: payload
+                .certificate_authority_names
+                .as_deref(),
+            named_groups: payload.named_groups.as_deref(),
         };
 
         trace!("Accepted::client_hello(): {ch:#?}");
@@ -1003,7 +1058,7 @@ impl Accepted {
 
         self.connection.enable_secret_extraction = config.enable_secret_extraction;
 
-        let state = hs::ExpectClientHello::new(config, Vec::new());
+        let state = hs::ExpectClientHello::new(config, ServerExtensionsInput::default());
         let mut cx = hs::ServerContext::from(&mut self.connection);
 
         let ch = Self::client_hello_payload(&self.message);
@@ -1020,8 +1075,7 @@ impl Accepted {
 
     fn client_hello_payload<'a>(message: &'a Message<'_>) -> &'a ClientHelloPayload {
         match &message.payload {
-            crate::msgs::message::MessagePayload::Handshake { parsed, .. } => match &parsed.payload
-            {
+            crate::msgs::message::MessagePayload::Handshake { parsed, .. } => match &parsed.0 {
                 crate::msgs::handshake::HandshakePayload::ClientHello(ch) => ch,
                 _ => unreachable!(),
             },
@@ -1157,7 +1211,7 @@ impl Debug for EarlyDataState {
 impl ConnectionCore<ServerConnectionData> {
     pub(crate) fn for_server(
         config: Arc<ServerConfig>,
-        extra_exts: Vec<ServerExtension>,
+        extra_exts: ServerExtensionsInput<'static>,
     ) -> Result<Self, Error> {
         let mut common = CommonState::new(Side::Server);
         common.set_max_fragment_size(config.max_fragment_size)?;

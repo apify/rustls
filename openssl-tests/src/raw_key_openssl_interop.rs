@@ -64,7 +64,7 @@ mod client {
     pub(super) fn run_client(config: ClientConfig, port: u16) -> Result<String, io::Error> {
         let server_name = "0.0.0.0".try_into().unwrap();
         let mut conn = ClientConnection::new(Arc::new(config), server_name).unwrap();
-        let mut sock = TcpStream::connect(format!("[::]:{}", port)).unwrap();
+        let mut sock = TcpStream::connect(format!("[::]:{port}")).unwrap();
         let mut tls = Stream::new(&mut conn, &mut sock);
 
         let mut buf = vec![0; 128];
@@ -90,11 +90,9 @@ mod client {
 
     impl SimpleRpkServerCertVerifier {
         fn new(trusted_spki: Vec<SubjectPublicKeyInfoDer<'static>>) -> Self {
-            SimpleRpkServerCertVerifier {
+            Self {
                 trusted_spki,
-                supported_algs: Arc::new(provider::default_provider())
-                    .clone()
-                    .signature_verification_algorithms,
+                supported_algs: provider::default_provider().signature_verification_algorithms,
             }
         }
     }
@@ -107,15 +105,13 @@ mod client {
             _server_name: &ServerName<'_>,
             _ocsp_response: &[u8],
             _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
+        ) -> Result<ServerCertVerified, Error> {
             let end_entity_as_spki = SubjectPublicKeyInfoDer::from(end_entity.as_ref());
             match self
                 .trusted_spki
                 .contains(&end_entity_as_spki)
             {
-                false => Err(rustls::Error::InvalidCertificate(
-                    CertificateError::UnknownIssuer,
-                )),
+                false => Err(Error::InvalidCertificate(CertificateError::UnknownIssuer)),
                 true => Ok(ServerCertVerified::assertion()),
             }
         }
@@ -125,10 +121,8 @@ mod client {
             _message: &[u8],
             _cert: &CertificateDer<'_>,
             _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Err(rustls::Error::PeerIncompatible(
-                PeerIncompatible::Tls12NotOffered,
-            ))
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Err(Error::PeerIncompatible(PeerIncompatible::Tls12NotOffered))
         }
 
         fn verify_tls13_signature(
@@ -136,7 +130,7 @@ mod client {
             message: &[u8],
             cert: &CertificateDer<'_>,
             dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        ) -> Result<HandshakeSignatureValid, Error> {
             verify_tls13_signature_with_raw_key(
                 message,
                 &SubjectPublicKeyInfoDer::from(cert.as_ref()),
@@ -254,12 +248,10 @@ mod server {
     }
 
     impl SimpleRpkClientCertVerifier {
-        pub fn new(trusted_spki: Vec<SubjectPublicKeyInfoDer<'static>>) -> Self {
+        pub(crate) fn new(trusted_spki: Vec<SubjectPublicKeyInfoDer<'static>>) -> Self {
             Self {
                 trusted_spki,
-                supported_algs: Arc::new(provider::default_provider())
-                    .clone()
-                    .signature_verification_algorithms,
+                supported_algs: provider::default_provider().signature_verification_algorithms,
             }
         }
     }
@@ -274,15 +266,13 @@ mod server {
             end_entity: &CertificateDer<'_>,
             _intermediates: &[CertificateDer<'_>],
             _now: UnixTime,
-        ) -> Result<ClientCertVerified, rustls::Error> {
+        ) -> Result<ClientCertVerified, Error> {
             let end_entity_as_spki = SubjectPublicKeyInfoDer::from(end_entity.as_ref());
             match self
                 .trusted_spki
                 .contains(&end_entity_as_spki)
             {
-                false => Err(rustls::Error::InvalidCertificate(
-                    CertificateError::UnknownIssuer,
-                )),
+                false => Err(Error::InvalidCertificate(CertificateError::UnknownIssuer)),
                 true => Ok(ClientCertVerified::assertion()),
             }
         }
@@ -292,10 +282,8 @@ mod server {
             _message: &[u8],
             _cert: &CertificateDer<'_>,
             _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Err(rustls::Error::PeerIncompatible(
-                PeerIncompatible::Tls12NotOffered,
-            ))
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Err(Error::PeerIncompatible(PeerIncompatible::Tls12NotOffered))
         }
 
         fn verify_tls13_signature(
@@ -303,7 +291,7 @@ mod server {
             message: &[u8],
             cert: &CertificateDer<'_>,
             dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        ) -> Result<HandshakeSignatureValid, Error> {
             verify_tls13_signature_with_raw_key(
                 message,
                 &SubjectPublicKeyInfoDer::from(cert.as_ref()),
@@ -368,7 +356,7 @@ mod tests {
                 assert_eq!(server_message, "Hello from the server");
             }
             Err(e) => {
-                panic!("Client failed to communicate with the server: {:?}", e);
+                panic!("Client failed to communicate with the server: {e:?}");
             }
         }
 
@@ -383,7 +371,7 @@ mod tests {
                 assert_eq!(client_message, "Hello from the client");
             }
             Err(e) => {
-                panic!("Server failed to communicate with the client: {:?}", e);
+                panic!("Server failed to communicate with the client: {e:?}");
             }
         }
     }
@@ -415,7 +403,7 @@ mod tests {
         let mut openssl_client = Command::new("openssl")
             .arg("s_client")
             .arg("-connect")
-            .arg(format!("[::]:{:?}", port))
+            .arg(format!("[::]:{port:?}"))
             .arg("-enable_client_rpk")
             .arg("-key")
             .arg(CLIENT_PRIV_KEY_FILE)
@@ -457,7 +445,7 @@ mod tests {
         let mut openssl_client = Command::new("openssl")
             .arg("s_client")
             .arg("-connect")
-            .arg(format!("[::]:{:?}", port))
+            .arg(format!("[::]:{port:?}"))
             .arg("-enable_server_rpk")
             .arg("-enable_client_rpk")
             .arg("-key")
@@ -552,7 +540,7 @@ mod tests {
                         }
                     }
                     Err(e) => {
-                        panic!("Error reading from OpenSSL stdout: {:?}", e);
+                        panic!("Error reading from OpenSSL stdout: {e:?}");
                     }
                 }
             }

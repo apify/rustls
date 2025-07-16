@@ -10,7 +10,7 @@ use crate::crypto::{SharedSecret, hash, hmac};
 use crate::error::Error;
 use crate::msgs::message::Message;
 use crate::suites::PartiallyExtractedSecrets;
-use crate::{KeyLog, Tls13CipherSuite, quic};
+use crate::{ConnectionTrafficSecrets, KeyLog, Tls13CipherSuite, quic};
 
 /// The kinds of secret we can extract from `KeySchedule`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -578,26 +578,30 @@ impl KeyScheduleTraffic {
             .export_keying_material(&self.current_exporter_secret, out, label, context)
     }
 
+    pub(crate) fn refresh_traffic_secret(
+        &mut self,
+        side: Side,
+    ) -> Result<ConnectionTrafficSecrets, Error> {
+        let secret = self.next_application_traffic_secret(side);
+        let (key, iv) = expand_secret(
+            &secret,
+            self.ks.suite.hkdf_provider,
+            self.ks.suite.aead_alg.key_len(),
+        );
+        Ok(self
+            .ks
+            .suite
+            .aead_alg
+            .extract_keys(key, iv)?)
+    }
+
     pub(crate) fn extract_secrets(&self, side: Side) -> Result<PartiallyExtractedSecrets, Error> {
-        fn expand(
-            secret: &OkmBlock,
-            hkdf: &'static dyn Hkdf,
-            aead_key_len: usize,
-        ) -> (AeadKey, Iv) {
-            let expander = hkdf.expander_for_okm(secret);
-
-            (
-                hkdf_expand_label_aead_key(expander.as_ref(), aead_key_len, b"key", &[]),
-                hkdf_expand_label(expander.as_ref(), b"iv", &[]),
-            )
-        }
-
-        let (client_key, client_iv) = expand(
+        let (client_key, client_iv) = expand_secret(
             &self.current_client_traffic_secret,
             self.ks.suite.hkdf_provider,
             self.ks.suite.aead_alg.key_len(),
         );
-        let (server_key, server_iv) = expand(
+        let (server_key, server_iv) = expand_secret(
             &self.current_server_traffic_secret,
             self.ks.suite.hkdf_provider,
             self.ks.suite.aead_alg.key_len(),
@@ -619,6 +623,15 @@ impl KeyScheduleTraffic {
         };
         Ok(PartiallyExtractedSecrets { tx, rx })
     }
+}
+
+fn expand_secret(secret: &OkmBlock, hkdf: &'static dyn Hkdf, aead_key_len: usize) -> (AeadKey, Iv) {
+    let expander = hkdf.expander_for_okm(secret);
+
+    (
+        hkdf_expand_label_aead_key(expander.as_ref(), aead_key_len, b"key", &[]),
+        hkdf_expand_label(expander.as_ref(), b"iv", &[]),
+    )
 }
 
 pub(crate) struct ResumptionSecret<'a> {
@@ -760,12 +773,11 @@ impl KeySchedule {
     /// - `SecretKind::ResumptionPSKBinderKey`
     /// - `SecretKind::DerivedSecret`
     fn derive_for_empty_hash(&self, kind: SecretKind) -> OkmBlock {
-        let empty_hash = self
-            .suite
-            .common
-            .hash_provider
-            .start()
-            .finish();
+        let hp = self.suite.common.hash_provider;
+        let empty_hash = hp
+            .algorithm()
+            .hash_for_empty_input()
+            .unwrap_or_else(|| hp.start().finish());
         self.derive(kind, empty_hash.as_ref())
     }
 
@@ -979,6 +991,43 @@ mod tests {
     };
     use super::{KeySchedule, SecretKind, derive_traffic_iv, derive_traffic_key};
     use crate::KeyLog;
+    use crate::msgs::enums::HashAlgorithm;
+
+    #[test]
+    fn empty_hash() {
+        let sha256 = super::provider::tls13::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .unwrap()
+            .common
+            .hash_provider;
+        let sha384 = super::provider::tls13::TLS13_AES_256_GCM_SHA384
+            .tls13()
+            .unwrap()
+            .common
+            .hash_provider;
+
+        assert!(
+            sha256.start().finish().as_ref()
+                == HashAlgorithm::SHA256
+                    .hash_for_empty_input()
+                    .unwrap()
+                    .as_ref()
+        );
+        assert!(
+            sha384.start().finish().as_ref()
+                == HashAlgorithm::SHA384
+                    .hash_for_empty_input()
+                    .unwrap()
+                    .as_ref()
+        );
+
+        // a theoretical example of unsupported hash
+        assert!(
+            HashAlgorithm::SHA1
+                .hash_for_empty_input()
+                .is_none()
+        );
+    }
 
     #[test]
     fn test_vectors() {

@@ -5,14 +5,14 @@ permissions:
 
 on:
   push:
-    branches-ignore:
-    - 'gh-readonly-queue/**'
+    branches: ['main', 'rel-*', 'ci/*']
     tags:
     - '**'
   pull_request:
   merge_group:
   schedule:
     - cron: '0 18 * * *'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
@@ -68,7 +68,7 @@ jobs:
         if: runner.os == 'MacOS'
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24.2"
+          go-version: "1.24.3"
 
       - name: cargo build (debug; default features)
         run: cargo build --locked
@@ -97,6 +97,9 @@ jobs:
         run: cargo test --release --no-default-features --features fips,tls12,read_buf,logging,std --all-targets
         env:
           RUST_BACKTRACE: 1
+
+      - name: cargo build (debug; no-std)
+        run: cargo build --locked --lib -p rustls $(admin/all-features-except std,brotli,read_buf rustls)
 
       - name: cargo build (debug; rustls-provider-example)
         run: cargo build --locked -p rustls-provider-example
@@ -445,10 +448,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install rust nightly toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
-          toolchain: nightly-2024-02-21
       - name: Check formatting (unstable)
         run: cargo fmt --all -- --check --config-path .rustfmt.unstable.toml
         continue-on-error: true
@@ -476,9 +478,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-        # - we want to be free of any warnings, so deny them (note: not for impit)
-        # - disable incompatible_msrv as it does not understand that we apply our
-        #   MSRV to the just the core crate.
       - run: ./admin/clippy -- --allow clippy::disallowed_types --allow clippy::incompatible_msrv
       - run: cargo clippy -p rustls
 
@@ -500,11 +499,7 @@ jobs:
         with:
           components: clippy
       # Do not deny warnings, as nightly clippy sometimes has false negatives.
-      # - Ignore `clippy::disallowed_types` as a workaround since `disallowed_types` configured in `.clippy.toml`
-      #   is only intended for main `rustls` crate.
-      - run: ./admin/clippy -- --allow clippy::disallowed_types
-      # Check the main crate for any Clippy nightly warnings, but do not deny them.
-      - run: cargo clippy -p rustls
+      - run: ./admin/clippy
 
   check-external-types:
     name: Validate external types appearing in public API
@@ -517,7 +512,7 @@ jobs:
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2024-06-30
+          toolchain: nightly-2025-05-04
           # ^ sync with https://github.com/awslabs/cargo-check-external-types/blob/main/rust-toolchain.toml
       - name: Install cargo-check-external-types
         uses: taiki-e/cache-cargo-install-action@v2
