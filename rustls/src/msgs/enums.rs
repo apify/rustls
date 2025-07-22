@@ -149,7 +149,6 @@ enum_builder! {
         ReservedGrease => 0xbaba,
         DelegatedCredentials => 0x0022,
         RecordSizeLimit => 0x001c,
-        SignedCertificateTimestamp => 0x0012,
         ApplicationSettings => 0x4469,
     }
 }
