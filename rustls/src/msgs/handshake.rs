@@ -929,7 +929,7 @@ extension_struct! {
             pub(crate) reserved_grease: Option<()>,
 
         /// Bogus impit extension
-        ExtensionType::SignedCertificateTimestamp =>
+        ExtensionType::SCT =>
             pub(crate) signed_certificate_timestamp: Option<()>,
 
         /// Bogus impit extension
@@ -1706,6 +1706,8 @@ extension_struct! {
     pub(crate) struct CertificateExtensions<'a> {
         ExtensionType::StatusRequest =>
             pub(crate) status: Option<CertificateStatus<'a>>,
+        ExtensionType::SCT =>
+            pub(crate) signed_certificate_timestamp: Option<PayloadU16>,
     }
 }
 
@@ -1713,6 +1715,7 @@ impl CertificateExtensions<'_> {
     fn into_owned(self) -> CertificateExtensions<'static> {
         CertificateExtensions {
             status: self.status.map(|s| s.into_owned()),
+            signed_certificate_timestamp: self.signed_certificate_timestamp,
         }
     }
 }
