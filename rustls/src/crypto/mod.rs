@@ -8,6 +8,7 @@ use emulation::{
     CHROME_TLS13_CIPHER_SUITES, CHROME_TLS12_CIPHER_SUITES, CHROME_SIGNATURE_VERIFICATION_ALGOS, FIREFOX_TLS13_CIPHER_SUITES, FIREFOX_TLS12_CIPHER_SUITES,
     FIREFOX_SIGNATURE_VERIFICATION_ALGOS,
 };
+#[cfg(feature = "impit")]
 use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 use core::ops::Deref;
 use core::time::Duration;
