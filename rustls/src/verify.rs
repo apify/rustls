@@ -27,50 +27,6 @@ use crate::sync::Arc;
 // means their origins can be precisely determined by looking
 // for their `assertion` constructors.
 
-/// Zero-sized marker type representing verification of a signature.
-#[derive(Debug)]
-pub struct HandshakeSignatureValid(());
-
-impl HandshakeSignatureValid {
-    /// Make a `HandshakeSignatureValid`
-    pub fn assertion() -> Self {
-        Self(())
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct FinishedMessageVerified(());
-
-impl FinishedMessageVerified {
-    pub(crate) fn assertion() -> Self {
-        Self(())
-    }
-}
-
-/// Zero-sized marker type representing verification of a server cert chain.
-#[allow(unreachable_pub)]
-#[derive(Debug)]
-pub struct ServerCertVerified(());
-
-#[allow(unreachable_pub)]
-impl ServerCertVerified {
-    /// Make a `ServerCertVerified`
-    pub fn assertion() -> Self {
-        Self(())
-    }
-}
-
-/// Zero-sized marker type representing verification of a client cert chain.
-#[derive(Debug)]
-pub struct ClientCertVerified(());
-
-impl ClientCertVerified {
-    /// Make a `ClientCertVerified`
-    pub fn assertion() -> Self {
-        Self(())
-    }
-}
-
 /// Disables all server certificate verification.
 /// Note that this can be potentially dangerous!
 ///
@@ -89,31 +45,20 @@ impl NoVerifier {
 
 #[cfg(feature = "impit")]
 impl ServerVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
-        now: UnixTime,
-    ) -> Result<ServerCertVerified, Error> {
-        Ok(ServerCertVerified::assertion())
+    fn verify_identity(&self, identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
+        Ok(PeerVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
@@ -142,7 +87,7 @@ impl ServerVerifier for NoVerifier {
         }
     }
 
-    fn requires_raw_public_keys(&self) -> bool {
+    fn request_ocsp_response(&self) -> bool {
         false
     }
 }

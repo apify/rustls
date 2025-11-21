@@ -14,8 +14,6 @@ use core::time::Duration;
 use pki_types::PrivateKeyDer;
 use zeroize::Zeroize;
 
-#[cfg(all(doc, feature = "tls12"))]
-use crate::Tls12CipherSuite;
 #[cfg(feature = "impit")]
 use crate::client::BrowserEmulator;
 #[cfg(feature = "impit")]

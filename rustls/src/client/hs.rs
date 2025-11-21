@@ -8,11 +8,8 @@ use core::ops::Deref;
 
 use pki_types::ServerName;
 
-#[cfg(feature = "tls12")]
-use super::tls12;
 use crate::NamedGroup;
 use crate::SupportedCipherSuite;
-#[cfg(feature = "logging")]
 use crate::bs_debug;
 use super::{ClientCredentialResolver, Tls12Resumption};
 use crate::check::inappropriate_handshake_message;
@@ -33,7 +30,6 @@ use crate::enums::{
 use crate::error::{ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
-use crate::msgs::base::Payload;
 #[cfg(feature = "impit")]
 use crate::msgs::base::{PayloadU8, PayloadU16};
 use crate::msgs::enums::{Compression, ExtensionType};
@@ -47,7 +43,7 @@ use crate::msgs::handshake::{
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
 use crate::sealed::Sealed;
-use crate::suites::{Suite, SupportedCipherSuite};
+use crate::suites::Suite;
 use crate::sync::Arc;
 use crate::tls12::Tls12CipherSuite;
 use crate::tls13::Tls13CipherSuite;
@@ -581,12 +577,16 @@ fn emit_client_hello_for_retry(
     // offer groups which are usable for any offered version
     #[cfg(not(feature = "impit"))]
     let offered_groups: Vec<NamedGroup> = config
-        .provider
-        .kx_groups
-        .iter()
-        .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
-        .map(|skxg| skxg.name())
-        .collect();
+                .provider
+                .kx_groups
+                .iter()
+                .filter_map(|skxg| {
+                    let named_group = skxg.name();
+                    supported_versions
+                        .any(|v| named_group.usable_for_version(v))
+                        .then_some(named_group)
+                })
+                .collect();
 
     #[cfg(feature = "impit")]
     let mut offered_groups: Vec<NamedGroup> = config
@@ -610,20 +610,6 @@ fn emit_client_hello_for_retry(
     }
 
     let mut exts = Box::new(ClientExtensions {
-        // offer groups which are usable for any offered version
-        named_groups: Some(
-            config
-                .provider
-                .kx_groups
-                .iter()
-                .filter_map(|skxg| {
-                    let named_group = skxg.name();
-                    supported_versions
-                        .any(|v| named_group.usable_for_version(v))
-                        .then_some(named_group)
-                })
-                .collect(),
-        ),
         supported_versions: Some(supported_versions),
         // offer groups which are usable for any offered version
         named_groups: Some(offered_groups),
@@ -672,11 +658,6 @@ fn emit_client_hello_for_retry(
         _ => {}
     }
 
-    match extra_exts.transport_parameters.clone() {
-        Some(TransportParameters::Quic(v)) => exts.transport_parameters = Some(v),
-        Some(TransportParameters::QuicDraft(v)) => exts.transport_parameters_draft = Some(v),
-        None => {}
-    };
     if let Some(TransportParameters::Quic(v)) = &extra_exts.transport_parameters {
         exts.transport_parameters = Some(v.clone());
     }

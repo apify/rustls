@@ -2,7 +2,6 @@
 use crate::KeyLogFile;
 #[cfg(not(feature = "impit"))]
 use crate::NoKeyLog;
-use crate::versions::TLS13;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 #[cfg(feature = "impit")]
@@ -250,7 +249,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
 #[derive(Clone)]
 pub struct WantsClientCertWithBrowserEmulationEnabled {
     versions: versions::EnabledVersions,
-    verifier: Arc<dyn verify::ServerCertVerifier>,
+    verifier: Arc<dyn verify::ServerVerifier>,
     client_ech_mode: Option<EchMode>,
     browser_emulator: BrowserEmulator,
 }

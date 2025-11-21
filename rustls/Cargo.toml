@@ -14,7 +14,7 @@ autotests = false
 exclude = ["src/testdata", "tests/**"]
 
 [features]
-default = ["log", "std"]
+default = ["log", "std", "impit"]
 
 aws-lc-rs = ["dep:aws-lc-rs", "webpki/aws-lc-rs", "aws-lc-rs/aws-lc-sys", "aws-lc-rs/prebuilt-nasm"]
 brotli = ["dep:brotli", "dep:brotli-decompressor", "std"]
@@ -23,7 +23,7 @@ fips = ["aws-lc-rs", "aws-lc-rs?/fips", "webpki/aws-lc-rs-fips"]
 log = ["dep:log"]
 std = ["webpki/std", "pki-types/std", "once_cell/std"]
 zlib = ["dep:zlib-rs"]
-impit = ["aws_lc_rs", "ring", "brotli"]
+impit = ["aws-lc-rs", "brotli"]
 
 [dependencies]
 aws-lc-rs = { workspace = true, optional = true }
