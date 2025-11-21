@@ -7,10 +7,9 @@ description = "Rustls connectivity based integration tests."
 publish = false
 
 [dependencies]
-rustls = { path = "../rustls", features = ["logging"] }
+rustls = { path = "../rustls", features = ["log"] }
 
 [dev-dependencies]
-hickory-resolver = { workspace = true }
 regex = { workspace = true }
 ring = { workspace = true }
 tokio = { workspace = true }

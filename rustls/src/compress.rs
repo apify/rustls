@@ -39,8 +39,9 @@ use core::fmt::Debug;
 #[cfg(feature = "std")]
 use std::sync::Mutex;
 
+use crate::crypto::cipher::Payload;
 use crate::enums::CertificateCompressionAlgorithm;
-use crate::msgs::base::{Payload, PayloadU24};
+use crate::msgs::base::PayloadU24;
 use crate::msgs::codec::Codec;
 use crate::msgs::handshake::{CertificatePayloadTls13, CompressedCertificatePayload};
 use crate::sync::Arc;
@@ -102,6 +103,7 @@ pub trait CertCompressor: Debug + Send + Sync {
 }
 
 /// A hint for how many resources to dedicate to a compression.
+#[non_exhaustive]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum CompressionLevel {
     /// This compression is happening interactively during a handshake.
@@ -116,10 +118,12 @@ pub enum CompressionLevel {
 }
 
 /// A content-less error for when `CertDecompressor::decompress` fails.
+#[expect(clippy::exhaustive_structs)]
 #[derive(Debug)]
 pub struct DecompressionFailed;
 
 /// A content-less error for when `CertCompressor::compress` fails.
+#[expect(clippy::exhaustive_structs)]
 #[derive(Debug)]
 pub struct CompressionFailed;
 
@@ -271,6 +275,7 @@ pub use feat_brotli::{BROTLI_COMPRESSOR, BROTLI_DECOMPRESSOR};
 /// The prospect of being able to reuse a given compression for many connections
 /// means we can afford to spend more time on that compression (by passing
 /// `CompressionLevel::Amortized` to the compressor).
+#[expect(clippy::exhaustive_enums)]
 #[derive(Debug)]
 pub enum CompressionCache {
     /// No caching happens, and compression happens each time using
@@ -373,7 +378,7 @@ impl CompressionCache {
             compressed: CompressedCertificatePayload {
                 alg: algorithm,
                 uncompressed_len,
-                compressed: PayloadU24(Payload::new(compressed)),
+                compressed: PayloadU24::from(Payload::new(compressed)),
             },
         });
 
@@ -406,7 +411,7 @@ impl CompressionCache {
             compressed: CompressedCertificatePayload {
                 alg: algorithm,
                 uncompressed_len,
-                compressed: PayloadU24(Payload::new(compressed)),
+                compressed: PayloadU24::from(Payload::new(compressed)),
             },
         }))
     }
@@ -427,7 +432,7 @@ impl Default for CompressionCache {
     }
 }
 
-#[cfg_attr(not(feature = "std"), allow(dead_code))]
+#[cfg_attr(not(feature = "std"), expect(dead_code))]
 #[derive(Debug)]
 pub(crate) struct CompressionCacheEntry {
     // cache key is algorithm + original:
@@ -534,12 +539,12 @@ mod tests {
 
         let cache = CompressionCache::default();
 
-        let cert = CertificateDer::from(vec![1]);
+        let certs = [CertificateDer::from(vec![1])].into_iter();
 
-        let cert1 = CertificatePayloadTls13::new([&cert].into_iter(), Some(b"1"));
-        let cert2 = CertificatePayloadTls13::new([&cert].into_iter(), Some(b"2"));
-        let cert3 = CertificatePayloadTls13::new([&cert].into_iter(), Some(b"3"));
-        let cert4 = CertificatePayloadTls13::new([&cert].into_iter(), Some(b"4"));
+        let cert1 = CertificatePayloadTls13::new(certs.clone(), Some(b"1"));
+        let cert2 = CertificatePayloadTls13::new(certs.clone(), Some(b"2"));
+        let cert3 = CertificatePayloadTls13::new(certs.clone(), Some(b"3"));
+        let cert4 = CertificatePayloadTls13::new(certs.clone(), Some(b"4"));
 
         // insert zlib (1), (2), (3), (4)
 

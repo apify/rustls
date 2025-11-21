@@ -17,11 +17,9 @@ use crate::crypto::hpke::{
     EncapsulatedSecret, Hpke, HpkeOpener, HpkePrivateKey, HpkePublicKey, HpkeSealer, HpkeSuite,
 };
 use crate::crypto::tls13::{HkdfExpander, HkdfPrkExtract, HkdfUsingHmac, expand};
+use crate::error::{Error, OtherError};
 use crate::msgs::enums::{HpkeAead, HpkeKdf, HpkeKem};
 use crate::msgs::handshake::HpkeSymmetricCipherSuite;
-#[cfg(feature = "std")]
-use crate::sync::Arc;
-use crate::{Error, OtherError};
 
 /// Default [RFC 9180] Hybrid Public Key Encryption (HPKE) suites supported by aws-lc-rs cryptography.
 pub static ALL_SUPPORTED_SUITES: &[&dyn Hpke] = &[
@@ -576,7 +574,7 @@ impl<const KDF_SIZE: usize> DhKem<KDF_SIZE> {
         let pk_r = agreement::UnparsedPublicKey::new(self.agreement_algorithm, &recipient.0);
         let kem_context = [enc.as_ref(), pk_r.bytes()].concat();
 
-        let shared_secret = agreement::agree(&sk_e, &pk_r, aws_lc_rs::error::Unspecified, |dh| {
+        let shared_secret = agreement::agree(&sk_e, pk_r, aws_lc_rs::error::Unspecified, |dh| {
             Ok(self.extract_and_expand(dh, &kem_context))
         })
         .map_err(unspecified_err)?;
@@ -616,7 +614,7 @@ impl<const KDF_SIZE: usize> DhKem<KDF_SIZE> {
             .map_err(unspecified_err)?;
         let kem_context = [&enc.0, pk_rm.as_ref()].concat();
 
-        let shared_secret = agreement::agree(&sk_r, &pk_e, aws_lc_rs::error::Unspecified, |dh| {
+        let shared_secret = agreement::agree(&sk_r, pk_e, aws_lc_rs::error::Unspecified, |dh| {
             Ok(self.extract_and_expand(dh, &kem_context))
         })
         .map_err(unspecified_err)?;
@@ -925,15 +923,8 @@ impl<const KDF_LEN: usize> Drop for KemSharedSecret<KDF_LEN> {
     }
 }
 
-fn key_rejected_err(_e: aws_lc_rs::error::KeyRejected) -> Error {
-    #[cfg(feature = "std")]
-    {
-        Error::Other(OtherError(Arc::new(_e)))
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        Error::Other(OtherError())
-    }
+fn key_rejected_err(e: aws_lc_rs::error::KeyRejected) -> Error {
+    Error::Other(OtherError::new(e))
 }
 
 // The `cipher::chacha::KEY_LEN` const is not exported, so we copy it here:

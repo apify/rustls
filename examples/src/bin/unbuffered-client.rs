@@ -7,11 +7,11 @@ use std::net::TcpStream;
 use std::sync::Arc;
 
 use rustls::client::{ClientConnectionData, EarlyDataError, UnbufferedClientConnection};
+use rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 use rustls::unbuffered::{
-    AppDataRecord, ConnectionState, EncodeError, EncryptError, InsufficientSizeError,
-    UnbufferedStatus, WriteTraffic,
+    ConnectionState, EncodeError, EncryptError, InsufficientSizeError, UnbufferedStatus,
+    WriteTraffic,
 };
-use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -19,9 +19,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         roots: webpki_roots::TLS_SERVER_ROOTS.into(),
     };
 
-    let mut config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
+    let mut config = ClientConfig::builder(Arc::new(DEFAULT_PROVIDER))
         .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .with_no_client_auth()?;
     config.enable_early_data = SEND_EARLY_DATA;
 
     let config = Arc::new(config);
@@ -58,32 +58,28 @@ fn converse(
 
     let mut iter_count = 0;
     while !fully_closed {
-        let UnbufferedStatus { mut discard, state } =
-            conn.process_tls_records(&mut incoming_tls[..incoming_used]);
+        let UnbufferedStatus {
+            mut discard, state, ..
+        } = conn.process_tls_records(&mut incoming_tls[..incoming_used]);
 
         match dbg!(state.unwrap()) {
-            ConnectionState::ReadTraffic(mut state) => {
-                while let Some(res) = state.next_record() {
-                    let AppDataRecord {
-                        discard: new_discard,
-                        payload,
-                    } = res?;
-                    discard += new_discard;
+            ConnectionState::ReadTraffic(state) => {
+                let record = state.record();
+                discard += record.discard;
 
-                    if payload.starts_with(b"HTTP") {
-                        let response = core::str::from_utf8(payload)?;
-                        let header = response
-                            .lines()
-                            .next()
-                            .unwrap_or(response);
+                if record.payload.starts_with(b"HTTP") {
+                    let response = core::str::from_utf8(record.payload)?;
+                    let header = response
+                        .lines()
+                        .next()
+                        .unwrap_or(response);
 
-                        println!("{header}");
-                    } else {
-                        println!("(.. continued HTTP response ..)");
-                    }
-
-                    received_response = true;
+                    println!("{header}");
+                } else {
+                    println!("(.. continued HTTP response ..)");
                 }
+
+                received_response = true;
             }
 
             ConnectionState::EncodeTlsData(mut state) => {
@@ -216,7 +212,7 @@ where
         Ok(written) => written,
 
         Err(e) => {
-            let InsufficientSizeError { required_size } = map_err(e)?;
+            let InsufficientSizeError { required_size, .. } = map_err(e)?;
             let new_len = *outgoing_used + required_size;
             outgoing_tls.resize(new_len, 0);
             eprintln!("resized `outgoing_tls` buffer to {new_len}B");

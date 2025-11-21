@@ -1,27 +1,30 @@
+use core::time::Duration;
 use std::prelude::v1::*;
 use std::{format, println, vec};
 
 use pki_types::{CertificateDer, DnsName};
 
-use super::base::{Payload, PayloadU8, PayloadU16, PayloadU24};
+use super::base::{PayloadU8, PayloadU16, PayloadU24};
 use super::codec::{Codec, Reader, put_u16};
 use super::enums::{
-    ClientCertificateType, Compression, ECCurveType, ExtensionType, KeyUpdateRequest, NamedGroup,
+    ClientCertificateType, Compression, ECCurveType, EchVersion, ExtensionType, HpkeAead, HpkeKdf,
+    HpkeKem, KeyUpdateRequest, NamedGroup,
 };
 use super::handshake::{
     CertificateChain, CertificateEntry, CertificateExtensions, CertificatePayloadTls13,
     CertificateRequestExtensions, CertificateRequestPayload, CertificateRequestPayloadTls13,
     CertificateStatus, CertificateStatusRequest, ClientExtensions, ClientHelloPayload,
     ClientSessionTicket, CompressedCertificatePayload, DistinguishedName, EcParameters,
-    EncryptedClientHello, HandshakeMessagePayload, HandshakePayload, HelloRetryRequest,
-    HelloRetryRequestExtensions, KeyShareEntry, NewSessionTicketExtensions,
-    NewSessionTicketPayload, NewSessionTicketPayloadTls13, PresharedKeyBinder,
-    PresharedKeyIdentity, PresharedKeyOffer, ProtocolName, PskKeyExchangeModes, Random,
-    ServerDhParams, ServerEcdhParams, ServerEncryptedClientHello, ServerExtensions,
-    ServerHelloPayload, ServerKeyExchange, ServerKeyExchangeParams, ServerKeyExchangePayload,
-    ServerNamePayload, SessionId, SingleProtocolName, SupportedEcPointFormats,
-    SupportedProtocolVersions,
+    EchConfigContents, EchConfigPayload, EncryptedClientHello, HandshakeMessagePayload,
+    HandshakePayload, HelloRetryRequest, HelloRetryRequestExtensions, HpkeKeyConfig,
+    HpkeSymmetricCipherSuite, KeyShareEntry, NewSessionTicketExtensions, NewSessionTicketPayload,
+    NewSessionTicketPayloadTls13, PresharedKeyBinder, PresharedKeyIdentity, PresharedKeyOffer,
+    ProtocolName, PskKeyExchangeModes, Random, ServerDhParams, ServerEcdhParams,
+    ServerEncryptedClientHello, ServerExtensions, ServerHelloPayload, ServerKeyExchange,
+    ServerKeyExchangeParams, ServerKeyExchangePayload, ServerNamePayload, SessionId,
+    SingleProtocolName, SupportedEcPointFormats, SupportedProtocolVersions,
 };
+use crate::crypto::cipher::Payload;
 use crate::enums::{
     CertificateCompressionAlgorithm, CertificateType, CipherSuite, HandshakeType, ProtocolVersion,
     SignatureScheme,
@@ -83,7 +86,6 @@ fn accepts_short_session_id() {
     let sess = SessionId::read(&mut rd).unwrap();
     println!("{sess:?}");
 
-    #[cfg(feature = "tls12")]
     assert!(!sess.is_empty());
     assert_ne!(sess, SessionId::empty());
     assert!(!rd.any_left());
@@ -96,7 +98,6 @@ fn accepts_empty_session_id() {
     let sess = SessionId::read(&mut rd).unwrap();
     println!("{sess:?}");
 
-    #[cfg(feature = "tls12")]
     assert!(sess.is_empty());
     assert_eq!(sess, SessionId::empty());
     assert!(!rd.any_left());
@@ -137,7 +138,7 @@ fn refuses_server_ext_with_unparsed_bytes() {
 #[test]
 fn refuses_certificate_ext_with_unparsed_bytes() {
     let bytes = [
-        0x00u8, 0x09, 0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x00u8, 0x0a, 0x00, 0x05, 0x00, 0x06, 0x01, 0x00, 0x00, 0x01, 0xcc, 0x01,
     ];
     assert_eq!(
         CertificateExtensions::read_bytes(&bytes).unwrap_err(),
@@ -750,11 +751,114 @@ fn wrapped_dn_encoding() {
     assert_eq!(dn.as_ref(), [expected_prefix, subject.to_vec()].concat());
 }
 
+#[test]
+fn test_decode_config_list() {
+    fn assert_config(contents: &EchConfigContents, public_name: impl AsRef<[u8]>, max_len: u8) {
+        assert_eq!(contents.maximum_name_length, max_len);
+        assert_eq!(
+            contents.public_name,
+            DnsName::try_from(public_name.as_ref()).unwrap()
+        );
+        assert!(contents.extensions.is_empty());
+    }
+
+    fn assert_key_config(
+        config: &HpkeKeyConfig,
+        id: u8,
+        kem_id: HpkeKem,
+        cipher_suites: Vec<HpkeSymmetricCipherSuite>,
+    ) {
+        assert_eq!(config.config_id, id);
+        assert_eq!(config.kem_id, kem_id);
+        assert_eq!(config.symmetric_cipher_suites, cipher_suites);
+    }
+
+    let config_list = get_ech_config(ECHCONFIG_LIST_LOCALHOST);
+    assert_eq!(config_list.len(), 1);
+    let EchConfigPayload::V18(contents) = &config_list[0] else {
+        std::panic!("unexpected ECH config version: {:?}", config_list[0]);
+    };
+    assert_config(contents, "localhost", 128);
+    assert_key_config(
+        &contents.key_config,
+        0,
+        HpkeKem::DHKEM_X25519_HKDF_SHA256,
+        vec![
+            HpkeSymmetricCipherSuite {
+                kdf_id: HpkeKdf::HKDF_SHA256,
+                aead_id: HpkeAead::AES_128_GCM,
+            },
+            HpkeSymmetricCipherSuite {
+                kdf_id: HpkeKdf::HKDF_SHA256,
+                aead_id: HpkeAead::CHACHA20_POLY_1305,
+            },
+        ],
+    );
+
+    let config_list = get_ech_config(ECHCONFIG_LIST_CF);
+    assert_eq!(config_list.len(), 2);
+    let EchConfigPayload::V18(contents_a) = &config_list[0] else {
+        std::panic!("unexpected ECH config version: {:?}", config_list[0]);
+    };
+    assert_config(contents_a, "cloudflare-esni.com", 37);
+    assert_key_config(
+        &contents_a.key_config,
+        195,
+        HpkeKem::DHKEM_X25519_HKDF_SHA256,
+        vec![HpkeSymmetricCipherSuite {
+            kdf_id: HpkeKdf::HKDF_SHA256,
+            aead_id: HpkeAead::AES_128_GCM,
+        }],
+    );
+    let EchConfigPayload::V18(contents_b) = &config_list[1] else {
+        std::panic!("unexpected ECH config version: {:?}", config_list[1]);
+    };
+    assert_config(contents_b, "cloudflare-esni.com", 42);
+    assert_key_config(
+        &contents_b.key_config,
+        3,
+        HpkeKem::DHKEM_P256_HKDF_SHA256,
+        vec![HpkeSymmetricCipherSuite {
+            kdf_id: HpkeKdf::HKDF_SHA256,
+            aead_id: HpkeAead::AES_128_GCM,
+        }],
+    );
+
+    let config_list = get_ech_config(ECHCONFIG_LIST_WITH_UNSUPPORTED);
+    assert_eq!(config_list.len(), 4);
+    // The first config should be unsupported.
+    assert!(matches!(
+        config_list[0],
+        EchConfigPayload::Unknown {
+            version: EchVersion::Unknown(0xBADD),
+            ..
+        }
+    ));
+    // The other configs should be recognized.
+    for config in config_list.iter().skip(1) {
+        assert!(matches!(config, EchConfigPayload::V18(_)));
+    }
+}
+
+#[test]
+fn test_echconfig_serialization() {
+    fn assert_round_trip_eq(original: &[u8]) {
+        let configs = get_ech_config(original);
+        let mut output = Vec::new();
+        configs.encode(&mut output);
+        assert_eq!(original, output);
+    }
+
+    assert_round_trip_eq(ECHCONFIG_LIST_LOCALHOST);
+    assert_round_trip_eq(ECHCONFIG_LIST_CF);
+    assert_round_trip_eq(ECHCONFIG_LIST_WITH_UNSUPPORTED);
+}
+
 fn sample_hello_retry_request() -> HelloRetryRequest {
     HelloRetryRequest {
         legacy_version: ProtocolVersion::TLSv1_2,
         session_id: SessionId::empty(),
-        cipher_suite: CipherSuite::TLS_NULL_WITH_NULL_NULL,
+        cipher_suite: CipherSuite::TLS_PSK_DHE_WITH_AES_128_CCM_8,
         extensions: HelloRetryRequestExtensions {
             key_share: Some(NamedGroup::X25519),
             cookie: Some(PayloadU16::new(vec![0])),
@@ -770,7 +874,7 @@ fn sample_client_hello_payload() -> ClientHelloPayload {
         client_version: ProtocolVersion::TLSv1_2,
         random: Random::from([0; 32]),
         session_id: SessionId::empty(),
-        cipher_suites: vec![CipherSuite::TLS_NULL_WITH_NULL_NULL],
+        cipher_suites: vec![CipherSuite::TLS_PSK_WITH_AES_128_CCM],
         compression_methods: vec![Compression::Null],
         extensions: Box::new(ClientExtensions {
             server_name: Some(ServerNamePayload::from(
@@ -820,7 +924,7 @@ fn sample_server_hello_payload() -> ServerHelloPayload {
         legacy_version: ProtocolVersion::TLSv1_2,
         random: Random::from([0; 32]),
         session_id: SessionId::empty(),
-        cipher_suite: CipherSuite::TLS_NULL_WITH_NULL_NULL,
+        cipher_suite: CipherSuite::TLS_PSK_WITH_AES_128_CCM,
         compression_method: Compression::Null,
         extensions: Box::new(ServerExtensions {
             ec_point_formats: Some(SupportedEcPointFormats::default()),
@@ -838,7 +942,6 @@ fn sample_server_hello_payload() -> ServerHelloPayload {
             certificate_status_request_ack: Some(()),
             selected_version: Some(ProtocolVersion::TLSv1_2),
             transport_parameters: Some(Payload::new(vec![1, 2, 3])),
-            transport_parameters_draft: None,
             client_certificate_type: Some(CertificateType::RawPublicKey),
             server_certificate_type: Some(CertificateType::RawPublicKey),
             unknown_extensions: Default::default(),
@@ -959,7 +1062,7 @@ fn sample_certificate_payload_tls13() -> CertificatePayloadTls13<'static> {
             cert: CertificateDer::from(vec![3, 4, 5]),
             extensions: CertificateExtensions {
                 status: Some(CertificateStatus {
-                    ocsp_response: PayloadU24(Payload::new(vec![1, 2, 3])),
+                    ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
                 }),
                 signed_certificate_timestamp: None,
             },
@@ -971,7 +1074,7 @@ fn sample_compressed_certificate() -> CompressedCertificatePayload<'static> {
     CompressedCertificatePayload {
         alg: CertificateCompressionAlgorithm::Brotli,
         uncompressed_len: 123,
-        compressed: PayloadU24(Payload::new(vec![1, 2, 3])),
+        compressed: PayloadU24::from(Payload::new(vec![1, 2, 3])),
     }
 }
 
@@ -993,7 +1096,7 @@ fn sample_dhe_server_key_exchange_payload() -> ServerKeyExchangePayload {
         params: ServerKeyExchangeParams::Dh(ServerDhParams {
             dh_p: PayloadU16::new(vec![1, 2, 3]),
             dh_g: PayloadU16::new(vec![2]),
-            dh_Ys: PayloadU16::new(vec![1, 2]),
+            dh_ys: PayloadU16::new(vec![1, 2]),
         }),
         dss: DigitallySignedStruct::new(SignatureScheme::RSA_PSS_SHA256, vec![1, 2, 3]),
     })
@@ -1024,14 +1127,14 @@ fn sample_certificate_request_payload_tls13() -> CertificateRequestPayloadTls13 
 
 fn sample_new_session_ticket_payload() -> NewSessionTicketPayload {
     NewSessionTicketPayload {
-        lifetime_hint: 1234,
+        lifetime_hint: Duration::from_secs(1234),
         ticket: Arc::new(PayloadU16::new(vec![1, 2, 3])),
     }
 }
 
 fn sample_new_session_ticket_payload_tls13() -> NewSessionTicketPayloadTls13 {
     NewSessionTicketPayloadTls13 {
-        lifetime: 123,
+        lifetime: Duration::from_secs(123),
         age_add: 1234,
         nonce: PayloadU8::new(vec![1, 2, 3]),
         ticket: Arc::new(PayloadU16::new(vec![4, 5, 6])),
@@ -1047,6 +1150,21 @@ fn sample_encrypted_extensions() -> Box<ServerExtensions<'static>> {
 
 fn sample_certificate_status() -> CertificateStatus<'static> {
     CertificateStatus {
-        ocsp_response: PayloadU24(Payload::new(vec![1, 2, 3])),
+        ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
     }
 }
+
+fn get_ech_config(encoded: &[u8]) -> Vec<EchConfigPayload> {
+    Vec::<_>::read(&mut Reader::init(encoded)).unwrap()
+}
+
+// One EchConfig, with server-name "localhost".
+static ECHCONFIG_LIST_LOCALHOST: &[u8] =
+    include_bytes!("../../tests/data/localhost-echconfigs.bin");
+
+// Two EchConfigs, both with server-name "cloudflare-esni.com".
+static ECHCONFIG_LIST_CF: &[u8] = include_bytes!("../../tests/data/cloudflare-esni-echconfigs.bin");
+
+// Three EchConfigs, the first one with an unsupported version.
+static ECHCONFIG_LIST_WITH_UNSUPPORTED: &[u8] =
+    include_bytes!("../../tests/data/unsupported-then-valid-echconfigs.bin");

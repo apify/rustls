@@ -1,15 +1,30 @@
 use core::fmt;
 
-use crate::crypto;
-use crate::crypto::hash;
-use crate::suites::{CipherSuiteCommon, SupportedCipherSuite};
+use crate::common_state::Protocol;
+use crate::crypto::{self, hash};
+use crate::enums::{ProtocolVersion, SignatureScheme};
+use crate::suites::{CipherSuiteCommon, Suite, SupportedCipherSuite};
+use crate::version::Tls13Version;
 
 pub(crate) mod key_schedule;
 
 /// A TLS 1.3 cipher suite supported by rustls.
+#[expect(clippy::exhaustive_structs)]
 pub struct Tls13CipherSuite {
     /// Common cipher suite fields.
     pub common: CipherSuiteCommon,
+
+    /// The associated protocol version.
+    ///
+    /// This field should have the value [`rustls::version::TLS13_VERSION`].
+    ///
+    /// This value contains references to the TLS1.3 protocol handling code.
+    /// This means that a program that does not contain any `Tls13CipherSuite`
+    /// values also does not contain any reference to the TLS1.3 protocol handling
+    /// code, and the linker can remove it.
+    ///
+    /// [`rustls::version::TLS13_VERSION`]: crate::version::TLS13_VERSION
+    pub protocol_version: &'static Tls13Version,
 
     /// How to complete HKDF with the suite's hash function.
     ///
@@ -48,6 +63,7 @@ impl Tls13CipherSuite {
     pub fn fips(&self) -> bool {
         let Self {
             common,
+            protocol_version: _,
             hkdf_provider,
             aead_alg,
             quic,
@@ -63,6 +79,36 @@ impl Tls13CipherSuite {
         self.quic
             .map(|quic| crate::quic::Suite { quic, suite: self })
     }
+}
+
+impl Suite for Tls13CipherSuite {
+    fn client_handler(&self) -> &'static dyn crate::client::ClientHandler<Self> {
+        self.protocol_version.client
+    }
+
+    fn server_handler(&self) -> &'static dyn crate::server::ServerHandler<Self> {
+        self.protocol_version.server
+    }
+
+    /// Does this suite support the `proto` protocol?
+    ///
+    /// All TLS1.3 suites support TCP-TLS. QUIC support is conditional on `quic` slot.
+    fn usable_for_protocol(&self, proto: Protocol) -> bool {
+        match proto {
+            Protocol::Tcp => true,
+            Protocol::Quic => self.quic.is_some(),
+        }
+    }
+
+    fn usable_for_signature_scheme(&self, scheme: SignatureScheme) -> bool {
+        scheme.supported_in_tls13()
+    }
+
+    fn common(&self) -> &CipherSuiteCommon {
+        &self.common
+    }
+
+    const VERSION: ProtocolVersion = ProtocolVersion::TLSv1_3;
 }
 
 impl From<&'static Tls13CipherSuite> for SupportedCipherSuite {
@@ -123,3 +169,37 @@ impl AsRef<[u8]> for VerifyMessage {
 const SERVER_CONSTANT: &[u8; 34] = b"TLS 1.3, server CertificateVerify\x00";
 const CLIENT_CONSTANT: &[u8; 34] = b"TLS 1.3, client CertificateVerify\x00";
 const MAX_VERIFY_MSG: usize = 64 + CLIENT_CONSTANT.len() + hash::Output::MAX_LEN;
+
+#[cfg(test)]
+mod tests {
+    use crate::TEST_PROVIDERS;
+    use crate::crypto::tls13_suite;
+    use crate::enums::CipherSuite;
+
+    #[test]
+    fn test_can_resume_to() {
+        for &provider in TEST_PROVIDERS {
+            let Some(cha_poly) = provider
+                .tls13_cipher_suites
+                .iter()
+                .find(|cs| cs.common.suite == CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
+            else {
+                continue;
+            };
+
+            let aes_128_gcm = tls13_suite(CipherSuite::TLS13_AES_128_GCM_SHA256, provider);
+            assert!(
+                aes_128_gcm
+                    .can_resume_from(cha_poly)
+                    .is_some()
+            );
+
+            let aes_256_gcm = tls13_suite(CipherSuite::TLS13_AES_256_GCM_SHA384, provider);
+            assert!(
+                aes_256_gcm
+                    .can_resume_from(cha_poly)
+                    .is_none()
+            );
+        }
+    }
+}

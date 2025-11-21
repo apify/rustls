@@ -1,36 +1,29 @@
 //! This is a simple client using rustls' unbuffered API. Meaning that the application layer must
 //! handle the buffers required to receive, process and send TLS data. Additionally it demonstrates
-//! using asynchronous I/O using either async-std or tokio.
+//! using asynchronous I/O via tokio.
 
 use std::error::Error;
 use std::sync::Arc;
 
-#[cfg(feature = "async-std")]
-use async_std::io::{ReadExt, WriteExt};
-#[cfg(feature = "async-std")]
-use async_std::net::TcpStream;
 use rustls::client::{ClientConnectionData, UnbufferedClientConnection};
+use rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 use rustls::unbuffered::{
-    AppDataRecord, ConnectionState, EncodeError, EncryptError, InsufficientSizeError,
-    UnbufferedStatus, WriteTraffic,
+    ConnectionState, EncodeError, EncryptError, InsufficientSizeError, UnbufferedStatus,
+    WriteTraffic,
 };
-use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore};
-#[cfg(not(feature = "async-std"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(not(feature = "async-std"))]
 use tokio::net::TcpStream;
 
-#[cfg_attr(not(feature = "async-std"), tokio::main(flavor = "current_thread"))]
-#[cfg_attr(feature = "async-std", async_std::main)]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let root_store = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.into(),
     };
 
-    let config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
+    let config = ClientConfig::builder(Arc::new(DEFAULT_PROVIDER))
         .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .with_no_client_auth()?;
 
     let config = Arc::new(config);
 
@@ -60,32 +53,28 @@ async fn converse(
 
     let mut iter_count = 0;
     while !fully_closed {
-        let UnbufferedStatus { mut discard, state } =
-            conn.process_tls_records(&mut incoming_tls[..incoming_used]);
+        let UnbufferedStatus {
+            mut discard, state, ..
+        } = conn.process_tls_records(&mut incoming_tls[..incoming_used]);
 
         match dbg!(state.unwrap()) {
-            ConnectionState::ReadTraffic(mut state) => {
-                while let Some(res) = state.next_record() {
-                    let AppDataRecord {
-                        discard: new_discard,
-                        payload,
-                    } = res?;
-                    discard += new_discard;
+            ConnectionState::ReadTraffic(state) => {
+                let record = state.record();
+                discard += record.discard;
 
-                    if payload.starts_with(b"HTTP") {
-                        let response = core::str::from_utf8(payload)?;
-                        let header = response
-                            .lines()
-                            .next()
-                            .unwrap_or(response);
+                if record.payload.starts_with(b"HTTP") {
+                    let response = core::str::from_utf8(record.payload)?;
+                    let header = response
+                        .lines()
+                        .next()
+                        .unwrap_or(response);
 
-                        println!("{header}");
-                    } else {
-                        println!("(.. continued HTTP response ..)");
-                    }
-
-                    received_response = true;
+                    println!("{header}");
+                } else {
+                    println!("(.. continued HTTP response ..)");
                 }
+
+                received_response = true;
             }
 
             ConnectionState::EncodeTlsData(mut state) => {
@@ -202,7 +191,7 @@ where
         Ok(written) => written,
 
         Err(e) => {
-            let InsufficientSizeError { required_size } = map_err(e)?;
+            let InsufficientSizeError { required_size, .. } = map_err(e)?;
             let new_len = *outgoing_used + required_size;
             outgoing_tls.resize(new_len, 0);
             eprintln!("resized `outgoing_tls` buffer to {new_len}B");

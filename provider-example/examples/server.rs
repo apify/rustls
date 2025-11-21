@@ -2,6 +2,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use rustls::ServerConfig;
+use rustls::crypto::Identity;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::Acceptor;
 
@@ -91,15 +92,20 @@ impl TestPki {
     }
 
     fn server_config(self) -> Arc<ServerConfig> {
-        let mut server_config =
-            ServerConfig::builder_with_provider(rustls_provider_example::provider().into())
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(vec![self.server_cert_der], self.server_key_der)
-                .unwrap();
+        let provider = Arc::new(rustls_provider_example::provider());
+        let mut server_config = ServerConfig::builder(provider.clone())
+            .with_no_client_auth()
+            .with_single_cert(
+                Arc::new(Identity::from_cert_chain(vec![self.server_cert_der]).unwrap()),
+                self.server_key_der,
+            )
+            .unwrap();
 
         server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+        server_config.ticketer = provider
+            .ticketer_factory
+            .ticketer()
+            .ok();
 
         Arc::new(server_config)
     }

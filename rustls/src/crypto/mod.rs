@@ -1,11 +1,15 @@
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::borrow::Borrow;
 use core::fmt::Debug;
 #[cfg(feature = "impit")]
 use emulation::{
     CHROME_CIPHER_SUITES, CHROME_SIGNATURE_VERIFICATION_ALGOS, FIREFOX_CIPHER_SUITES,
     FIREFOX_SIGNATURE_VERIFICATION_ALGOS,
 };
+use core::ops::Deref;
+use core::time::Duration;
 
 use pki_types::PrivateKeyDer;
 use zeroize::Zeroize;
@@ -16,26 +20,22 @@ use crate::Tls12CipherSuite;
 use crate::client::BrowserEmulator;
 #[cfg(feature = "impit")]
 use crate::client::builder::BrowserType;
+#[cfg(test)]
+use crate::enums::CipherSuite;
+use crate::enums::ProtocolVersion;
+use crate::error::{ApiMisuse, Error};
 use crate::msgs::ffdhe_groups::FfdheGroup;
-use crate::sign::SigningKey;
+use crate::msgs::handshake::ALL_KEY_EXCHANGE_ALGORITHMS;
 use crate::sync::Arc;
 pub use crate::webpki::{
     WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
-    verify_tls13_signature_with_raw_key,
 };
 #[cfg(doc)]
-use crate::{
-    ClientConfig, ConfigBuilder, ServerConfig, SupportedCipherSuite, Tls13CipherSuite, client,
-    crypto, server, sign,
-};
-use crate::{Error, NamedGroup, ProtocolVersion, SupportedProtocolVersion, suites};
-
-/// *ring* based CryptoProvider.
-#[cfg(feature = "ring")]
-pub mod ring;
+use crate::{ClientConfig, ConfigBuilder, ServerConfig, client, crypto, server};
+use crate::{NamedGroup, SupportedCipherSuite, Tls12CipherSuite, Tls13CipherSuite};
 
 /// aws-lc-rs-based CryptoProvider.
-#[cfg(feature = "aws_lc_rs")]
+#[cfg(feature = "aws-lc-rs")]
 pub mod aws_lc_rs;
 
 /// retch-specific CryptoProvider.
@@ -50,7 +50,6 @@ pub mod hash;
 /// HMAC interfaces.
 pub mod hmac;
 
-#[cfg(feature = "tls12")]
 /// Cryptography specific to TLS1.2.
 pub mod tls12;
 
@@ -60,9 +59,12 @@ pub mod tls13;
 /// Hybrid public key encryption (RFC 9180).
 pub mod hpke;
 
-// Message signing interfaces. Re-exported under rustls::sign. Kept crate-internal here to
-// avoid having two import paths to the same types.
-pub(crate) mod signer;
+// Message signing interfaces.
+mod signer;
+pub use signer::{
+    CertificateIdentity, Credentials, Identity, SelectedCredential, Signer, SigningKey,
+    SingleCredential, public_key_to_spki,
+};
 
 pub use crate::msgs::handshake::KeyExchangeAlgorithm;
 pub use crate::rand::GetRandomFailed;
@@ -70,15 +72,12 @@ pub use crate::suites::CipherSuiteCommon;
 
 /// Controls core cryptography used by rustls.
 ///
-/// This crate comes with two built-in options, provided as
+/// This crate comes with one built-in option, provided as
 /// `CryptoProvider` structures:
 ///
-/// - [`crypto::aws_lc_rs::default_provider`]: (behind the `aws_lc_rs` crate feature,
-///   which is enabled by default).  This provider uses the [aws-lc-rs](https://github.com/aws/aws-lc-rs)
+/// - [`crypto::aws_lc_rs::DEFAULT_PROVIDER`]: (behind the `aws-lc-rs` crate feature).
+///   This provider uses the [aws-lc-rs](https://github.com/aws/aws-lc-rs)
 ///   crate.  The `fips` crate feature makes this option use FIPS140-3-approved cryptography.
-/// - [`crypto::ring::default_provider`]: (behind the `ring` crate feature, which
-///   is optional).  This provider uses the [*ring*](https://github.com/briansmith/ring)
-///   crate.
 ///
 /// This structure provides defaults. Everything in it can be overridden at
 /// runtime by replacing field values as needed.
@@ -107,14 +106,14 @@ pub use crate::suites::CipherSuiteCommon;
 ///
 /// Supply the provider when constructing your [`ClientConfig`] or [`ServerConfig`]:
 ///
-/// - [`ClientConfig::builder_with_provider()`]
-/// - [`ServerConfig::builder_with_provider()`]
+/// - [`ClientConfig::builder()`]
+/// - [`ServerConfig::builder()`]
 ///
 /// When creating and configuring a webpki-backed client or server certificate verifier, a choice of
 /// provider is also needed to start the configuration process:
 ///
-/// - [`client::WebPkiServerVerifier::builder_with_provider()`]
-/// - [`server::WebPkiClientVerifier::builder_with_provider()`]
+/// - [`client::WebPkiServerVerifier::builder()`]
+/// - [`server::WebPkiClientVerifier::builder()`]
 ///
 /// If you install a custom provider and want to avoid any accidental use of a built-in provider, the feature
 /// `custom-provider` can be activated to ensure your custom provider is used everywhere
@@ -135,15 +134,15 @@ pub use crate::suites::CipherSuiteCommon;
 /// API (with [`ConfigBuilder::with_single_cert`], etc.), it might look like this:
 ///
 /// ```
-/// # #[cfg(feature = "aws_lc_rs")] {
+/// # #[cfg(feature = "aws-lc-rs")] {
 /// # use std::sync::Arc;
-/// # mod fictious_hsm_api { pub fn load_private_key(key_der: pki_types::PrivateKeyDer<'static>) -> ! { unreachable!(); } }
+/// # mod fictitious_hsm_api { pub fn load_private_key(key_der: pki_types::PrivateKeyDer<'static>) -> ! { unreachable!(); } }
 /// use rustls::crypto::aws_lc_rs;
 ///
 /// pub fn provider() -> rustls::crypto::CryptoProvider {
 ///   rustls::crypto::CryptoProvider{
 ///     key_provider: &HsmKeyLoader,
-///     ..aws_lc_rs::default_provider()
+///     ..aws_lc_rs::DEFAULT_PROVIDER
 ///   }
 /// }
 ///
@@ -151,8 +150,8 @@ pub use crate::suites::CipherSuiteCommon;
 /// struct HsmKeyLoader;
 ///
 /// impl rustls::crypto::KeyProvider for HsmKeyLoader {
-///     fn load_private_key(&self, key_der: pki_types::PrivateKeyDer<'static>) -> Result<Arc<dyn rustls::sign::SigningKey>, rustls::Error> {
-///          fictious_hsm_api::load_private_key(key_der)
+///     fn load_private_key(&self, key_der: pki_types::PrivateKeyDer<'static>) -> Result<Box<dyn rustls::crypto::SigningKey>, rustls::Error> {
+///          fictitious_hsm_api::load_private_key(key_der)
 ///     }
 /// }
 /// # }
@@ -168,7 +167,7 @@ pub use crate::suites::CipherSuiteCommon;
 /// - **Key exchange groups** - see [`crypto::SupportedKxGroup`].
 /// - **Signature verification algorithms** - see [`crypto::WebPkiSupportedAlgorithms`].
 /// - **Authentication key loading** - see [`crypto::KeyProvider::load_private_key()`] and
-///   [`sign::SigningKey`].
+///   [`SigningKey`].
 ///
 /// # Example code
 ///
@@ -192,16 +191,27 @@ pub use crate::suites::CipherSuiteCommon;
 ///
 /// You can verify the configuration at runtime by checking
 /// [`ServerConfig::fips()`]/[`ClientConfig::fips()`] return `true`.
+#[expect(clippy::exhaustive_structs)]
 #[derive(Debug, Clone)]
 pub struct CryptoProvider {
-    /// List of supported ciphersuites, in preference order -- the first element
+    /// List of supported TLS1.2 cipher suites, in preference order -- the first element
     /// is the highest priority.
     ///
-    /// The `SupportedCipherSuite` type carries both configuration and implementation.
+    /// Note that the protocol version is negotiated before the cipher suite.
+    ///
+    /// The `Tls12CipherSuite` type carries both configuration and implementation.
     ///
     /// A valid `CryptoProvider` must ensure that all cipher suites are accompanied by at least
     /// one matching key exchange group in [`CryptoProvider::kx_groups`].
-    pub cipher_suites: Vec<suites::SupportedCipherSuite>,
+    pub tls12_cipher_suites: Cow<'static, [&'static Tls12CipherSuite]>,
+
+    /// List of supported TLS1.3 cipher suites, in preference order -- the first element
+    /// is the highest priority.
+    ///
+    /// Note that the protocol version is negotiated before the cipher suite.
+    ///
+    /// The `Tls13CipherSuite` type carries both configuration and implementation.
+    pub tls13_cipher_suites: Cow<'static, [&'static Tls13CipherSuite]>,
 
     /// List of supported key exchange groups, in preference order -- the
     /// first element is the highest priority.
@@ -210,15 +220,15 @@ pub struct CryptoProvider {
     /// and in TLS1.3 a key share for it is sent in the client hello.
     ///
     /// The `SupportedKxGroup` type carries both configuration and implementation.
-    pub kx_groups: Vec<&'static dyn SupportedKxGroup>,
+    pub kx_groups: Cow<'static, [&'static dyn SupportedKxGroup]>,
 
     /// List of signature verification algorithms for use with webpki.
     ///
     /// These are used for both certificate chain verification and handshake signature verification.
     ///
     /// This is called by [`ConfigBuilder::with_root_certificates()`],
-    /// [`server::WebPkiClientVerifier::builder_with_provider()`] and
-    /// [`client::WebPkiServerVerifier::builder_with_provider()`].
+    /// [`server::WebPkiClientVerifier::builder()`] and
+    /// [`client::WebPkiServerVerifier::builder()`].
     pub signature_verification_algorithms: WebPkiSupportedAlgorithms,
 
     /// Source of cryptographically secure random numbers.
@@ -226,6 +236,9 @@ pub struct CryptoProvider {
 
     /// Provider for loading private [`SigningKey`]s from [`PrivateKeyDer`].
     pub key_provider: &'static dyn KeyProvider,
+
+    /// Provider for creating [`TicketProducer`]s for stateless session resumption.
+    pub ticketer_factory: &'static dyn TicketerFactory,
 }
 
 /// Convenience builder for `CryptoProvider`.
@@ -293,58 +306,14 @@ impl CryptoProvider {
     pub fn install_default(self) -> Result<(), Arc<Self>> {
         static_default::install_default(self)
     }
+}
 
+impl CryptoProvider {
     /// Returns the default `CryptoProvider` for this process.
     ///
     /// This will be `None` if no default has been set yet.
     pub fn get_default() -> Option<&'static Arc<Self>> {
         static_default::get_default()
-    }
-
-    /// An internal function that:
-    ///
-    /// - gets the pre-installed default, or
-    /// - installs one `from_crate_features()`, or else
-    /// - panics about the need to call [`CryptoProvider::install_default()`]
-    pub(crate) fn get_default_or_install_from_crate_features() -> &'static Arc<Self> {
-        if let Some(provider) = Self::get_default() {
-            return provider;
-        }
-
-        let provider = Self::from_crate_features()
-            .expect("no process-level CryptoProvider available -- call CryptoProvider::install_default() before this point");
-        // Ignore the error resulting from us losing a race, and accept the outcome.
-        let _ = provider.install_default();
-        Self::get_default().unwrap()
-    }
-
-    /// Returns a provider named unambiguously by rustls crate features.
-    ///
-    /// This function returns `None` if the crate features are ambiguous (ie, specify two
-    /// providers), or specify no providers, or the feature `custom-provider` is activated.
-    /// In all cases the application should explicitly specify the provider to use
-    /// with [`CryptoProvider::install_default`].
-    fn from_crate_features() -> Option<Self> {
-        #[cfg(all(
-            feature = "ring",
-            not(feature = "aws_lc_rs"),
-            not(feature = "custom-provider")
-        ))]
-        {
-            return Some(ring::default_provider());
-        }
-
-        #[cfg(all(
-            feature = "aws_lc_rs",
-            not(feature = "ring"),
-            not(feature = "custom-provider")
-        ))]
-        {
-            return Some(aws_lc_rs::default_provider());
-        }
-
-        #[allow(unreachable_code)]
-        None
     }
 
     /// Returns `true` if this `CryptoProvider` is operating in FIPS mode.
@@ -355,17 +324,112 @@ impl CryptoProvider {
     /// which take these into account.
     pub fn fips(&self) -> bool {
         let Self {
-            cipher_suites,
+            tls12_cipher_suites,
+            tls13_cipher_suites,
             kx_groups,
             signature_verification_algorithms,
             secure_random,
             key_provider,
+            ticketer_factory,
         } = self;
-        cipher_suites.iter().all(|cs| cs.fips())
+        tls12_cipher_suites
+            .iter()
+            .all(|cs| cs.fips())
+            && tls13_cipher_suites
+                .iter()
+                .all(|cs| cs.fips())
             && kx_groups.iter().all(|kx| kx.fips())
             && signature_verification_algorithms.fips()
             && secure_random.fips()
             && key_provider.fips()
+            && ticketer_factory.fips()
+    }
+
+    pub(crate) fn consistency_check(&self) -> Result<(), Error> {
+        if self.tls12_cipher_suites.is_empty() && self.tls13_cipher_suites.is_empty() {
+            return Err(ApiMisuse::NoCipherSuitesConfigured.into());
+        }
+
+        if self.kx_groups.is_empty() {
+            return Err(ApiMisuse::NoKeyExchangeGroupsConfigured.into());
+        }
+
+        // verifying cipher suites have matching kx groups
+        let mut supported_kx_algos = Vec::with_capacity(ALL_KEY_EXCHANGE_ALGORITHMS.len());
+        for group in self.kx_groups.iter() {
+            let kx = group.name().key_exchange_algorithm();
+            if !supported_kx_algos.contains(&kx) {
+                supported_kx_algos.push(kx);
+            }
+            // Small optimization. We don't need to go over other key exchange groups
+            // if we already cover all supported key exchange algorithms
+            if supported_kx_algos.len() == ALL_KEY_EXCHANGE_ALGORITHMS.len() {
+                break;
+            }
+        }
+
+        for cs in self.tls12_cipher_suites.iter() {
+            if supported_kx_algos.contains(&cs.kx) {
+                continue;
+            }
+            let suite_name = cs.common.suite;
+            return Err(Error::General(alloc::format!(
+                "TLS1.2 cipher suite {suite_name:?} requires {0:?} key exchange, but no {0:?}-compatible \
+                key exchange groups were present in `CryptoProvider`'s `kx_groups` field",
+                cs.kx,
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn iter_cipher_suites(&self) -> impl Iterator<Item = SupportedCipherSuite> + '_ {
+        self.tls13_cipher_suites
+            .iter()
+            .copied()
+            .map(SupportedCipherSuite::Tls13)
+            .chain(
+                self.tls12_cipher_suites
+                    .iter()
+                    .copied()
+                    .map(SupportedCipherSuite::Tls12),
+            )
+    }
+
+    /// We support a given TLS version if at least one ciphersuite for the version
+    /// is available.
+    pub(crate) fn supports_version(&self, v: ProtocolVersion) -> bool {
+        match v {
+            ProtocolVersion::TLSv1_2 => !self.tls12_cipher_suites.is_empty(),
+            ProtocolVersion::TLSv1_3 => !self.tls13_cipher_suites.is_empty(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn find_kx_group(
+        &self,
+        name: NamedGroup,
+        version: ProtocolVersion,
+    ) -> Option<&'static dyn SupportedKxGroup> {
+        if !name.usable_for_version(version) {
+            return None;
+        }
+        self.kx_groups
+            .iter()
+            .find(|skxg| skxg.name() == name)
+            .copied()
+    }
+}
+
+impl Borrow<[&'static Tls12CipherSuite]> for CryptoProvider {
+    fn borrow(&self) -> &[&'static Tls12CipherSuite] {
+        &self.tls12_cipher_suites
+    }
+}
+
+impl Borrow<[&'static Tls13CipherSuite]> for CryptoProvider {
+    fn borrow(&self) -> &[&'static Tls13CipherSuite] {
+        &self.tls13_cipher_suites
     }
 }
 
@@ -408,7 +472,7 @@ pub trait KeyProvider: Send + Sync + Debug {
     fn load_private_key(
         &self,
         key_der: PrivateKeyDer<'static>,
-    ) -> Result<Arc<dyn SigningKey>, Error>;
+    ) -> Result<Box<dyn SigningKey>, Error>;
 
     /// Return `true` if this is backed by a FIPS-approved implementation.
     ///
@@ -417,6 +481,46 @@ pub trait KeyProvider: Send + Sync + Debug {
     fn fips(&self) -> bool {
         false
     }
+}
+
+/// A factory that builds [`TicketProducer`]s.
+///
+/// These can be used in [`ServerConfig::ticketer`] to enable stateless resumption.
+///
+/// [`ServerConfig::ticketer`]: crate::server::ServerConfig::ticketer
+pub trait TicketerFactory: Debug + Send + Sync {
+    /// Build a new `TicketProducer`.
+    fn ticketer(&self) -> Result<Arc<dyn TicketProducer>, Error>;
+
+    /// Return `true` if this is backed by a FIPS-approved implementation.
+    fn fips(&self) -> bool;
+}
+
+/// A trait for the ability to encrypt and decrypt tickets.
+pub trait TicketProducer: Debug + Send + Sync {
+    /// Encrypt and authenticate `plain`, returning the resulting
+    /// ticket.  Return None if `plain` cannot be encrypted for
+    /// some reason: an empty ticket will be sent and the connection
+    /// will continue.
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>>;
+
+    /// Decrypt `cipher`, validating its authenticity protection
+    /// and recovering the plaintext.  `cipher` is fully attacker
+    /// controlled, so this decryption must be side-channel free,
+    /// panic-proof, and otherwise bullet-proof.  If the decryption
+    /// fails, return None.
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>>;
+
+    /// Returns the lifetime of tickets produced now.
+    /// The lifetime is provided as a hint to clients that the
+    /// ticket will not be useful after the given time.
+    ///
+    /// This lifetime must be implemented by key rolling and
+    /// erasure, *not* by storing a lifetime in the ticket.
+    ///
+    /// The objective is to limit damage to forward secrecy caused
+    /// by tickets, not just limiting their lifetime.
+    fn lifetime(&self) -> Duration;
 }
 
 /// A supported key exchange group.
@@ -430,13 +534,19 @@ pub trait SupportedKxGroup: Send + Sync + Debug {
     /// Start a key exchange.
     ///
     /// This will prepare an ephemeral secret key in the supported group, and a corresponding
-    /// public key. The key exchange can be completed by calling [ActiveKeyExchange#complete]
+    /// public key. The key exchange can be completed by calling [`ActiveKeyExchange::complete()`]
     /// or discarded.
+    ///
+    /// Most implementations will want to return the `StartedKeyExchange::Single(_)` variant.
+    /// Hybrid key exchange algorithms, which are constructed from two underlying algorithms,
+    /// may wish to return `StartedKeyExchange::Hybrid(_)` variant which additionally allows
+    /// one part of the key exchange to be completed separately.  See the documentation
+    /// on [`HybridKeyExchange`] for more detail.
     ///
     /// # Errors
     ///
     /// This can fail if the random source fails during ephemeral key generation.
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error>;
+    fn start(&self) -> Result<StartedKeyExchange, Error>;
 
     /// Start and complete a key exchange, in one operation.
     ///
@@ -448,7 +558,7 @@ pub trait SupportedKxGroup: Send + Sync + Debug {
     /// If there is such a data dependency (like key encapsulation mechanisms), this
     /// function should be implemented.
     fn start_and_complete(&self, peer_pub_key: &[u8]) -> Result<CompletedKeyExchange, Error> {
-        let kx = self.start()?;
+        let kx = self.start()?.into_single();
 
         Ok(CompletedKeyExchange {
             group: kx.group(),
@@ -457,19 +567,16 @@ pub trait SupportedKxGroup: Send + Sync + Debug {
         })
     }
 
-    /// FFDHE group the `SupportedKxGroup` operates in.
+    /// FFDHE group the `SupportedKxGroup` operates in, if any.
     ///
-    /// Return `None` if this group is not a FFDHE one.
+    /// The default implementation returns `None`, so non-FFDHE groups (the
+    /// most common) do not need to do anything.
     ///
-    /// The default implementation calls `FfdheGroup::from_named_group`: this function
-    /// is extremely linker-unfriendly so it is recommended all key exchange implementers
-    /// provide this function.
-    ///
-    /// `rustls::ffdhe_groups` contains suitable values to return from this,
-    /// for example [`rustls::ffdhe_groups::FFDHE2048`][crate::ffdhe_groups::FFDHE2048].
+    /// FFDHE groups must implement this. `rustls::ffdhe_groups` contains
+    /// suitable values to return, for example
+    /// [`rustls::ffdhe_groups::FFDHE2048`][crate::ffdhe_groups::FFDHE2048].
     fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
-        #[allow(deprecated)]
-        FfdheGroup::from_named_group(self.name())
+        None
     }
 
     /// Named group the SupportedKxGroup operates in.
@@ -482,12 +589,71 @@ pub trait SupportedKxGroup: Send + Sync + Debug {
     fn fips(&self) -> bool {
         false
     }
+}
 
-    /// Return `true` if this should be offered/selected with the given version.
+/// Return value from [`SupportedKxGroup::start()`].
+#[non_exhaustive]
+pub enum StartedKeyExchange {
+    /// A single [`ActiveKeyExchange`].
+    Single(Box<dyn ActiveKeyExchange>),
+    /// A [`HybridKeyExchange`] that can potentially be split.
+    Hybrid(Box<dyn HybridKeyExchange>),
+}
+
+impl StartedKeyExchange {
+    /// Collapses this object into its underlying [`ActiveKeyExchange`].
     ///
-    /// The default implementation returns true for all versions.
-    fn usable_for_version(&self, _version: ProtocolVersion) -> bool {
-        true
+    /// This removes the ability to do the hybrid key exchange optimization,
+    /// but still allows the key exchange as a whole to be completed.
+    pub fn into_single(self) -> Box<dyn ActiveKeyExchange> {
+        match self {
+            Self::Single(s) => s,
+            Self::Hybrid(h) => h.into_key_exchange(),
+        }
+    }
+
+    /// Accesses the [`HybridKeyExchange`], and checks it was also usable separately.
+    ///
+    /// Returns:
+    ///
+    /// - the [`HybridKeyExchange`]
+    /// - the stand-alone `SupportedKxGroup` for the hybrid's component group.
+    ///
+    /// This returns `None` for:
+    ///
+    /// - non-hybrid groups,
+    /// - if the hybrid component group is not present in `supported`
+    /// - if the hybrid component group is not usable with `version`
+    pub(crate) fn as_hybrid_checked(
+        &self,
+        supported: &[&'static dyn SupportedKxGroup],
+        version: ProtocolVersion,
+    ) -> Option<(&dyn HybridKeyExchange, &'static dyn SupportedKxGroup)> {
+        let Self::Hybrid(hybrid) = self else {
+            return None;
+        };
+
+        let component_group = hybrid.component().0;
+        if !component_group.usable_for_version(version) {
+            return None;
+        }
+
+        supported
+            .iter()
+            .find(|g| g.name() == component_group)
+            .copied()
+            .map(|g| (hybrid.as_ref(), g))
+    }
+}
+
+impl Deref for StartedKeyExchange {
+    type Target = dyn ActiveKeyExchange;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Single(s) => s.as_ref(),
+            Self::Hybrid(h) => h.as_key_exchange(),
+        }
     }
 }
 
@@ -496,7 +662,7 @@ pub trait ActiveKeyExchange: Send + Sync {
     /// Completes the key exchange, given the peer's public key.
     ///
     /// This method must return an error if `peer_pub_key` is invalid: either
-    /// mis-encoded, or an invalid public key (such as, but not limited to, being
+    /// misencoded, or an invalid public key (such as, but not limited to, being
     /// in a small order subgroup).
     ///
     /// If the key exchange algorithm is FFDHE, the result must be left-padded with zeros,
@@ -526,7 +692,7 @@ pub trait ActiveKeyExchange: Send + Sync {
     /// implementation of this method handle TLS 1.2-specific requirements.
     ///
     /// This method must return an error if `peer_pub_key` is invalid: either
-    /// mis-encoded, or an invalid public key (such as, but not limited to, being
+    /// misencoded, or an invalid public key (such as, but not limited to, being
     /// in a small order subgroup).
     ///
     /// The shared secret is returned as a [`SharedSecret`] which can be constructed
@@ -536,9 +702,9 @@ pub trait ActiveKeyExchange: Send + Sync {
     fn complete_for_tls_version(
         self: Box<Self>,
         peer_pub_key: &[u8],
-        tls_version: &SupportedProtocolVersion,
+        tls_version: ProtocolVersion,
     ) -> Result<SharedSecret, Error> {
-        if tls_version.version != ProtocolVersion::TLSv1_2 {
+        if tls_version == ProtocolVersion::TLSv1_3 {
             return self.complete(peer_pub_key);
         }
 
@@ -548,87 +714,6 @@ pub trait ActiveKeyExchange: Send + Sync {
             complete_res.strip_leading_zeros();
         }
         Ok(complete_res)
-    }
-
-    /// For hybrid key exchanges, returns the [`NamedGroup`] and key share
-    /// for the classical half of this key exchange.
-    ///
-    /// There is no requirement for a hybrid scheme (or any other!) to implement
-    /// `hybrid_component()`. It only enables an optimization; described below.
-    ///
-    /// "Hybrid" means a key exchange algorithm which is constructed from two
-    /// (or more) independent component algorithms. Usually one is post-quantum-secure,
-    /// and the other is "classical".  See
-    /// <https://datatracker.ietf.org/doc/draft-ietf-tls-hybrid-design/11/>
-    ///
-    /// # Background
-    /// Rustls always sends a presumptive key share in its `ClientHello`, using
-    /// (absent any other information) the first item in [`CryptoProvider::kx_groups`].
-    /// If the server accepts the client's selection, it can complete the handshake
-    /// using that key share.  If not, the server sends a `HelloRetryRequest` instructing
-    /// the client to send a different key share instead.
-    ///
-    /// This request costs an extra round trip, and wastes the key exchange computation
-    /// (in [`SupportedKxGroup::start()`]) the client already did.  We would
-    /// like to avoid those wastes if possible.
-    ///
-    /// It is early days for post-quantum-secure hybrid key exchange deployment.
-    /// This means (commonly) continuing to offer both the hybrid and classical
-    /// key exchanges, so the handshake can be completed without a `HelloRetryRequest`
-    /// for servers that support the offered hybrid or classical schemes.
-    ///
-    /// Implementing `hybrid_component()` enables two optimizations:
-    ///
-    /// 1. Sending both the hybrid and classical key shares in the `ClientHello`.
-    ///
-    /// 2. Performing the classical key exchange setup only once.  This is important
-    ///    because the classical key exchange setup is relatively expensive.
-    ///    This optimization is permitted and described in
-    ///    <https://www.ietf.org/archive/id/draft-ietf-tls-hybrid-design-11.html#section-3.2>
-    ///
-    /// Both of these only happen if the classical algorithm appears separately in
-    /// the client's [`CryptoProvider::kx_groups`], and if the hybrid algorithm appears
-    /// first in that list.
-    ///
-    /// # How it works
-    /// This function is only called by rustls for clients.  It is called when
-    /// constructing the initial `ClientHello`.  rustls follows these steps:
-    ///
-    /// 1. If the return value is `None`, nothing further happens.
-    /// 2. If the given [`NamedGroup`] does not appear in
-    ///    [`CryptoProvider::kx_groups`], nothing further happens.
-    /// 3. The given key share is added to the `ClientHello`, after the hybrid entry.
-    ///
-    /// Then, one of three things may happen when the server replies to the `ClientHello`:
-    ///
-    /// 1. The server sends a `HelloRetryRequest`.  Everything is thrown away and
-    ///    we start again.
-    /// 2. The server agrees to our hybrid key exchange: rustls calls
-    ///    [`ActiveKeyExchange::complete()`] consuming `self`.
-    /// 3. The server agrees to our classical key exchange: rustls calls
-    ///    [`ActiveKeyExchange::complete_hybrid_component()`] which
-    ///    discards the hybrid key data, and completes just the classical key exchange.
-    fn hybrid_component(&self) -> Option<(NamedGroup, &[u8])> {
-        None
-    }
-
-    /// Completes the classical component of the key exchange, given the peer's public key.
-    ///
-    /// This is only called if `hybrid_component` returns `Some(_)`.
-    ///
-    /// This method must return an error if `peer_pub_key` is invalid: either
-    /// mis-encoded, or an invalid public key (such as, but not limited to, being
-    /// in a small order subgroup).
-    ///
-    /// The shared secret is returned as a [`SharedSecret`] which can be constructed
-    /// from a `&[u8]`.
-    ///
-    /// See the documentation on [`Self::hybrid_component()`] for explanation.
-    fn complete_hybrid_component(
-        self: Box<Self>,
-        _peer_pub_key: &[u8],
-    ) -> Result<SharedSecret, Error> {
-        unreachable!("only called if `hybrid_component()` implemented")
     }
 
     /// Return the public key being used.
@@ -642,24 +727,103 @@ pub trait ActiveKeyExchange: Send + Sync {
 
     /// FFDHE group the `ActiveKeyExchange` is operating in.
     ///
-    /// Return `None` if this group is not a FFDHE one.
+    /// The default implementation returns `None`, so non-FFDHE groups (the
+    /// most common) do not need to do anything.
     ///
-    /// The default implementation calls `FfdheGroup::from_named_group`: this function
-    /// is extremely linker-unfriendly so it is recommended all key exchange implementers
-    /// provide this function.
-    ///
-    /// `rustls::ffdhe_groups` contains suitable values to return from this,
-    /// for example [`rustls::ffdhe_groups::FFDHE2048`][crate::ffdhe_groups::FFDHE2048].
+    /// FFDHE groups must implement this. `rustls::ffdhe_groups` contains
+    /// suitable values to return, for example
+    /// [`rustls::ffdhe_groups::FFDHE2048`][crate::ffdhe_groups::FFDHE2048].
     fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
-        #[allow(deprecated)]
-        FfdheGroup::from_named_group(self.group())
+        None
     }
 
     /// Return the group being used.
     fn group(&self) -> NamedGroup;
 }
 
+/// An in-progress hybrid key exchange originating from a [`SupportedKxGroup`].
+///
+/// "Hybrid" means a key exchange algorithm which is constructed from two
+/// (or more) independent component algorithms. Usually one is post-quantum-secure,
+/// and the other is "classical".  See
+/// <https://datatracker.ietf.org/doc/draft-ietf-tls-hybrid-design/11/>
+///
+/// There is no requirement for a hybrid scheme (or any other!) to implement
+/// `HybridKeyExchange` if it is not desirable for it to be "split" like this.
+/// It only enables an optimization; described below.
+///
+/// # Background
+/// Rustls always sends a presumptive key share in its `ClientHello`, using
+/// (absent any other information) the first item in [`CryptoProvider::kx_groups`].
+/// If the server accepts the client's selection, it can complete the handshake
+/// using that key share.  If not, the server sends a `HelloRetryRequest` instructing
+/// the client to send a different key share instead.
+///
+/// This request costs an extra round trip, and wastes the key exchange computation
+/// (in [`SupportedKxGroup::start()`]) the client already did.  We would
+/// like to avoid those wastes if possible.
+///
+/// It is early days for post-quantum-secure hybrid key exchange deployment.
+/// This means (commonly) continuing to offer both the hybrid and classical
+/// key exchanges, so the handshake can be completed without a `HelloRetryRequest`
+/// for servers that support the offered hybrid or classical schemes.
+///
+/// Implementing `HybridKeyExchange` enables two optimizations:
+///
+/// 1. Sending both the hybrid and classical key shares in the `ClientHello`.
+///
+/// 2. Performing the classical key exchange setup only once.  This is important
+///    because the classical key exchange setup is relatively expensive.
+///    This optimization is permitted and described in
+///    <https://www.ietf.org/archive/id/draft-ietf-tls-hybrid-design-11.html#section-3.2>
+///
+/// Both of these only happen if the classical algorithm appears separately in
+/// the client's [`CryptoProvider::kx_groups`], and if the hybrid algorithm appears
+/// first in that list.
+///
+/// # How it works
+/// This function is only called by rustls for clients.  It is called when
+/// constructing the initial `ClientHello`.  rustls follows these steps:
+///
+/// 1. If the return value is `None`, nothing further happens.
+/// 2. If the given [`NamedGroup`] does not appear in
+///    [`CryptoProvider::kx_groups`], nothing further happens.
+/// 3. The given key share is added to the `ClientHello`, after the hybrid entry.
+///
+/// Then, one of three things may happen when the server replies to the `ClientHello`:
+///
+/// 1. The server sends a `HelloRetryRequest`.  Everything is thrown away and
+///    we start again.
+/// 2. The server agrees to our hybrid key exchange: rustls calls
+///    [`ActiveKeyExchange::complete()`] consuming `self`.
+/// 3. The server agrees to our classical key exchange: rustls calls
+///    [`HybridKeyExchange::complete_component()`] which
+///    discards the hybrid key data, and completes just the classical key exchange.
+pub trait HybridKeyExchange: ActiveKeyExchange {
+    /// Returns the [`NamedGroup`] and public key "share" for the component.
+    fn component(&self) -> (NamedGroup, &[u8]);
+
+    /// Completes the classical component of the key exchange, given the peer's public key.
+    ///
+    /// This method must return an error if `peer_pub_key` is invalid: either
+    /// misencoded, or an invalid public key (such as, but not limited to, being
+    /// in a small order subgroup).
+    ///
+    /// The shared secret is returned as a [`SharedSecret`] which can be constructed
+    /// from a `&[u8]`.
+    ///
+    /// See the documentation on [`HybridKeyExchange`] for explanation.
+    fn complete_component(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error>;
+
+    /// Obtain the value as a `dyn ActiveKeyExchange`
+    fn as_key_exchange(&self) -> &(dyn ActiveKeyExchange + 'static);
+
+    /// Remove the ability to do hybrid key exchange on this object.
+    fn into_key_exchange(self: Box<Self>) -> Box<dyn ActiveKeyExchange>;
+}
+
 /// The result from [`SupportedKxGroup::start_and_complete()`].
+#[expect(clippy::exhaustive_structs)]
 pub struct CompletedKeyExchange {
     /// Which group was used.
     pub group: NamedGroup,
@@ -671,7 +835,7 @@ pub struct CompletedKeyExchange {
     pub secret: SharedSecret,
 }
 
-/// The result from [`ActiveKeyExchange::complete`] or [`ActiveKeyExchange::complete_hybrid_component`].
+/// The result from [`ActiveKeyExchange::complete()`] or [`HybridKeyExchange::complete_component()`].
 pub struct SharedSecret {
     buf: Vec<u8>,
     offset: usize,
@@ -693,7 +857,7 @@ impl SharedSecret {
             .enumerate()
             .find(|(_i, x)| **x != 0)
             .map(|(i, _x)| i)
-            .unwrap_or(self.secret_bytes().len());
+            .unwrap_or_else(|| self.secret_bytes().len());
         self.offset += start;
     }
 }
@@ -743,19 +907,18 @@ impl From<Vec<u8>> for SharedSecret {
 /// ```rust
 /// # #[cfg(feature = "fips")] {
 /// # let root_store = rustls::RootCertStore::empty();
-/// let config = rustls::ClientConfig::builder_with_provider(
+/// let config = rustls::ClientConfig::builder(
 ///         rustls::crypto::default_fips_provider().into()
 ///     )
-///     .with_safe_default_protocol_versions()
-///     .unwrap()
 ///     .with_root_certificates(root_store)
-///     .with_no_client_auth();
+///     .with_no_client_auth()
+///     .unwrap();
 /// # }
 /// ```
-#[cfg(all(feature = "aws_lc_rs", any(feature = "fips", docsrs)))]
-#[cfg_attr(docsrs, doc(cfg(feature = "fips")))]
+#[cfg(all(feature = "aws-lc-rs", any(feature = "fips", rustls_docsrs)))]
+#[cfg_attr(rustls_docsrs, doc(cfg(feature = "fips")))]
 pub fn default_fips_provider() -> CryptoProvider {
-    aws_lc_rs::default_provider()
+    aws_lc_rs::DEFAULT_PROVIDER
 }
 
 mod static_default {
@@ -794,6 +957,46 @@ mod static_default {
     static PROCESS_DEFAULT_PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
     #[cfg(not(feature = "std"))]
     static PROCESS_DEFAULT_PROVIDER: OnceBox<Arc<CryptoProvider>> = OnceBox::new();
+}
+
+#[cfg(test)]
+pub(crate) fn tls13_suite(
+    suite: CipherSuite,
+    provider: &CryptoProvider,
+) -> &'static Tls13CipherSuite {
+    provider
+        .tls13_cipher_suites
+        .iter()
+        .find(|cs| cs.common.suite == suite)
+        .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn tls12_suite(
+    suite: CipherSuite,
+    provider: &CryptoProvider,
+) -> &'static Tls12CipherSuite {
+    provider
+        .tls12_cipher_suites
+        .iter()
+        .find(|cs| cs.common.suite == suite)
+        .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn tls13_only(provider: CryptoProvider) -> CryptoProvider {
+    CryptoProvider {
+        tls12_cipher_suites: Cow::default(),
+        ..provider
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn tls12_only(provider: CryptoProvider) -> CryptoProvider {
+    CryptoProvider {
+        tls13_cipher_suites: Cow::default(),
+        ..provider
+    }
 }
 
 #[cfg(test)]

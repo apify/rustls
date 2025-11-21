@@ -2,6 +2,8 @@ use alloc::vec::Vec;
 use core::fmt::Debug;
 use core::marker::PhantomData;
 
+use pki_types::{CertificateDer, SubjectPublicKeyInfoDer};
+
 use crate::error::InvalidMessage;
 
 /// Wrapper over a slice of bytes that allows reading chunks from
@@ -154,7 +156,7 @@ impl Codec<'_> for u16 {
 }
 
 // Make a distinct type for u24, even though it's a u32 underneath
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types)]
 #[derive(Debug, Copy, Clone)]
 pub struct u24(pub u32);
 
@@ -274,6 +276,17 @@ impl Codec<'_> for () {
     }
 }
 
+impl TlsListElement for CertificateDer<'_> {
+    const SIZE_LEN: ListLength = ListLength::U24 {
+        max: CERTIFICATE_MAX_SIZE_LIMIT,
+        error: InvalidMessage::CertificatePayloadTooLarge,
+    };
+}
+
+impl TlsListElement for SubjectPublicKeyInfoDer<'_> {
+    const SIZE_LEN: ListLength = CertificateDer::SIZE_LEN;
+}
+
 /// A trait for types that can be encoded and decoded in a list.
 ///
 /// This trait is used to implement `Codec` for `Vec<T>`. Lists in the TLS wire format are
@@ -301,6 +314,13 @@ pub(crate) enum ListLength {
 
     /// U24 with imposed upper bound
     U24 { max: usize, error: InvalidMessage },
+
+    /// U24 but non-empty, with imposed upper bound
+    NonZeroU24 {
+        max: usize,
+        empty_error: InvalidMessage,
+        too_many_error: InvalidMessage,
+    },
 }
 
 impl ListLength {
@@ -317,6 +337,15 @@ impl ListLength {
             },
             Self::U24 { max, error } => match usize::from(u24::read(r)?) {
                 len if len > *max => return Err(*error),
+                len => len,
+            },
+            Self::NonZeroU24 {
+                max,
+                empty_error,
+                too_many_error,
+            } => match usize::from(u24::read(r)?) {
+                0 => return Err(*empty_error),
+                len if len > *max => return Err(*too_many_error),
                 len => len,
             },
         })
@@ -340,7 +369,7 @@ impl<'a> LengthPrefixedBuffer<'a> {
         buf.extend(match size_len {
             ListLength::NonZeroU8 { .. } => &[0xff][..],
             ListLength::U16 | ListLength::NonZeroU16 { .. } => &[0xff, 0xff],
-            ListLength::U24 { .. } => &[0xff, 0xff, 0xff],
+            ListLength::U24 { .. } | ListLength::NonZeroU24 { .. } => &[0xff, 0xff, 0xff],
         });
 
         Self {
@@ -368,7 +397,7 @@ impl Drop for LengthPrefixedBuffer<'_> {
                     .unwrap();
                 *out = u16::to_be_bytes(len as u16);
             }
-            ListLength::U24 { .. } => {
+            ListLength::U24 { .. } | ListLength::NonZeroU24 { .. } => {
                 let len = self.buf.len() - self.len_offset - 3;
                 debug_assert!(len <= 0xff_ffff);
                 let len_bytes = u32::to_be_bytes(len as u32);
@@ -380,6 +409,13 @@ impl Drop for LengthPrefixedBuffer<'_> {
         }
     }
 }
+
+/// TLS has a 16MB size limit on any handshake message,
+/// plus a 16MB limit on any given certificate.
+///
+/// We contract that to 64KB to limit the amount of memory allocation
+/// that is directly controllable by the peer.
+pub(crate) const CERTIFICATE_MAX_SIZE_LIMIT: usize = 0x1_0000;
 
 #[cfg(test)]
 mod tests {

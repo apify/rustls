@@ -19,6 +19,7 @@
 //!
 //! [mio]: https://docs.rs/mio/latest/mio/
 
+use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
@@ -27,7 +28,8 @@ use std::{process, str};
 use clap::Parser;
 use mio::net::TcpStream;
 use rustls::RootCertStore;
-use rustls::crypto::{CryptoProvider, SupportedKxGroup, aws_lc_rs as provider};
+use rustls::crypto::{CryptoProvider, Identity, SupportedKxGroup, aws_lc_rs as provider};
+use rustls::enums::ProtocolVersion;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
@@ -274,17 +276,34 @@ struct Args {
     hostname: String,
 }
 
-/// Find a ciphersuite with the given name
-fn find_suite(name: &str) -> Option<rustls::SupportedCipherSuite> {
-    for suite in provider::ALL_CIPHER_SUITES {
-        let sname = format!("{:?}", suite.suite()).to_lowercase();
+impl Args {
+    fn provider(&self) -> CryptoProvider {
+        let kx_groups = match self.key_exchange.as_slice() {
+            [] => Cow::Borrowed(provider::DEFAULT_KX_GROUPS),
+            items => Cow::Owned(
+                items
+                    .iter()
+                    .map(|kx| find_key_exchange(kx))
+                    .collect::<Vec<&'static dyn SupportedKxGroup>>(),
+            ),
+        };
 
-        if sname == name.to_string().to_lowercase() {
-            return Some(*suite);
+        let provider = match lookup_versions(&self.protover).as_slice() {
+            [ProtocolVersion::TLSv1_2] => provider::DEFAULT_TLS12_PROVIDER,
+            [ProtocolVersion::TLSv1_3] => provider::DEFAULT_TLS13_PROVIDER,
+            _ => provider::DEFAULT_PROVIDER,
+        };
+
+        let provider = CryptoProvider {
+            kx_groups,
+            ..provider
+        };
+
+        match self.suite.as_slice() {
+            [] => provider,
+            _ => filter_suites(provider, &self.suite),
         }
     }
-
-    None
 }
 
 /// Find a key exchange with the given name
@@ -300,32 +319,67 @@ fn find_key_exchange(name: &str) -> &'static dyn SupportedKxGroup {
     panic!("cannot find key exchange with name '{name}'");
 }
 
-/// Make a vector of ciphersuites named in `suites`
-fn lookup_suites(suites: &[String]) -> Vec<rustls::SupportedCipherSuite> {
-    let mut out = Vec::new();
+/// Alter `provider` to reduce the set of ciphersuites to just `suites`
+fn filter_suites(mut provider: CryptoProvider, suites: &[String]) -> CryptoProvider {
+    // first, check `suites` all name known suites, and will have some effect
+    let known_suites = provider
+        .tls12_cipher_suites
+        .iter()
+        .map(|cs| cs.common.suite)
+        .chain(
+            provider
+                .tls13_cipher_suites
+                .iter()
+                .map(|cs| cs.common.suite),
+        )
+        .map(|cs| format!("{:?}", cs).to_lowercase())
+        .collect::<Vec<String>>();
 
-    for csname in suites {
-        let scs = find_suite(csname);
-        match scs {
-            Some(s) => out.push(s),
-            None => panic!("cannot look up ciphersuite '{csname}'"),
+    for s in suites {
+        if !known_suites.contains(&s.to_lowercase()) {
+            panic!(
+                "unsupported ciphersuite '{s}'; should be one of {known_suites}",
+                known_suites = known_suites.join(", ")
+            );
         }
     }
 
-    out
+    // now discard non-named suites
+    provider
+        .tls12_cipher_suites
+        .to_mut()
+        .retain(|cs| {
+            let name = format!("{:?}", cs.common.suite).to_lowercase();
+            suites
+                .iter()
+                .any(|s| s.to_lowercase() == name)
+        });
+    provider
+        .tls13_cipher_suites
+        .to_mut()
+        .retain(|cs| {
+            let name = format!("{:?}", cs.common.suite).to_lowercase();
+            suites
+                .iter()
+                .any(|s| s.to_lowercase() == name)
+        });
+
+    provider
 }
 
 /// Make a vector of protocol versions named in `versions`
-fn lookup_versions(versions: &[String]) -> Vec<&'static rustls::SupportedProtocolVersion> {
+fn lookup_versions(versions: &[String]) -> Vec<ProtocolVersion> {
     let mut out = Vec::new();
 
     for vname in versions {
         let version = match vname.as_ref() {
-            "1.2" => &rustls::version::TLS12,
-            "1.3" => &rustls::version::TLS13,
+            "1.2" => ProtocolVersion::TLSv1_2,
+            "1.3" => ProtocolVersion::TLSv1_3,
             _ => panic!("cannot look up version '{vname}', valid are '1.2' and '1.3'"),
         };
-        out.push(version);
+        if !out.contains(&version) {
+            out.push(version);
+        }
     }
 
     out
@@ -343,10 +397,12 @@ fn load_private_key(filename: &str) -> PrivateKeyDer<'static> {
 }
 
 mod danger {
-    use rustls::DigitallySignedStruct;
-    use rustls::client::danger::HandshakeSignatureValid;
+    use rustls::Error;
+    use rustls::client::danger::{
+        HandshakeSignatureValid, ServerIdentity, SignatureVerificationInput,
+    };
     use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::enums::SignatureScheme;
 
     #[derive(Debug)]
     pub struct NoCertificateVerification(CryptoProvider);
@@ -357,50 +413,36 @@ mod danger {
         }
     }
 
-    impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
-        fn verify_server_cert(
+    impl rustls::client::danger::ServerVerifier for NoCertificateVerification {
+        fn verify_identity(
             &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp: &[u8],
-            _now: UnixTime,
-        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
+            _identity: &ServerIdentity<'_>,
+        ) -> Result<rustls::client::danger::PeerVerified, Error> {
+            Ok(rustls::client::danger::PeerVerified::assertion())
         }
 
         fn verify_tls12_signature(
             &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            verify_tls12_signature(
-                message,
-                cert,
-                dss,
-                &self.0.signature_verification_algorithms,
-            )
+            input: &SignatureVerificationInput<'_>,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            verify_tls12_signature(input, &self.0.signature_verification_algorithms)
         }
 
         fn verify_tls13_signature(
             &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            verify_tls13_signature(
-                message,
-                cert,
-                dss,
-                &self.0.signature_verification_algorithms,
-            )
+            input: &SignatureVerificationInput<'_>,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            verify_tls13_signature(input, &self.0.signature_verification_algorithms)
         }
 
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
             self.0
                 .signature_verification_algorithms
                 .supported_schemes()
+        }
+
+        fn request_ocsp_response(&self) -> bool {
+            false
         }
     }
 }
@@ -423,47 +465,18 @@ fn make_config(args: &Args) -> Arc<rustls::ClientConfig> {
         );
     }
 
-    let suites = if !args.suite.is_empty() {
-        lookup_suites(&args.suite)
-    } else {
-        provider::DEFAULT_CIPHER_SUITES.to_vec()
-    };
-
-    let kx_groups = match args.key_exchange.as_slice() {
-        [] => provider::DEFAULT_KX_GROUPS.to_vec(),
-        items => items
-            .iter()
-            .map(|kx| find_key_exchange(kx))
-            .collect::<Vec<&'static dyn SupportedKxGroup>>(),
-    };
-
-    let versions = if !args.protover.is_empty() {
-        lookup_versions(&args.protover)
-    } else {
-        rustls::DEFAULT_VERSIONS.to_vec()
-    };
-
-    let config = rustls::ClientConfig::builder_with_provider(
-        CryptoProvider {
-            cipher_suites: suites,
-            kx_groups,
-            ..provider::default_provider()
-        }
-        .into(),
-    )
-    .with_protocol_versions(&versions)
-    .expect("inconsistent cipher-suite/versions selected")
-    .with_root_certificates(root_store);
+    let config =
+        rustls::ClientConfig::builder(args.provider().into()).with_root_certificates(root_store);
 
     let mut config = match (&args.auth_key, &args.auth_certs) {
         (Some(key_file), Some(certs_file)) => {
             let certs = load_certs(certs_file);
             let key = load_private_key(key_file);
             config
-                .with_client_auth_cert(certs, key)
+                .with_client_auth_cert(Arc::new(Identity::from_cert_chain(certs).unwrap()), key)
                 .expect("invalid client auth certs/key")
         }
-        (None, None) => config.with_no_client_auth(),
+        (None, None) => config.with_no_client_auth().unwrap(),
         (_, _) => {
             panic!("must provide --auth-certs and --auth-key together");
         }
@@ -492,7 +505,7 @@ fn make_config(args: &Args) -> Arc<rustls::ClientConfig> {
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(danger::NoCertificateVerification::new(
-                provider::default_provider(),
+                provider::DEFAULT_PROVIDER,
             )));
     }
 

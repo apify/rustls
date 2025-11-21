@@ -4,15 +4,16 @@ use alloc::vec::Vec;
 use aws_lc_rs::kem;
 
 use super::INVALID_KEY_SHARE;
-use crate::crypto::{ActiveKeyExchange, CompletedKeyExchange, SharedSecret, SupportedKxGroup};
-use crate::ffdhe_groups::FfdheGroup;
-use crate::{Error, NamedGroup, ProtocolVersion};
+use crate::crypto::{
+    ActiveKeyExchange, CompletedKeyExchange, SharedSecret, StartedKeyExchange, SupportedKxGroup,
+};
+use crate::{Error, NamedGroup};
 
 #[derive(Debug)]
 pub(crate) struct MlKem768;
 
 impl SupportedKxGroup for MlKem768 {
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+    fn start(&self) -> Result<StartedKeyExchange, Error> {
         let decaps_key = kem::DecapsulationKey::generate(&kem::ML_KEM_768)
             .map_err(|_| Error::General("key generation failed".into()))?;
 
@@ -21,10 +22,10 @@ impl SupportedKxGroup for MlKem768 {
             .and_then(|encaps_key| encaps_key.key_bytes())
             .map_err(|_| Error::General("encaps failed".into()))?;
 
-        Ok(Box::new(Active {
+        Ok(StartedKeyExchange::Single(Box::new(Active {
             decaps_key: Box::new(decaps_key),
             encaps_key_bytes: Vec::from(pub_key_bytes.as_ref()),
-        }))
+        })))
     }
 
     fn start_and_complete(&self, client_share: &[u8]) -> Result<CompletedKeyExchange, Error> {
@@ -40,10 +41,6 @@ impl SupportedKxGroup for MlKem768 {
             pub_key: Vec::from(ciphertext.as_ref()),
             secret: SharedSecret::from(shared_secret.as_ref()),
         })
-    }
-
-    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
-        None
     }
 
     fn name(&self) -> NamedGroup {
@@ -64,10 +61,6 @@ impl SupportedKxGroup for MlKem768 {
         // <https://github.com/golang/go/issues/70200#issuecomment-2490017956> --
         // see <https://github.com/rustls/rustls/issues/2309>
         super::super::fips()
-    }
-
-    fn usable_for_version(&self, version: ProtocolVersion) -> bool {
-        version == ProtocolVersion::TLSv1_3
     }
 }
 
@@ -91,10 +84,6 @@ impl ActiveKeyExchange for Active {
 
     fn pub_key(&self) -> &[u8] {
         &self.encaps_key_bytes
-    }
-
-    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
-        None
     }
 
     fn group(&self) -> NamedGroup {

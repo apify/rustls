@@ -1,34 +1,23 @@
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::ResolvesClientCert;
+use super::{ClientCredentialResolver, CredentialRequest};
+use crate::compress;
+use crate::crypto::SelectedCredential;
+use crate::enums::{CertificateType, SignatureScheme};
 use crate::log::{debug, trace};
 use crate::msgs::enums::ExtensionType;
 use crate::msgs::handshake::{CertificateChain, DistinguishedName, ProtocolName, ServerExtensions};
-use crate::sync::Arc;
-use crate::{SignatureScheme, compress, sign};
 
 #[derive(Debug)]
-pub(super) struct ServerCertDetails<'a> {
-    pub(super) cert_chain: CertificateChain<'a>,
+pub(super) struct ServerCertDetails {
+    pub(super) cert_chain: CertificateChain<'static>,
     pub(super) ocsp_response: Vec<u8>,
 }
 
-impl<'a> ServerCertDetails<'a> {
-    pub(super) fn new(cert_chain: CertificateChain<'a>, ocsp_response: Vec<u8>) -> Self {
+impl ServerCertDetails {
+    pub(super) fn new(cert_chain: CertificateChain<'static>, ocsp_response: Vec<u8>) -> Self {
         Self {
             cert_chain,
-            ocsp_response,
-        }
-    }
-
-    pub(super) fn into_owned(self) -> ServerCertDetails<'static> {
-        let Self {
-            cert_chain,
-            ocsp_response,
-        } = self;
-        ServerCertDetails {
-            cert_chain: cert_chain.into_owned(),
             ocsp_response,
         }
     }
@@ -80,8 +69,7 @@ pub(super) enum ClientAuthDetails {
     Empty { auth_context_tls13: Option<Vec<u8>> },
     /// Send a non-empty `Certificate` and a `CertificateVerify`.
     Verify {
-        certkey: Arc<sign::CertifiedKey>,
-        signer: Box<dyn sign::Signer>,
+        credentials: SelectedCredential,
         auth_context_tls13: Option<Vec<u8>>,
         compressor: Option<&'static dyn compress::CertCompressor>,
     },
@@ -89,28 +77,26 @@ pub(super) enum ClientAuthDetails {
 
 impl ClientAuthDetails {
     pub(super) fn resolve(
-        resolver: &dyn ResolvesClientCert,
-        canames: Option<&[DistinguishedName]>,
-        sigschemes: &[SignatureScheme],
+        negotiated_type: CertificateType,
+        resolver: &dyn ClientCredentialResolver,
+        root_hint_subjects: Option<&[DistinguishedName]>,
+        signature_schemes: &[SignatureScheme],
         auth_context_tls13: Option<Vec<u8>>,
         compressor: Option<&'static dyn compress::CertCompressor>,
     ) -> Self {
-        let acceptable_issuers = canames
-            .unwrap_or_default()
-            .iter()
-            .map(|p| p.as_ref())
-            .collect::<Vec<&[u8]>>();
+        let server_hello = CredentialRequest {
+            negotiated_type,
+            signature_schemes,
+            root_hint_subjects: root_hint_subjects.unwrap_or_default(),
+        };
 
-        if let Some(certkey) = resolver.resolve(&acceptable_issuers, sigschemes) {
-            if let Some(signer) = certkey.key.choose_scheme(sigschemes) {
-                debug!("Attempting client auth");
-                return Self::Verify {
-                    certkey,
-                    signer,
-                    auth_context_tls13,
-                    compressor,
-                };
-            }
+        if let Some(credentials) = resolver.resolve(&server_hello) {
+            debug!("Attempting client auth");
+            return Self::Verify {
+                credentials,
+                auth_context_tls13,
+                compressor,
+            };
         }
 
         debug!("Client auth requested but no cert/sigscheme available");

@@ -3,16 +3,12 @@ use core::fmt;
 use crate::common_state::Protocol;
 use crate::crypto::cipher::{AeadKey, Iv};
 use crate::crypto::{self, KeyExchangeAlgorithm};
-use crate::enums::{CipherSuite, SignatureAlgorithm, SignatureScheme};
-use crate::msgs::handshake::ALL_KEY_EXCHANGE_ALGORITHMS;
-#[cfg(feature = "tls12")]
+use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::tls12::Tls12CipherSuite;
 use crate::tls13::Tls13CipherSuite;
-#[cfg(feature = "tls12")]
-use crate::versions::TLS12;
-use crate::versions::{SupportedProtocolVersion, TLS13};
 
 /// Common state for cipher suites (both for TLS 1.2 and TLS 1.3)
+#[expect(clippy::exhaustive_structs)]
 pub struct CipherSuiteCommon {
     /// The TLS enumeration naming this cipher suite.
     pub suite: CipherSuite,
@@ -28,7 +24,7 @@ pub struct CipherSuiteCommon {
     ///
     /// This is to be set on the assumption that messages are maximally sized --
     /// each is 2<sup>14</sup> bytes. It **does not** consider confidentiality limits for
-    /// QUIC connections - see the [`quic::KeyBuilder.confidentiality_limit`] field for
+    /// QUIC connections - see the [`quic::PacketKey::confidentiality_limit`] field for
     /// this context.
     ///
     /// For AES-GCM implementations, this should be set to 2<sup>24</sup> to limit attack
@@ -43,6 +39,7 @@ pub struct CipherSuiteCommon {
     /// ```
     /// [AEBounds]: https://eprint.iacr.org/2024/051.pdf
     /// [draft-irtf-aead-limits-08]: https://www.ietf.org/archive/id/draft-irtf-cfrg-aead-limits-08.html#section-5.1.1
+    /// [`quic::PacketKey::confidentiality_limit`]: crate::quic::PacketKey::confidentiality_limit
     ///
     /// For chacha20-poly1305 implementations, this should be set to `u64::MAX`:
     /// see <https://www.ietf.org/archive/id/draft-irtf-cfrg-aead-limits-08.html#section-5.2.1>
@@ -62,10 +59,10 @@ impl CipherSuiteCommon {
 ///
 /// This type carries both configuration and implementation. Compare with
 /// [`CipherSuite`], which carries solely a cipher suite identifier.
+#[non_exhaustive]
 #[derive(Clone, Copy, PartialEq)]
 pub enum SupportedCipherSuite {
     /// A TLS 1.2 cipher suite
-    #[cfg(feature = "tls12")]
     Tls12(&'static Tls12CipherSuite),
     /// A TLS 1.3 cipher suite
     Tls13(&'static Tls13CipherSuite),
@@ -84,87 +81,16 @@ impl SupportedCipherSuite {
 
     pub(crate) fn common(&self) -> &CipherSuiteCommon {
         match self {
-            #[cfg(feature = "tls12")]
             Self::Tls12(inner) => &inner.common,
             Self::Tls13(inner) => &inner.common,
         }
     }
 
-    /// Return the inner `Tls13CipherSuite` for this suite, if it is a TLS1.3 suite.
-    pub fn tls13(&self) -> Option<&'static Tls13CipherSuite> {
-        match self {
-            #[cfg(feature = "tls12")]
-            Self::Tls12(_) => None,
-            Self::Tls13(inner) => Some(inner),
-        }
-    }
-
-    /// Return supported protocol version for the cipher suite.
-    pub fn version(&self) -> &'static SupportedProtocolVersion {
-        match self {
-            #[cfg(feature = "tls12")]
-            Self::Tls12(_) => &TLS12,
-            Self::Tls13(_) => &TLS13,
-        }
-    }
-
-    /// Return true if this suite is usable for a key only offering `sig_alg`
-    /// signatures.  This resolves to true for all TLS1.3 suites.
-    pub fn usable_for_signature_algorithm(&self, _sig_alg: SignatureAlgorithm) -> bool {
-        match self {
-            Self::Tls13(_) => true, // no constraint expressed by ciphersuite (e.g., TLS1.3)
-            #[cfg(feature = "tls12")]
-            Self::Tls12(inner) => inner
-                .sign
-                .iter()
-                .any(|scheme| scheme.algorithm() == _sig_alg),
-        }
-    }
-
     /// Return true if this suite is usable for the given [`Protocol`].
-    ///
-    /// All cipher suites are usable for TCP-TLS.  Only TLS1.3 suites
-    /// with `Tls13CipherSuite::quic` provided are usable for QUIC.
     pub(crate) fn usable_for_protocol(&self, proto: Protocol) -> bool {
-        match proto {
-            Protocol::Tcp => true,
-            Protocol::Quic => self
-                .tls13()
-                .and_then(|cs| cs.quic)
-                .is_some(),
-        }
-    }
-
-    /// Return `true` if this is backed by a FIPS-approved implementation.
-    pub fn fips(&self) -> bool {
         match self {
-            #[cfg(feature = "tls12")]
-            Self::Tls12(cs) => cs.fips(),
-            Self::Tls13(cs) => cs.fips(),
-        }
-    }
-
-    /// Return the list of `KeyExchangeAlgorithm`s supported by this cipher suite.
-    ///
-    /// TLS 1.3 cipher suites support both ECDHE and DHE key exchange, but TLS 1.2 suites
-    /// support one or the other.
-    pub(crate) fn key_exchange_algorithms(&self) -> &[KeyExchangeAlgorithm] {
-        match self {
-            #[cfg(feature = "tls12")]
-            Self::Tls12(tls12) => core::slice::from_ref(&tls12.kx),
-            Self::Tls13(_) => ALL_KEY_EXCHANGE_ALGORITHMS,
-        }
-    }
-
-    /// Say if the given `KeyExchangeAlgorithm` is supported by this cipher suite.
-    ///
-    /// TLS 1.3 cipher suites support all key exchange types, but TLS 1.2 suites
-    /// support only one.
-    pub(crate) fn usable_for_kx_algorithm(&self, _kxa: KeyExchangeAlgorithm) -> bool {
-        match self {
-            #[cfg(feature = "tls12")]
-            Self::Tls12(tls12) => tls12.kx == _kxa,
-            Self::Tls13(_) => true,
+            Self::Tls12(tls12) => tls12.usable_for_protocol(proto),
+            Self::Tls13(tls13) => tls13.usable_for_protocol(proto),
         }
     }
 }
@@ -175,15 +101,26 @@ impl fmt::Debug for SupportedCipherSuite {
     }
 }
 
-/// Return true if `sigscheme` is usable by any of the given suites.
-pub(crate) fn compatible_sigscheme_for_suites(
-    sigscheme: SignatureScheme,
-    common_suites: &[SupportedCipherSuite],
-) -> bool {
-    let sigalg = sigscheme.algorithm();
-    common_suites
-        .iter()
-        .any(|&suite| suite.usable_for_signature_algorithm(sigalg))
+pub(crate) trait Suite: fmt::Debug {
+    fn client_handler(&self) -> &'static dyn crate::client::ClientHandler<Self>;
+
+    fn server_handler(&self) -> &'static dyn crate::server::ServerHandler<Self>;
+
+    fn usable_for_protocol(&self, proto: Protocol) -> bool;
+
+    fn usable_for_signature_scheme(&self, _scheme: SignatureScheme) -> bool;
+
+    fn usable_for_kx_algorithm(&self, _kxa: KeyExchangeAlgorithm) -> bool {
+        true
+    }
+
+    fn suite(&self) -> CipherSuite {
+        self.common().suite
+    }
+
+    fn common(&self) -> &CipherSuiteCommon;
+
+    const VERSION: ProtocolVersion;
 }
 
 /// Secrets for transmitting/receiving data over a TLS session.
@@ -191,6 +128,7 @@ pub(crate) fn compatible_sigscheme_for_suites(
 /// After performing a handshake with rustls, these secrets can be extracted
 /// to configure kTLS for a socket, and have the kernel take over encryption
 /// and/or decryption.
+#[expect(clippy::exhaustive_structs)]
 pub struct ExtractedSecrets {
     /// sequence number and secrets for the "tx" (transmit) direction
     pub tx: (u64, ConnectionTrafficSecrets),
@@ -241,32 +179,19 @@ pub enum ConnectionTrafficSecrets {
 }
 
 #[cfg(test)]
-#[macro_rules_attribute::apply(test_for_each_provider)]
 mod tests {
     use std::println;
 
-    use super::provider::tls13::*;
+    use super::SupportedCipherSuite;
+    use crate::TEST_PROVIDERS;
+    use crate::crypto::tls13_suite;
+    use crate::enums::CipherSuite;
 
     #[test]
     fn test_scs_is_debug() {
-        println!("{:?}", super::provider::ALL_CIPHER_SUITES);
-    }
-
-    #[test]
-    fn test_can_resume_to() {
-        assert!(
-            TLS13_AES_128_GCM_SHA256
-                .tls13()
-                .unwrap()
-                .can_resume_from(TLS13_CHACHA20_POLY1305_SHA256_INTERNAL)
-                .is_some()
-        );
-        assert!(
-            TLS13_AES_256_GCM_SHA384
-                .tls13()
-                .unwrap()
-                .can_resume_from(TLS13_CHACHA20_POLY1305_SHA256_INTERNAL)
-                .is_none()
-        );
+        for &provider in TEST_PROVIDERS {
+            let aes_128_gcm = tls13_suite(CipherSuite::TLS13_AES_128_GCM_SHA256, provider);
+            println!("{:?}", SupportedCipherSuite::Tls13(aes_128_gcm));
+        }
     }
 }

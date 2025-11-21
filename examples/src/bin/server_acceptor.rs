@@ -15,6 +15,8 @@ use std::{fs, thread};
 use clap::Parser;
 use rcgen::{Issuer, KeyPair, SerialNumber};
 use rustls::RootCertStore;
+use rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER;
+use rustls::crypto::{CryptoProvider, Identity};
 use rustls::pki_types::{CertificateRevocationListDer, PrivatePkcs8KeyDer};
 use rustls::server::{Acceptor, ClientHello, ServerConfig, WebPkiClientVerifier};
 
@@ -110,6 +112,7 @@ fn main() {
 
 /// A test PKI with a CA certificate, server certificate, and client certificate.
 struct TestPki {
+    provider: Arc<CryptoProvider>,
     roots: Arc<RootCertStore>,
     ca_cert: (Issuer<'static, rcgen::KeyPair>, rcgen::Certificate),
     client_cert: (rcgen::CertifiedKey<KeyPair>, SerialNumber),
@@ -168,6 +171,7 @@ impl TestPki {
             .add(ca_cert.der().clone())
             .unwrap();
         Self {
+            provider: Arc::new(DEFAULT_PROVIDER),
             roots: roots.into(),
             ca_cert: (ca, ca_cert),
             client_cert: (
@@ -199,7 +203,7 @@ impl TestPki {
         crl_file.read_to_end(&mut crl).unwrap();
 
         // Construct a fresh verifier using the test PKI roots, and the updated CRL.
-        let verifier = WebPkiClientVerifier::builder(self.roots.clone())
+        let verifier = WebPkiClientVerifier::builder(self.roots.clone(), &self.provider)
             .with_crls([CertificateRevocationListDer::from(crl)])
             .build()
             .unwrap();
@@ -207,10 +211,12 @@ impl TestPki {
         // Build a server config using the fresh verifier. If necessary, this could be customized
         // based on the ClientHello (e.g. selecting a different certificate, or customizing
         // supported algorithms/protocol versions).
-        let mut server_config = ServerConfig::builder()
+        let mut server_config = ServerConfig::builder(self.provider.clone())
             .with_client_cert_verifier(verifier)
             .with_single_cert(
-                vec![self.server_cert.cert.der().clone()],
+                Arc::from(
+                    Identity::from_cert_chain(vec![self.server_cert.cert.der().clone()]).unwrap(),
+                ),
                 PrivatePkcs8KeyDer::from(
                     self.server_cert
                         .signing_key
@@ -232,7 +238,7 @@ impl TestPki {
         &self,
         serials: Vec<rcgen::SerialNumber>,
         next_update_seconds: u64,
-    ) -> CertificateRevocationListDer {
+    ) -> CertificateRevocationListDer<'static> {
         // In a real use-case you would want to set this to the current date/time.
         let now = rcgen::date_time_ymd(2023, 1, 1);
 

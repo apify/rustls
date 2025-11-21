@@ -2,6 +2,7 @@
 //! so that unused cryptography in rustls can be discarded by the linker.  You can
 //! observe using `nm` that the binary of this program does not contain any AES code.
 
+use std::borrow::Cow;
 use std::io::{Read, Write, stdout};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -15,18 +16,10 @@ fn main() {
             .cloned(),
     );
 
-    let config = rustls::ClientConfig::builder_with_provider(
-        CryptoProvider {
-            cipher_suites: vec![provider::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256],
-            kx_groups: vec![provider::kx_group::X25519],
-            ..provider::default_provider()
-        }
-        .into(),
-    )
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .unwrap()
-    .with_root_certificates(root_store)
-    .with_no_client_auth();
+    let config = rustls::ClientConfig::builder(PROVIDER.into())
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
+        .unwrap();
 
     let server_name = "www.rust-lang.org".try_into().unwrap();
     let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
@@ -57,3 +50,10 @@ fn main() {
     tls.read_to_end(&mut plaintext).unwrap();
     stdout().write_all(&plaintext).unwrap();
 }
+
+const PROVIDER: CryptoProvider = CryptoProvider {
+    tls12_cipher_suites: Cow::Borrowed(&[]),
+    tls13_cipher_suites: Cow::Borrowed(&[provider::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256]),
+    kx_groups: Cow::Borrowed(&[provider::kx_group::X25519]),
+    ..provider::DEFAULT_PROVIDER
+};

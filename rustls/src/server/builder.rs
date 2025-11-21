@@ -1,25 +1,25 @@
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use pki_types::{CertificateDer, PrivateKeyDer};
+use pki_types::PrivateKeyDer;
 
-use super::{ResolvesServerCert, ServerConfig, handy};
+use super::server_conn::InvalidSniPolicy;
+use super::{ServerConfig, ServerCredentialResolver, handy};
 use crate::builder::{ConfigBuilder, WantsVerifier};
+use crate::crypto::{Credentials, Identity, SingleCredential};
 use crate::error::Error;
-use crate::sign::{CertifiedKey, SingleCertAndKey};
 use crate::sync::Arc;
-use crate::verify::{ClientCertVerifier, NoClientAuth};
-use crate::{NoKeyLog, compress, versions};
+use crate::verify::{ClientVerifier, NoClientAuth};
+use crate::{NoKeyLog, compress};
 
 impl ConfigBuilder<ServerConfig, WantsVerifier> {
     /// Choose how to verify client certificates.
     pub fn with_client_cert_verifier(
         self,
-        client_cert_verifier: Arc<dyn ClientCertVerifier>,
+        client_cert_verifier: Arc<dyn ClientVerifier>,
     ) -> ConfigBuilder<ServerConfig, WantsServerCert> {
         ConfigBuilder {
             state: WantsServerCert {
-                versions: self.state.versions,
                 verifier: client_cert_verifier,
             },
             provider: self.provider,
@@ -40,8 +40,7 @@ impl ConfigBuilder<ServerConfig, WantsVerifier> {
 /// For more information, see the [`ConfigBuilder`] documentation.
 #[derive(Clone, Debug)]
 pub struct WantsServerCert {
-    versions: versions::EnabledVersions,
-    verifier: Arc<dyn ClientCertVerifier>,
+    verifier: Arc<dyn ClientVerifier>,
 }
 
 impl ConfigBuilder<ServerConfig, WantsServerCert> {
@@ -64,11 +63,11 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
     /// key for the end-entity certificate from the `cert_chain`.
     pub fn with_single_cert(
         self,
-        cert_chain: Vec<CertificateDer<'static>>,
+        identity: Arc<Identity<'static>>,
         key_der: PrivateKeyDer<'static>,
     ) -> Result<ServerConfig, Error> {
-        let certified_key = CertifiedKey::from_der(cert_chain, key_der, self.crypto_provider())?;
-        Ok(self.with_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+        let credentials = Credentials::from_der(identity, key_der, self.crypto_provider())?;
+        self.with_server_credential_resolver(Arc::new(SingleCredential::from(credentials)))
     }
 
     /// Sets a single certificate chain, matching private key and optional OCSP
@@ -86,19 +85,24 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
     /// key for the end-entity certificate from the `cert_chain`.
     pub fn with_single_cert_with_ocsp(
         self,
-        cert_chain: Vec<CertificateDer<'static>>,
+        identity: Arc<Identity<'static>>,
         key_der: PrivateKeyDer<'static>,
-        ocsp: Vec<u8>,
+        ocsp: Arc<[u8]>,
     ) -> Result<ServerConfig, Error> {
-        let mut certified_key =
-            CertifiedKey::from_der(cert_chain, key_der, self.crypto_provider())?;
-        certified_key.ocsp = Some(ocsp);
-        Ok(self.with_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+        let mut credentials = Credentials::from_der(identity, key_der, self.crypto_provider())?;
+        if !ocsp.is_empty() {
+            credentials.ocsp = Some(ocsp);
+        }
+        self.with_server_credential_resolver(Arc::new(SingleCredential::from(credentials)))
     }
 
-    /// Sets a custom [`ResolvesServerCert`].
-    pub fn with_cert_resolver(self, cert_resolver: Arc<dyn ResolvesServerCert>) -> ServerConfig {
-        ServerConfig {
+    /// Sets a custom [`ServerCredentialResolver`].
+    pub fn with_server_credential_resolver(
+        self,
+        cert_resolver: Arc<dyn ServerCredentialResolver>,
+    ) -> Result<ServerConfig, Error> {
+        self.provider.consistency_check()?;
+        Ok(ServerConfig {
             provider: self.provider,
             verifier: self.state.verifier,
             cert_resolver,
@@ -108,20 +112,19 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
             session_storage: handy::ServerSessionMemoryCache::new(256),
             #[cfg(not(feature = "std"))]
             session_storage: Arc::new(handy::NoServerSessionStorage {}),
-            ticketer: Arc::new(handy::NeverProducesTickets {}),
+            ticketer: None,
             alpn_protocols: Vec::new(),
-            versions: self.state.versions,
             key_log: Arc::new(NoKeyLog {}),
             enable_secret_extraction: false,
             max_early_data_size: 0,
             send_half_rtt_data: false,
             send_tls13_tickets: 2,
-            #[cfg(feature = "tls12")]
             require_ems: cfg!(feature = "fips"),
             time_provider: self.time_provider,
             cert_compressors: compress::default_cert_compressors().to_vec(),
             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
             cert_decompressors: compress::default_cert_decompressors().to_vec(),
-        }
+            invalid_sni_policy: InvalidSniPolicy::default(),
+        })
     }
 }

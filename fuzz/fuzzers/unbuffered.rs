@@ -19,23 +19,21 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn client(data: &mut [u8]) {
-    let config = ClientConfig::builder_with_provider(rustls_fuzzing_provider::provider().into())
-        .with_safe_default_protocol_versions()
-        .unwrap()
+    let config = ClientConfig::builder(rustls_fuzzing_provider::PROVIDER.into())
         .dangerous()
         .with_custom_certificate_verifier(rustls_fuzzing_provider::server_verifier())
-        .with_no_client_auth();
+        .with_no_client_auth()
+        .unwrap();
     let conn =
         UnbufferedClientConnection::new(config.into(), "localhost".try_into().unwrap()).unwrap();
     fuzz_unbuffered(data, ClientServer::Client(conn));
 }
 
 fn server(data: &mut [u8]) {
-    let config = ServerConfig::builder_with_provider(rustls_fuzzing_provider::provider().into())
-        .with_safe_default_protocol_versions()
-        .unwrap()
+    let config = ServerConfig::builder(rustls_fuzzing_provider::PROVIDER.into())
         .with_no_client_auth()
-        .with_cert_resolver(rustls_fuzzing_provider::server_cert_resolver());
+        .with_server_credential_resolver(rustls_fuzzing_provider::server_cert_resolver())
+        .unwrap();
     let conn = UnbufferedServerConnection::new(config.into()).unwrap();
     fuzz_unbuffered(data, ClientServer::Server(conn));
 }
@@ -62,7 +60,7 @@ fn fuzz_unbuffered(mut data: &mut [u8], mut conn: ClientServer) {
 }
 
 fn process<S: SideData>(status: UnbufferedStatus<'_, '_, S>) -> Option<usize> {
-    let UnbufferedStatus { discard, state } = status;
+    let UnbufferedStatus { discard, state, .. } = status;
 
     match state {
         Ok(ConnectionState::EncodeTlsData(mut enc)) => {
@@ -72,11 +70,7 @@ fn process<S: SideData>(status: UnbufferedStatus<'_, '_, S>) -> Option<usize> {
         Ok(ConnectionState::TransmitTlsData(xmit)) => xmit.done(),
         Ok(ConnectionState::WriteTraffic(_)) => return None,
         Ok(ConnectionState::BlockedHandshake) => return None,
-        Ok(ConnectionState::ReadTraffic(mut read)) => loop {
-            let Some(_app_data) = read.next_record() else {
-                break;
-            };
-        },
+        Ok(ConnectionState::ReadTraffic(_)) => {}
         Ok(st) => panic!("unhandled state {st:?}"),
         Err(_) => return None,
     };

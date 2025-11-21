@@ -7,14 +7,13 @@ description = "Rustls example code and tests."
 publish = false
 
 [dependencies]
-async-std = { workspace = true, optional = true }
 clap = { workspace = true }
 env_logger = { workspace = true }
 hickory-resolver = { workspace = true }
 log = { workspace = true }
 mio = { workspace = true }
 rcgen = { workspace = true }
-rustls = { path = "../rustls", features = ["logging"] }
+rustls = { path = "../rustls", features = ["aws-lc-rs", "log"] }
 serde = { workspace = true }
 tokio = { workspace = true }
 webpki-roots = { workspace = true }

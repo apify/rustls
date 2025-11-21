@@ -8,10 +8,11 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::ServerConfig;
+use rustls::crypto::Identity;
+use rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::UnbufferedServerConnection;
+use rustls::server::{ServerConfig, UnbufferedServerConnection};
 use rustls::unbuffered::{
     AppDataRecord, ConnectionState, EncodeError, EncryptError, InsufficientSizeError,
     UnbufferedStatus,
@@ -27,9 +28,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .next()
         .expect("missing private key file argument");
 
-    let mut config = ServerConfig::builder()
+    let mut config = ServerConfig::builder(Arc::new(DEFAULT_PROVIDER))
         .with_no_client_auth()
-        .with_single_cert(load_certs(cert_file)?, load_private_key(private_key_file)?)?;
+        .with_single_cert(
+            Arc::new(Identity::from_cert_chain(load_certs(cert_file)?)?),
+            load_private_key(private_key_file)?,
+        )?;
 
     if let Some(max_early_data_size) = MAX_EARLY_DATA_SIZE {
         config.max_early_data_size = max_early_data_size;
@@ -71,32 +75,28 @@ fn handle(
 
     let mut iter_count = 0;
     while open_connection {
-        let UnbufferedStatus { mut discard, state } =
-            conn.process_tls_records(&mut incoming_tls[..incoming_used]);
+        let UnbufferedStatus {
+            mut discard, state, ..
+        } = conn.process_tls_records(&mut incoming_tls[..incoming_used]);
 
         match dbg!(state.unwrap()) {
-            ConnectionState::ReadTraffic(mut state) => {
-                while let Some(res) = state.next_record() {
-                    let AppDataRecord {
-                        discard: new_discard,
-                        payload,
-                    } = res?;
-                    discard += new_discard;
+            ConnectionState::ReadTraffic(state) => {
+                let record = state.record();
+                discard += record.discard;
 
-                    if payload.starts_with(b"GET") {
-                        let response = core::str::from_utf8(payload)?;
-                        let header = response
-                            .lines()
-                            .next()
-                            .unwrap_or(response);
+                if record.payload.starts_with(b"GET") {
+                    let response = core::str::from_utf8(record.payload)?;
+                    let header = response
+                        .lines()
+                        .next()
+                        .unwrap_or(response);
 
-                        println!("{header}");
-                    } else {
-                        println!("(.. continued HTTP request ..)");
-                    }
-
-                    received_request = true;
+                    println!("{header}");
+                } else {
+                    println!("(.. continued HTTP request ..)");
                 }
+
+                received_request = true;
             }
 
             ConnectionState::ReadEarlyData(mut state) => {
@@ -104,6 +104,7 @@ fn handle(
                     let AppDataRecord {
                         discard: new_discard,
                         payload,
+                        ..
                     } = res?;
                     discard += new_discard;
 
@@ -215,7 +216,7 @@ where
         Ok(written) => written,
 
         Err(e) => {
-            let InsufficientSizeError { required_size } = map_err(e)?;
+            let InsufficientSizeError { required_size, .. } = map_err(e)?;
             let new_len = *outgoing_used + required_size;
             outgoing_tls.resize(new_len, 0);
             eprintln!("resized `outgoing_tls` buffer to {new_len}B");

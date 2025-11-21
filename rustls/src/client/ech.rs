@@ -5,14 +5,17 @@ use alloc::vec::Vec;
 use pki_types::{DnsName, EchConfigListBytes, ServerName};
 use subtle::ConstantTimeEq;
 
-use crate::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
 use crate::client::tls13;
 use crate::crypto::SecureRandom;
+use crate::crypto::cipher::Payload;
 use crate::crypto::hash::Hash;
 use crate::crypto::hpke::{EncapsulatedSecret, Hpke, HpkePublicKey, HpkeSealer, HpkeSuite};
+use crate::enums::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
+use crate::enums::{AlertDescription, ProtocolVersion};
+use crate::error::{EncryptedClientHelloError, Error, PeerMisbehaved, RejectedEch};
 use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
 use crate::log::{debug, trace, warn};
-use crate::msgs::base::{Payload, PayloadU16};
+use crate::msgs::base::PayloadU16;
 use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::{ExtensionType, HpkeKem};
 use crate::msgs::handshake::{
@@ -27,12 +30,10 @@ use crate::msgs::persist::Retrieved;
 use crate::tls13::key_schedule::{
     KeyScheduleEarly, KeyScheduleHandshakeStart, server_ech_hrr_confirmation_secret,
 };
-use crate::{
-    AlertDescription, ClientConfig, CommonState, EncryptedClientHelloError, Error,
-    PeerIncompatible, PeerMisbehaved, ProtocolVersion, Tls13CipherSuite,
-};
+use crate::{ClientConfig, CommonState, Tls13CipherSuite};
 
 /// Controls how Encrypted Client Hello (ECH) is used in a client handshake.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum EchMode {
     /// ECH is enabled and the ClientHello will be encrypted based on the provided
@@ -105,20 +106,61 @@ impl EchConfig {
                 Error::InvalidEncryptedClientHello(EncryptedClientHelloError::InvalidConfigList)
             })?;
 
-        // Note: we name the index var _i because if the log feature is disabled
-        //       it is unused.
-        #[cfg_attr(not(feature = "logging"), allow(clippy::unused_enumerate_index))]
-        for (_i, config) in ech_configs.iter().enumerate() {
+        Self::new_for_configs(ech_configs, hpke_suites)
+    }
+
+    /// Build an EchConfig for retrying ECH using a retry config from a server's previous rejection
+    ///
+    /// Returns an error if the server provided no retry configurations in `RejectedEch`, or if
+    /// none of the retry configurations are compatible with the supported `hpke_suites`.
+    pub fn for_retry(
+        rejection: RejectedEch,
+        hpke_suites: &[&'static dyn Hpke],
+    ) -> Result<Self, Error> {
+        let Some(configs) = rejection.retry_configs else {
+            return Err(EncryptedClientHelloError::NoCompatibleConfig.into());
+        };
+
+        Self::new_for_configs(configs, hpke_suites)
+    }
+
+    pub(super) fn state(
+        &self,
+        server_name: ServerName<'static>,
+        config: &ClientConfig,
+    ) -> Result<EchState, Error> {
+        EchState::new(
+            self,
+            server_name.clone(),
+            !config
+                .client_auth_cert_resolver
+                .supported_certificate_types()
+                .is_empty(),
+            config.provider.secure_random,
+            config.enable_sni,
+        )
+    }
+
+    /// Compute the HPKE `SetupBaseS` `info` parameter for this ECH configuration.
+    ///
+    /// See <https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-17#section-6.1>.
+    pub(crate) fn hpke_info(&self) -> Vec<u8> {
+        let mut info = Vec::with_capacity(128);
+        // "tls ech" || 0x00 || ECHConfig
+        info.extend_from_slice(b"tls ech\0");
+        self.config.encode(&mut info);
+        info
+    }
+
+    fn new_for_configs(
+        ech_configs: Vec<EchConfigPayload>,
+        hpke_suites: &[&'static dyn Hpke],
+    ) -> Result<Self, Error> {
+        for (i, config) in ech_configs.iter().enumerate() {
             let contents = match config {
                 EchConfigPayload::V18(contents) => contents,
-                EchConfigPayload::Unknown {
-                    version: _version, ..
-                } => {
-                    warn!(
-                        "ECH config {} has unsupported version {:?}",
-                        _i + 1,
-                        _version
-                    );
+                EchConfigPayload::Unknown { version, .. } => {
+                    warn!("ECH config {} has unsupported version {:?}", i + 1, version);
                     continue; // Unsupported version.
                 }
             };
@@ -155,33 +197,6 @@ impl EchConfig {
         }
 
         Err(EncryptedClientHelloError::NoCompatibleConfig.into())
-    }
-
-    pub(super) fn state(
-        &self,
-        server_name: ServerName<'static>,
-        config: &ClientConfig,
-    ) -> Result<EchState, Error> {
-        EchState::new(
-            self,
-            server_name.clone(),
-            config
-                .client_auth_cert_resolver
-                .has_certs(),
-            config.provider.secure_random,
-            config.enable_sni,
-        )
-    }
-
-    /// Compute the HPKE `SetupBaseS` `info` parameter for this ECH configuration.
-    ///
-    /// See <https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-17#section-6.1>.
-    pub(crate) fn hpke_info(&self) -> Vec<u8> {
-        let mut info = Vec::with_capacity(128);
-        // "tls ech" || 0x00 || ECHConfig
-        info.extend_from_slice(b"tls ech\0");
-        self.config.encode(&mut info);
-        info
     }
 }
 
@@ -277,6 +292,7 @@ impl EchGreaseConfig {
 }
 
 /// An enum representing ECH offer status.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum EchStatus {
     /// ECH was not offered - it is a normal TLS handshake.
@@ -587,7 +603,7 @@ impl EchState {
                 .cipher_suites
                 .iter()
                 .filter(|cs| **cs != TLS_EMPTY_RENEGOTIATION_INFO_SCSV)
-                .cloned()
+                .copied()
                 .collect(),
         };
 
@@ -832,16 +848,15 @@ pub(crate) fn fatal_alert_required(
 ) -> Error {
     common.send_fatal_alert(
         AlertDescription::EncryptedClientHelloRequired,
-        PeerIncompatible::ServerRejectedEncryptedClientHello(retry_configs),
+        RejectedEch { retry_configs },
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::enums::CipherSuite;
     use crate::msgs::handshake::{Random, ServerExtensions, SessionId};
-
-    use super::*;
 
     #[test]
     fn server_hello_conf_alters_server_hello_random() {

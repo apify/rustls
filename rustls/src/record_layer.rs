@@ -1,10 +1,12 @@
 use alloc::boxed::Box;
 use core::cmp::min;
 
-use crate::crypto::cipher::{InboundOpaqueMessage, MessageDecrypter, MessageEncrypter};
+use crate::crypto::cipher::{
+    InboundOpaqueMessage, InboundPlainMessage, MessageDecrypter, MessageEncrypter,
+    OutboundOpaqueMessage, OutboundPlainMessage,
+};
 use crate::error::Error;
 use crate::log::trace;
-use crate::msgs::message::{InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage};
 
 #[derive(PartialEq)]
 enum DirectionState {
@@ -272,11 +274,10 @@ const SEQ_HARD_LIMIT: u64 = 0xffff_ffff_ffff_fffeu64;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::enums::{ContentType, ProtocolVersion};
 
     #[test]
     fn test_has_decrypted() {
-        use crate::{ContentType, ProtocolVersion};
-
         struct PassThroughDecrypter;
         impl MessageDecrypter for PassThroughDecrypter {
             fn decrypt<'a>(

@@ -20,6 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use rustls::RootCertStore;
+use rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 
@@ -99,9 +100,10 @@ fn main() {
         )
     }
 
-    let mut config = rustls::ClientConfig::builder()
+    let mut config = rustls::ClientConfig::builder(Arc::new(DEFAULT_PROVIDER))
         .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .with_no_client_auth()
+        .unwrap();
 
     // Allow using SSLKEYLOGFILE.
     config.key_log = Arc::new(rustls::KeyLogFile::new());
