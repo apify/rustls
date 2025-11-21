@@ -10,6 +10,7 @@ use crate::{DistinguishedName, Error};
 
 /// A container for root certificates able to provide a root-of-trust
 /// for connection authentication.
+#[expect(clippy::exhaustive_structs)]
 #[derive(Clone)]
 pub struct RootCertStore {
     /// The list of roots.
@@ -37,7 +38,6 @@ impl RootCertStore {
         let mut invalid_count = 0;
 
         for der_cert in der_certs {
-            #[cfg_attr(not(feature = "logging"), allow(unused_variables))]
             match anchor_from_trusted_cert(&der_cert) {
                 Ok(anchor) => {
                     self.roots.push(anchor.to_owned());
@@ -134,7 +134,7 @@ fn root_cert_store_debug() {
         subject_public_key_info: Der::from_slice(&[]),
         name_constraints: None,
     };
-    let store = RootCertStore::from_iter(iter::repeat(ta).take(138));
+    let store = RootCertStore::from_iter(iter::repeat_n(ta, 138));
 
     assert_eq!(
         format!("{store:?}"),

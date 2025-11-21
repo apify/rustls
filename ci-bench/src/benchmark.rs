@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
-use fxhash::FxHashMap;
 use itertools::Itertools;
+use rustc_hash::FxHashMap;
+use rustls::crypto::{CryptoProvider, TicketProducer};
+use rustls::enums::ProtocolVersion;
 use rustls_test::KeyType;
 
 use crate::Side;
-use crate::callgrind::InstructionCounts;
+use crate::valgrind::InstructionCounts;
 
 /// Validates a benchmark collection, returning an error if the provided benchmarks are invalid
 ///
@@ -56,8 +58,8 @@ impl BenchmarkKind {
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
 /// The kind of resumption used during the handshake
+#[derive(PartialEq, Clone, Copy)]
 pub enum ResumptionKind {
     /// No resumption
     No,
@@ -83,37 +85,39 @@ impl ResumptionKind {
 /// Parameters associated to a benchmark
 #[derive(Clone, Debug)]
 pub struct BenchmarkParams {
-    /// Which `CryptoProvider` to test
-    pub provider: rustls::crypto::CryptoProvider,
-    /// How to make a suitable [`rustls::server::ProducesTickets`].
-    pub ticketer: &'static fn() -> Arc<dyn rustls::server::ProducesTickets>,
+    /// Which `CryptoProvider` to test.
+    ///
+    /// The choice of cipher suite is baked into this.
+    pub provider: Arc<CryptoProvider>,
+    /// How to make a suitable [`rustls::crypto::TicketProducer`].
+    pub ticketer: &'static fn() -> Arc<dyn TicketProducer>,
     /// Where to get keys for server auth
     pub auth_key: AuthKeySource,
-    /// Cipher suite
-    pub ciphersuite: rustls::SupportedCipherSuite,
     /// TLS version
-    pub version: &'static rustls::SupportedProtocolVersion,
+    pub version: ProtocolVersion,
     /// A user-facing label that identifies these params
     pub label: String,
+    /// Call this once this BenchmarkParams is sure to be used
+    pub warm_up: Option<fn()>,
 }
 
 impl BenchmarkParams {
     /// Create a new set of benchmark params
     pub const fn new(
-        provider: rustls::crypto::CryptoProvider,
-        ticketer: &'static fn() -> Arc<dyn rustls::server::ProducesTickets>,
+        provider: Arc<CryptoProvider>,
+        ticketer: &'static fn() -> Arc<dyn TicketProducer>,
         auth_key: AuthKeySource,
-        ciphersuite: rustls::SupportedCipherSuite,
-        version: &'static rustls::SupportedProtocolVersion,
+        version: ProtocolVersion,
         label: String,
+        warm_up: Option<fn()>,
     ) -> Self {
         Self {
             provider,
             ticketer,
             auth_key,
-            ciphersuite,
             version,
             label,
+            warm_up,
         }
     }
 }

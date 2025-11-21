@@ -9,7 +9,6 @@
     clippy::use_self,
     clippy::upper_case_acronyms,
     elided_lifetimes_in_paths,
-    trivial_casts,
     trivial_numeric_casts,
     unreachable_pub,
     unused_import_braces,
@@ -29,15 +28,16 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
 use rustls::client::{Resumption, UnbufferedClientConnection};
-use rustls::crypto::CryptoProvider;
+use rustls::crypto::{CryptoProvider, Identity};
+use rustls::enums::{CipherSuite, ProtocolVersion};
 use rustls::server::{
-    NoServerSessionStorage, ProducesTickets, ServerSessionMemoryCache, UnbufferedServerConnection,
+    NoServerSessionStorage, ServerSessionMemoryCache, UnbufferedServerConnection,
     WebPkiClientVerifier,
 };
 use rustls::unbuffered::{ConnectionState, EncryptError, InsufficientSizeError, UnbufferedStatus};
 use rustls::{
-    CipherSuite, ClientConfig, ClientConnection, ConnectionCommon, Error, HandshakeKind,
-    RootCertStore, ServerConfig, ServerConnection, SideData,
+    ClientConfig, ClientConnection, ConnectionCommon, HandshakeKind, RootCertStore, ServerConfig,
+    ServerConnection, SideData,
 };
 use rustls_test::KeyType;
 
@@ -448,6 +448,13 @@ fn multithreaded(
     server_config: &Arc<ServerConfig>,
     f: impl Fn(Arc<ClientConfig>, Arc<ServerConfig>) -> Timings + Send + Sync,
 ) -> Vec<Timings> {
+    if count.get() == 1 {
+        // Use the current thread if possible; for mysterious reasons this is much
+        // faster for bulk tests on Intel, but makes little difference on AMD and
+        // elsewhere.
+        return vec![f(client_config.clone(), server_config.clone())];
+    }
+
     thread::scope(|s| {
         let threads = (0..count.into())
             .map(|_| {
@@ -459,7 +466,7 @@ fn multithreaded(
 
         threads
             .into_iter()
-            .map(|thr| thr.join().unwrap())
+            .map(|thread| thread.join().unwrap())
             .collect::<Vec<Timings>>()
     })
 }
@@ -790,29 +797,27 @@ impl Parameters {
         let provider = Arc::new(self.provider.build());
         let client_auth = match self.client_auth {
             ClientAuth::Yes => {
-                let roots = self.proto.key_type.get_chain();
+                let Identity::X509(id) = &*self.proto.key_type.identity() else {
+                    panic!("client auth requested but no X.509 identity available");
+                };
+
                 let mut client_auth_roots = RootCertStore::empty();
-                for root in roots {
-                    client_auth_roots.add(root).unwrap();
+                for root in &id.intermediates {
+                    client_auth_roots
+                        .add(root.clone())
+                        .unwrap();
                 }
-                WebPkiClientVerifier::builder_with_provider(
-                    client_auth_roots.into(),
-                    provider.clone(),
-                )
-                .build()
-                .unwrap()
+
+                WebPkiClientVerifier::builder(client_auth_roots.into(), &provider)
+                    .build()
+                    .unwrap()
             }
             ClientAuth::No => WebPkiClientVerifier::no_client_auth(),
         };
 
-        let mut cfg = ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[self.proto.version])
-            .unwrap()
+        let mut cfg = ServerConfig::builder(provider)
             .with_client_cert_verifier(client_auth)
-            .with_single_cert(
-                self.proto.key_type.get_chain(),
-                self.proto.key_type.get_key(),
-            )
+            .with_single_cert(self.proto.key_type.identity(), self.proto.key_type.key())
             .expect("bad certs/private key?");
 
         match self.resume {
@@ -820,7 +825,12 @@ impl Parameters {
                 cfg.session_storage = ServerSessionMemoryCache::new(128);
             }
             ResumptionParam::Tickets => {
-                cfg.ticketer = self.provider.ticketer().unwrap();
+                cfg.ticketer = Some(
+                    cfg.crypto_provider()
+                        .ticketer_factory
+                        .ticketer()
+                        .unwrap(),
+                );
             }
             ResumptionParam::No => {
                 cfg.session_storage = Arc::new(NoServerSessionStorage {});
@@ -837,27 +847,21 @@ impl Parameters {
             .add(self.proto.key_type.ca_cert())
             .unwrap();
 
-        let cfg = ClientConfig::builder_with_provider(
-            CryptoProvider {
-                cipher_suites: self
-                    .provider
-                    .find_suite(self.proto.ciphersuite),
-                ..self.provider.build()
-            }
-            .into(),
+        let cfg = ClientConfig::builder(
+            self.provider
+                .build_with_cipher_suite(self.proto.ciphersuite)
+                .into(),
         )
-        .with_protocol_versions(&[self.proto.version])
-        .unwrap()
         .with_root_certificates(root_store);
 
         let mut cfg = match self.client_auth {
             ClientAuth::Yes => cfg
                 .with_client_auth_cert(
-                    self.proto.key_type.get_client_chain(),
-                    self.proto.key_type.get_client_key(),
+                    self.proto.key_type.client_identity(),
+                    self.proto.key_type.client_key(),
                 )
                 .unwrap(),
-            ClientAuth::No => cfg.with_no_client_auth(),
+            ClientAuth::No => cfg.with_no_client_auth().unwrap(),
         };
 
         cfg.resumption = match self.resume {
@@ -955,8 +959,6 @@ enum Provider {
     AwsLcRsFips,
     #[cfg(feature = "graviola")]
     Graviola,
-    #[cfg(feature = "post-quantum")]
-    PostQuantum,
     #[cfg(feature = "ring")]
     Ring,
     #[value(skip)]
@@ -967,47 +969,33 @@ impl Provider {
     fn build(self) -> CryptoProvider {
         match self {
             #[cfg(feature = "aws-lc-rs")]
-            Self::AwsLcRs => rustls::crypto::aws_lc_rs::default_provider(),
+            Self::AwsLcRs => rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER,
             #[cfg(all(feature = "aws-lc-rs", feature = "fips"))]
             Self::AwsLcRsFips => rustls::crypto::default_fips_provider(),
             #[cfg(feature = "graviola")]
             Self::Graviola => rustls_graviola::default_provider(),
-            #[cfg(feature = "post-quantum")]
-            Self::PostQuantum => rustls_post_quantum::provider(),
             #[cfg(feature = "ring")]
-            Self::Ring => rustls::crypto::ring::default_provider(),
+            Self::Ring => rustls_ring::DEFAULT_PROVIDER,
             Self::_None => unreachable!(),
         }
     }
 
-    fn ticketer(self) -> Result<Arc<dyn ProducesTickets>, Error> {
-        match self {
-            #[cfg(feature = "aws-lc-rs")]
-            Self::AwsLcRs => rustls::crypto::aws_lc_rs::Ticketer::new(),
-            #[cfg(all(feature = "aws-lc-rs", feature = "fips"))]
-            Self::AwsLcRsFips => rustls::crypto::aws_lc_rs::Ticketer::new(),
-            #[cfg(feature = "graviola")]
-            Self::Graviola => rustls_graviola::Ticketer::new(),
-            #[cfg(feature = "post-quantum")]
-            Self::PostQuantum => rustls::crypto::aws_lc_rs::Ticketer::new(),
-            #[cfg(feature = "ring")]
-            Self::Ring => rustls::crypto::ring::Ticketer::new(),
-            Self::_None => unreachable!(),
-        }
-    }
-
-    fn find_suite(&self, name: CipherSuite) -> Vec<rustls::SupportedCipherSuite> {
+    fn build_with_cipher_suite(&self, name: CipherSuite) -> CryptoProvider {
         let mut provider = self.build();
         provider
-            .cipher_suites
-            .retain(|cs| cs.suite() == name);
-        provider.cipher_suites
+            .tls12_cipher_suites
+            .to_mut()
+            .retain(|cs| cs.common.suite == name);
+        provider
+            .tls13_cipher_suites
+            .to_mut()
+            .retain(|cs| cs.common.suite == name);
+        provider
     }
 
     fn supports_benchmark(&self, param: &BenchmarkParam) -> bool {
-        !self
-            .find_suite(param.ciphersuite)
-            .is_empty()
+        let prov = self.build_with_cipher_suite(param.ciphersuite);
+        (prov.tls12_cipher_suites.len() + prov.tls13_cipher_suites.len()) > 0
             && self.supports_key_type(param.key_type)
     }
 
@@ -1033,9 +1021,6 @@ impl Provider {
         #[cfg(feature = "graviola")]
         available.push(Self::Graviola);
 
-        #[cfg(feature = "post-quantum")]
-        available.push(Self::PostQuantum);
-
         #[cfg(feature = "ring")]
         available.push(Self::Ring);
 
@@ -1054,15 +1039,11 @@ impl Provider {
 struct BenchmarkParam {
     key_type: KeyType,
     ciphersuite: CipherSuite,
-    version: &'static rustls::SupportedProtocolVersion,
+    version: ProtocolVersion,
 }
 
 impl BenchmarkParam {
-    const fn new(
-        key_type: KeyType,
-        ciphersuite: CipherSuite,
-        version: &'static rustls::SupportedProtocolVersion,
-    ) -> Self {
+    const fn new(key_type: KeyType, ciphersuite: CipherSuite, version: ProtocolVersion) -> Self {
         Self {
             key_type,
             ciphersuite,
@@ -1166,7 +1147,9 @@ impl Unbuffered {
             .write(data, &mut self.output[self.output_used..])
         {
             Ok(output_added) => output_added,
-            Err(EncryptError::InsufficientSize(InsufficientSizeError { required_size })) => {
+            Err(EncryptError::InsufficientSize(InsufficientSizeError {
+                required_size, ..
+            })) => {
                 self.output
                     .resize(self.output_used + required_size, 0);
                 self.conn
@@ -1207,6 +1190,7 @@ impl UnbufferedConnection {
                         UnbufferedStatus {
                             state: Ok(ConnectionState::EncodeTlsData(mut etd)),
                             discard,
+                            ..
                         } => {
                             input_used += discard;
                             output_added += etd
@@ -1216,6 +1200,7 @@ impl UnbufferedConnection {
                         UnbufferedStatus {
                             state: Ok(ConnectionState::TransmitTlsData(ttd)),
                             discard,
+                            ..
                         } => {
                             input_used += discard;
                             ttd.done();
@@ -1224,6 +1209,7 @@ impl UnbufferedConnection {
                         UnbufferedStatus {
                             state: Ok(ConnectionState::WriteTraffic(_)),
                             discard,
+                            ..
                         } => {
                             input_used += discard;
                             return (input_used, output_added);
@@ -1239,6 +1225,7 @@ impl UnbufferedConnection {
                         UnbufferedStatus {
                             state: Ok(ConnectionState::EncodeTlsData(mut etd)),
                             discard,
+                            ..
                         } => {
                             input_used += discard;
                             output_added += etd
@@ -1248,6 +1235,7 @@ impl UnbufferedConnection {
                         UnbufferedStatus {
                             state: Ok(ConnectionState::TransmitTlsData(ttd)),
                             discard,
+                            ..
                         } => {
                             input_used += discard;
                             ttd.done();
@@ -1256,6 +1244,7 @@ impl UnbufferedConnection {
                         UnbufferedStatus {
                             state: Ok(ConnectionState::WriteTraffic(_)),
                             discard,
+                            ..
                         } => {
                             input_used += discard;
                             return (input_used, output_added);
@@ -1300,11 +1289,12 @@ impl UnbufferedConnection {
         while expected > 0 {
             match client.process_tls_records(&mut input[input_used..]) {
                 UnbufferedStatus {
-                    state: Ok(ConnectionState::ReadTraffic(mut rt)),
+                    state: Ok(ConnectionState::ReadTraffic(rt)),
                     discard,
+                    ..
                 } => {
                     input_used += discard;
-                    let record = rt.next_record().unwrap().unwrap();
+                    let record = rt.record();
                     input_used += record.discard;
                     expected -= record.payload.len();
                 }
@@ -1455,72 +1445,72 @@ static ALL_BENCHMARKS: &[BenchmarkParam] = &[
     BenchmarkParam::new(
         KeyType::Rsa2048,
         CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-        &rustls::version::TLS12,
+        ProtocolVersion::TLSv1_2,
     ),
     BenchmarkParam::new(
         KeyType::EcdsaP256,
         CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        &rustls::version::TLS12,
+        ProtocolVersion::TLSv1_2,
     ),
     BenchmarkParam::new(
         KeyType::Rsa2048,
         CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-        &rustls::version::TLS12,
+        ProtocolVersion::TLSv1_2,
     ),
     BenchmarkParam::new(
         KeyType::Rsa2048,
         CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-        &rustls::version::TLS12,
+        ProtocolVersion::TLSv1_2,
     ),
     BenchmarkParam::new(
         KeyType::EcdsaP256,
         CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        &rustls::version::TLS12,
+        ProtocolVersion::TLSv1_2,
     ),
     BenchmarkParam::new(
         KeyType::EcdsaP384,
         CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        &rustls::version::TLS12,
+        ProtocolVersion::TLSv1_2,
     ),
     BenchmarkParam::new(
         KeyType::Ed25519,
         CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        &rustls::version::TLS12,
+        ProtocolVersion::TLSv1_2,
     ),
     BenchmarkParam::new(
         KeyType::Rsa2048,
         CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-        &rustls::version::TLS13,
+        ProtocolVersion::TLSv1_3,
     ),
     BenchmarkParam::new(
         KeyType::Rsa2048,
         CipherSuite::TLS13_AES_256_GCM_SHA384,
-        &rustls::version::TLS13,
+        ProtocolVersion::TLSv1_3,
     ),
     BenchmarkParam::new(
         KeyType::EcdsaP256,
         CipherSuite::TLS13_AES_256_GCM_SHA384,
-        &rustls::version::TLS13,
+        ProtocolVersion::TLSv1_3,
     ),
     BenchmarkParam::new(
         KeyType::Ed25519,
         CipherSuite::TLS13_AES_256_GCM_SHA384,
-        &rustls::version::TLS13,
+        ProtocolVersion::TLSv1_3,
     ),
     BenchmarkParam::new(
         KeyType::Rsa2048,
         CipherSuite::TLS13_AES_128_GCM_SHA256,
-        &rustls::version::TLS13,
+        ProtocolVersion::TLSv1_3,
     ),
     BenchmarkParam::new(
         KeyType::EcdsaP256,
         CipherSuite::TLS13_AES_128_GCM_SHA256,
-        &rustls::version::TLS13,
+        ProtocolVersion::TLSv1_3,
     ),
     BenchmarkParam::new(
         KeyType::Ed25519,
         CipherSuite::TLS13_AES_128_GCM_SHA256,
-        &rustls::version::TLS13,
+        ProtocolVersion::TLSv1_3,
     ),
 ];
 

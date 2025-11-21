@@ -1,3 +1,5 @@
+//! Error types used throughout rustls.
+
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -5,8 +7,8 @@ use core::fmt;
 #[cfg(feature = "std")]
 use std::time::SystemTimeError;
 
-use pki_types::{AlgorithmIdentifier, ServerName, UnixTime};
-use webpki::KeyUsage;
+use pki_types::{AlgorithmIdentifier, EchConfigListBytes, ServerName, UnixTime};
+use webpki::ExtendedKeyUsage;
 
 use crate::enums::{AlertDescription, ContentType, HandshakeType};
 use crate::msgs::handshake::{EchConfigPayload, KeyExchangeAlgorithm};
@@ -43,9 +45,6 @@ pub enum Error {
 
     /// The peer sent us a TLS message with invalid contents.
     InvalidMessage(InvalidMessage),
-
-    /// The peer didn't give us any certificates.
-    NoCertificatesPresented,
 
     /// The certificate verifier doesn't support the given type of name.
     UnsupportedNameType,
@@ -96,14 +95,49 @@ pub enum Error {
     /// An incoming connection did not support any known application protocol.
     NoApplicationProtocol,
 
+    /// The server certificate resolver didn't find an appropriate certificate.
+    NoSuitableCertificate,
+
     /// The `max_fragment_size` value supplied in configuration was too small,
     /// or too large.
     BadMaxFragmentSize,
 
-    /// Specific failure cases from [`keys_match`] or a [`crate::crypto::signer::SigningKey`] that cannot produce a corresponding public key.
+    /// Specific failure cases from [`Credentials::new()`] or a
+    /// [`crate::crypto::SigningKey`] that cannot produce a corresponding public key.
     ///
-    /// [`keys_match`]: crate::crypto::signer::CertifiedKey::keys_match
+    /// If encountered while building a [`Credentials`], consider if
+    /// [`Credentials::new_unchecked()`] might be appropriate for your use case.
+    ///
+    /// [`Credentials::new()`]: crate::crypto::Credentials::new()
+    /// [`Credentials`]: crate::crypto::Credentials
+    /// [`Credentials::new_unchecked()`]: crate::crypto::Credentials::new_unchecked()
     InconsistentKeys(InconsistentKeys),
+
+    /// The server rejected encrypted client hello (ECH) negotiation
+    ///
+    /// It may have returned new ECH configurations that could be used to retry negotiation
+    /// with a fresh connection.
+    ///
+    /// See [`RejectedEch::can_retry()`] and [`crate::client::EchConfig::for_retry()`].
+    RejectedEch(RejectedEch),
+
+    /// Errors of this variant should never be produced by the library.
+    ///
+    /// Please file a bug if you see one.
+    Unreachable(&'static str),
+
+    /// The caller misused the API
+    ///
+    /// Generally we try to make error cases like this unnecessary by embedding
+    /// the constraints in the type system, so misuses simply do not compile.  But,
+    /// for cases where that is not possible or exceptionally costly, we return errors
+    /// of this variant.
+    ///
+    /// This only results from the ordering, dependencies or parameter values of calls,
+    /// so (assuming parameter values are fixed) these can be determined and fixed by
+    /// reading the code.  They are never caused by the values of untrusted data, or
+    /// other non-determinism.
+    ApiMisuse(ApiMisuse),
 
     /// Any other error.
     ///
@@ -115,20 +149,20 @@ pub enum Error {
     Other(OtherError),
 }
 
-/// Specific failure cases from [`keys_match`] or a [`crate::crypto::signer::SigningKey`] that cannot produce a corresponding public key.
+/// Specific failure cases from [`Credentials::new()`] or a [`crate::crypto::SigningKey`] that cannot produce a corresponding public key.
 ///
-/// [`keys_match`]: crate::crypto::signer::CertifiedKey::keys_match
+/// [`Credentials::new()`]: crate::crypto::Credentials::new()
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InconsistentKeys {
     /// The public key returned by the [`SigningKey`] does not match the public key information in the certificate.
     ///
-    /// [`SigningKey`]: crate::crypto::signer::SigningKey
+    /// [`SigningKey`]: crate::crypto::SigningKey
     KeyMismatch,
 
     /// The [`SigningKey`] cannot produce its corresponding public key.
     ///
-    /// [`SigningKey`]: crate::crypto::signer::SigningKey
+    /// [`SigningKey`]: crate::crypto::SigningKey
     Unknown,
 }
 
@@ -221,9 +255,6 @@ impl From<InvalidMessage> for AlertDescription {
     }
 }
 
-#[non_exhaustive]
-#[allow(missing_docs)]
-#[derive(Debug, PartialEq, Clone)]
 /// The set of cases where we failed to make a connection because we thought
 /// the peer was misbehaving.
 ///
@@ -234,6 +265,9 @@ impl From<InvalidMessage> for AlertDescription {
 ///
 /// Please file a bug against rustls if you see `Error::PeerMisbehaved` in
 /// the wild.
+#[expect(missing_docs)]
+#[non_exhaustive]
+#[derive(Debug, PartialEq, Clone)]
 pub enum PeerMisbehaved {
     AttemptedDowngradeToTls12WhenTls13IsSupported,
     BadCertChainExtensions,
@@ -269,6 +303,7 @@ pub enum PeerMisbehaved {
     MissingKeyShare,
     MissingPskModesExtension,
     MissingQuicTransportParameters,
+    NoCertificatesPresented,
     OfferedDuplicateCertificateCompressions,
     OfferedDuplicateKeyShares,
     OfferedEarlyDataWithOldProtocolVersion,
@@ -291,7 +326,6 @@ pub enum PeerMisbehaved {
     SelectedUnofferedCompression,
     SelectedUnofferedKxGroup,
     SelectedUnofferedPsk,
-    SelectedUnusableCipherSuiteForVersion,
     ServerEchoedCompatibilitySessionId,
     ServerHelloMustOfferUncompressedEcPoints,
     ServerNameDifferedOnRetry,
@@ -319,25 +353,27 @@ impl From<PeerMisbehaved> for Error {
     }
 }
 
-#[non_exhaustive]
-#[allow(missing_docs)]
-#[derive(Debug, PartialEq, Clone)]
 /// The set of cases where we failed to make a connection because a peer
 /// doesn't support a TLS version/feature we require.
 ///
 /// This is `non_exhaustive`: we might add or stop using items here in minor
 /// versions.
+#[expect(missing_docs)]
+#[non_exhaustive]
+#[derive(Debug, PartialEq, Clone)]
 pub enum PeerIncompatible {
     EcPointsExtensionRequired,
     ExtendedMasterSecretExtensionRequired,
     IncorrectCertificateTypeExtension,
     KeyShareExtensionRequired,
+    MultipleRawKeys,
     NamedGroupsExtensionRequired,
     NoCertificateRequestSignatureSchemesInCommon,
     NoCipherSuitesInCommon,
     NoEcPointFormatsInCommon,
     NoKxGroupsInCommon,
     NoSignatureSchemesInCommon,
+    NoServerNameProvided,
     NullCompressionRequired,
     ServerDoesNotSupportTls12Or13,
     ServerSentHelloRetryRequestWithUnknownExtension,
@@ -348,8 +384,8 @@ pub enum PeerIncompatible {
     Tls12NotOfferedOrEnabled,
     Tls13RequiredForQuic,
     UncompressedEcPointsRequired,
+    UnknownCertificateType(u8),
     UnsolicitedCertificateTypeExtension,
-    ServerRejectedEncryptedClientHello(Option<Vec<EchConfigPayload>>),
 }
 
 impl From<PeerIncompatible> for Error {
@@ -359,8 +395,6 @@ impl From<PeerIncompatible> for Error {
     }
 }
 
-#[non_exhaustive]
-#[derive(Debug, Clone)]
 /// The ways in which certificate validators can express errors.
 ///
 /// Note that the rustls TLS protocol code interprets specifically these
@@ -368,6 +402,8 @@ impl From<PeerIncompatible> for Error {
 /// custom certificate validator uses incorrect errors the library as
 /// a whole will send alerts that do not match the standard (this is usually
 /// a minor issue, but could be misleading).
+#[non_exhaustive]
+#[derive(Debug, Clone)]
 pub enum CertificateError {
     /// The certificate is not correctly encoded.
     BadEncoding,
@@ -432,14 +468,7 @@ pub enum CertificateError {
     BadSignature,
 
     /// A signature inside a certificate or on a handshake was made with an unsupported algorithm.
-    #[deprecated(
-        since = "0.23.29",
-        note = "use `UnsupportedSignatureAlgorithmContext` instead"
-    )]
-    UnsupportedSignatureAlgorithm,
-
-    /// A signature inside a certificate or on a handshake was made with an unsupported algorithm.
-    UnsupportedSignatureAlgorithmContext {
+    UnsupportedSignatureAlgorithm {
         /// The signature algorithm OID that was unsupported.
         signature_algorithm_id: Vec<u8>,
         /// Supported algorithms that were available for signature verification.
@@ -447,7 +476,7 @@ pub enum CertificateError {
     },
 
     /// A signature was made with an algorithm that doesn't match the relevant public key.
-    UnsupportedSignatureAlgorithmForPublicKeyContext {
+    UnsupportedSignatureAlgorithmForPublicKey {
         /// The signature algorithm OID.
         signature_algorithm_id: Vec<u8>,
         /// The public key algorithm OID.
@@ -490,12 +519,12 @@ pub enum CertificateError {
 
     /// The OCSP response provided to the verifier was invalid.
     ///
-    /// This should be returned from [`ServerCertVerifier::verify_server_cert()`]
+    /// This should be returned from [`ServerVerifier::verify_identity()`]
     /// when a verifier checks its `ocsp_response` parameter and finds it invalid.
     ///
     /// This maps to [`AlertDescription::BadCertificateStatusResponse`].
     ///
-    /// [`ServerCertVerifier::verify_server_cert()`]: crate::client::danger::ServerCertVerifier::verify_server_cert
+    /// [`ServerVerifier::verify_identity()`]: crate::client::danger::ServerVerifier::verify_identity
     InvalidOcspResponse,
 
     /// The certificate is valid, but the handshake is rejected for other
@@ -518,7 +547,6 @@ pub enum CertificateError {
 impl PartialEq<Self> for CertificateError {
     fn eq(&self, other: &Self) -> bool {
         use CertificateError::*;
-        #[allow(clippy::match_like_matches_macro)]
         match (self, other) {
             (BadEncoding, BadEncoding) => true,
             (Expired, Expired) => true,
@@ -547,14 +575,12 @@ impl PartialEq<Self> for CertificateError {
             (UnhandledCriticalExtension, UnhandledCriticalExtension) => true,
             (UnknownIssuer, UnknownIssuer) => true,
             (BadSignature, BadSignature) => true,
-            #[allow(deprecated)]
-            (UnsupportedSignatureAlgorithm, UnsupportedSignatureAlgorithm) => true,
             (
-                UnsupportedSignatureAlgorithmContext {
+                UnsupportedSignatureAlgorithm {
                     signature_algorithm_id: left_signature_algorithm_id,
                     supported_algorithms: left_supported_algorithms,
                 },
-                UnsupportedSignatureAlgorithmContext {
+                UnsupportedSignatureAlgorithm {
                     signature_algorithm_id: right_signature_algorithm_id,
                     supported_algorithms: right_supported_algorithms,
                 },
@@ -563,11 +589,11 @@ impl PartialEq<Self> for CertificateError {
                     == (right_signature_algorithm_id, right_supported_algorithms)
             }
             (
-                UnsupportedSignatureAlgorithmForPublicKeyContext {
+                UnsupportedSignatureAlgorithmForPublicKey {
                     signature_algorithm_id: left_signature_algorithm_id,
                     public_key_algorithm_id: left_public_key_algorithm_id,
                 },
-                UnsupportedSignatureAlgorithmForPublicKeyContext {
+                UnsupportedSignatureAlgorithmForPublicKey {
                     signature_algorithm_id: right_signature_algorithm_id,
                     public_key_algorithm_id: right_public_key_algorithm_id,
                 },
@@ -639,13 +665,11 @@ impl From<CertificateError> for AlertDescription {
             UnknownIssuer
             | UnknownRevocationStatus
             | ExpiredRevocationList
-            | ExpiredRevocationListContext { .. } => Self::UnknownCA,
+            | ExpiredRevocationListContext { .. } => Self::UnknownCa,
             InvalidOcspResponse => Self::BadCertificateStatusResponse,
-            #[allow(deprecated)]
             BadSignature
-            | UnsupportedSignatureAlgorithm
-            | UnsupportedSignatureAlgorithmContext { .. }
-            | UnsupportedSignatureAlgorithmForPublicKeyContext { .. } => Self::DecryptError,
+            | UnsupportedSignatureAlgorithm { .. }
+            | UnsupportedSignatureAlgorithmForPublicKey { .. } => Self::DecryptError,
             InvalidPurpose | InvalidPurposeContext { .. } => Self::UnsupportedCertificate,
             ApplicationVerificationFailure => Self::AccessDenied,
             // RFC 5246/RFC 8446
@@ -747,6 +771,8 @@ impl fmt::Display for CertificateError {
                 Ok(())
             }
 
+            Self::Other(other) => write!(f, "{other}"),
+
             other => write!(f, "{other:?}"),
         }
     }
@@ -763,6 +789,7 @@ impl From<CertificateError> for Error {
 ///
 /// These are usually represented as OID values in the certificate's extension (if present), but
 /// we represent the values that are most relevant to rustls as named enum variants.
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExtendedKeyPurpose {
     /// Client authentication
@@ -779,8 +806,8 @@ impl ExtendedKeyPurpose {
     pub(crate) fn for_values(values: impl Iterator<Item = usize>) -> Self {
         let values = values.collect::<Vec<_>>();
         match &*values {
-            KeyUsage::CLIENT_AUTH_REPR => Self::ClientAuth,
-            KeyUsage::SERVER_AUTH_REPR => Self::ServerAuth,
+            ExtendedKeyUsage::CLIENT_AUTH_REPR => Self::ClientAuth,
+            ExtendedKeyUsage::SERVER_AUTH_REPR => Self::ServerAuth,
             _ => Self::Other(values),
         }
     }
@@ -804,22 +831,15 @@ impl fmt::Display for ExtendedKeyPurpose {
     }
 }
 
+/// The ways in which a certificate revocation list (CRL) can be invalid.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-/// The ways in which a certificate revocation list (CRL) can be invalid.
 pub enum CertRevocationListError {
     /// The CRL had a bad signature from its issuer.
     BadSignature,
 
-    /// The CRL had an unsupported signature from its issuer.
-    #[deprecated(
-        since = "0.23.29",
-        note = "use `UnsupportedSignatureAlgorithmContext` instead"
-    )]
-    UnsupportedSignatureAlgorithm,
-
     /// A signature inside a certificate or on a handshake was made with an unsupported algorithm.
-    UnsupportedSignatureAlgorithmContext {
+    UnsupportedSignatureAlgorithm {
         /// The signature algorithm OID that was unsupported.
         signature_algorithm_id: Vec<u8>,
         /// Supported algorithms that were available for signature verification.
@@ -827,7 +847,7 @@ pub enum CertRevocationListError {
     },
 
     /// A signature was made with an algorithm that doesn't match the relevant public key.
-    UnsupportedSignatureAlgorithmForPublicKeyContext {
+    UnsupportedSignatureAlgorithmForPublicKey {
         /// The signature algorithm OID.
         signature_algorithm_id: Vec<u8>,
         /// The public key algorithm OID.
@@ -874,17 +894,14 @@ pub enum CertRevocationListError {
 impl PartialEq<Self> for CertRevocationListError {
     fn eq(&self, other: &Self) -> bool {
         use CertRevocationListError::*;
-        #[allow(clippy::match_like_matches_macro)]
         match (self, other) {
             (BadSignature, BadSignature) => true,
-            #[allow(deprecated)]
-            (UnsupportedSignatureAlgorithm, UnsupportedSignatureAlgorithm) => true,
             (
-                UnsupportedSignatureAlgorithmContext {
+                UnsupportedSignatureAlgorithm {
                     signature_algorithm_id: left_signature_algorithm_id,
                     supported_algorithms: left_supported_algorithms,
                 },
-                UnsupportedSignatureAlgorithmContext {
+                UnsupportedSignatureAlgorithm {
                     signature_algorithm_id: right_signature_algorithm_id,
                     supported_algorithms: right_supported_algorithms,
                 },
@@ -893,11 +910,11 @@ impl PartialEq<Self> for CertRevocationListError {
                     == (right_signature_algorithm_id, right_supported_algorithms)
             }
             (
-                UnsupportedSignatureAlgorithmForPublicKeyContext {
+                UnsupportedSignatureAlgorithmForPublicKey {
                     signature_algorithm_id: left_signature_algorithm_id,
                     public_key_algorithm_id: left_public_key_algorithm_id,
                 },
-                UnsupportedSignatureAlgorithmForPublicKeyContext {
+                UnsupportedSignatureAlgorithmForPublicKey {
                     signature_algorithm_id: right_signature_algorithm_id,
                     public_key_algorithm_id: right_public_key_algorithm_id,
                 },
@@ -926,9 +943,9 @@ impl From<CertRevocationListError> for Error {
     }
 }
 
+/// An error that occurred while handling Encrypted Client Hello (ECH).
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq)]
-/// An error that occurred while handling Encrypted Client Hello (ECH).
 pub enum EncryptedClientHelloError {
     /// The provided ECH configuration list was invalid.
     InvalidConfigList,
@@ -942,6 +959,46 @@ impl From<EncryptedClientHelloError> for Error {
     #[inline]
     fn from(e: EncryptedClientHelloError) -> Self {
         Self::InvalidEncryptedClientHello(e)
+    }
+}
+
+/// The server rejected the request to enable Encrypted Client Hello (ECH)
+///
+/// If [`RejectedEch::can_retry()`] is true, then you may use this with
+/// [`crate::client::EchConfig::for_retry()`] to build a new `EchConfig` for a fresh client
+/// connection that will use a compatible ECH configuration provided by the server for a retry.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RejectedEch {
+    pub(crate) retry_configs: Option<Vec<EchConfigPayload>>,
+}
+
+impl RejectedEch {
+    /// Returns true if the server provided new ECH configurations to use for a fresh retry connection
+    ///
+    /// The `RejectedEch` error can be provided to [`crate::client::EchConfig::for_retry()`]
+    /// to build a new `EchConfig` for a fresh client connection that will use a compatible ECH
+    /// configuration provided by the server for a retry.
+    pub fn can_retry(&self) -> bool {
+        self.retry_configs.is_some()
+    }
+
+    /// Returns an `EchConfigListBytes` with the server's provided retry configurations (if any)
+    pub fn retry_configs(&self) -> Option<EchConfigListBytes<'static>> {
+        let Some(retry_configs) = &self.retry_configs else {
+            return None;
+        };
+
+        let mut tls_encoded_list = Vec::new();
+        retry_configs.encode(&mut tls_encoded_list);
+
+        Some(EchConfigListBytes::from(tls_encoded_list))
+    }
+}
+
+impl From<RejectedEch> for Error {
+    fn from(rejected_error: RejectedEch) -> Self {
+        Self::RejectedEch(rejected_error)
     }
 }
 
@@ -979,14 +1036,13 @@ impl fmt::Display for Error {
             }
             Self::PeerIncompatible(why) => write!(f, "peer is incompatible: {why:?}"),
             Self::PeerMisbehaved(why) => write!(f, "peer misbehaved: {why:?}"),
-            Self::AlertReceived(alert) => write!(f, "received fatal alert: {alert:?}"),
+            Self::AlertReceived(alert) => write!(f, "received fatal alert: the peer {alert}"),
             Self::InvalidCertificate(err) => {
                 write!(f, "invalid peer certificate: {err}")
             }
             Self::InvalidCertRevocationList(err) => {
                 write!(f, "invalid certificate revocation list: {err:?}")
             }
-            Self::NoCertificatesPresented => write!(f, "peer sent no certificates"),
             Self::UnsupportedNameType => write!(f, "presented server name type wasn't supported"),
             Self::DecryptError => write!(f, "cannot decrypt peer's message"),
             Self::InvalidEncryptedClientHello(err) => {
@@ -996,6 +1052,7 @@ impl fmt::Display for Error {
             Self::PeerSentOversizedRecord => write!(f, "peer sent excess record size"),
             Self::HandshakeNotComplete => write!(f, "handshake not complete"),
             Self::NoApplicationProtocol => write!(f, "peer doesn't support any known protocol"),
+            Self::NoSuitableCertificate => write!(f, "no suitable certificate found"),
             Self::FailedToGetCurrentTime => write!(f, "failed to get current time"),
             Self::FailedToGetRandomBytes => write!(f, "failed to get random bytes"),
             Self::BadMaxFragmentSize => {
@@ -1004,7 +1061,19 @@ impl fmt::Display for Error {
             Self::InconsistentKeys(why) => {
                 write!(f, "keys may not be consistent: {why:?}")
             }
+            Self::RejectedEch(why) => {
+                write!(
+                    f,
+                    "server rejected encrypted client hello (ECH) {} retry configs",
+                    if why.can_retry() { "with" } else { "without" }
+                )
+            }
             Self::General(err) => write!(f, "unexpected error: {err}"),
+            Self::Unreachable(err) => write!(
+                f,
+                "unreachable condition: {err} (please file a bug in rustls)"
+            ),
+            Self::ApiMisuse(why) => write!(f, "API misuse: {why:?}"),
             Self::Other(err) => write!(f, "other error: {err}"),
         }
     }
@@ -1018,8 +1087,7 @@ impl From<SystemTimeError> for Error {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 impl From<rand::GetRandomFailed> for Error {
     fn from(_: rand::GetRandomFailed) -> Self {
@@ -1027,13 +1095,169 @@ impl From<rand::GetRandomFailed> for Error {
     }
 }
 
+/// Describes cases of API misuse
+///
+/// Variants here should be sufficiently detailed that the action needed is clear.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApiMisuse {
+    /// The [`KeyingMaterialExporter`][] was already consumed.
+    ///
+    /// Methods that obtain an exporter (eg, [`ConnectionCommon::exporter()`][]) can only
+    /// be used once.  This error is returned on subsequent calls.
+    ///
+    /// [`KeyingMaterialExporter`]: crate::KeyingMaterialExporter
+    /// [`ConnectionCommon::exporter()`]: crate::ConnectionCommon::exporter()
+    ExporterAlreadyUsed,
+
+    /// The `context` parameter to [`KeyingMaterialExporter::derive()`][] was too long.
+    ///
+    /// For TLS1.2 connections (only) this parameter is limited to 64KB.
+    ///
+    /// [`KeyingMaterialExporter::derive()`]: crate::KeyingMaterialExporter::derive()
+    ExporterContextTooLong,
+
+    /// The `output` object for [`KeyingMaterialExporter::derive()`][] was too long.
+    ///
+    /// For TLS1.3 connections this is limited to 255 times the hash output length.
+    ///
+    /// [`KeyingMaterialExporter::derive()`]: crate::KeyingMaterialExporter::derive()
+    ExporterOutputTooLong,
+
+    /// The `output` object to [`KeyingMaterialExporter::derive()`][] was zero length.
+    ///
+    /// This doesn't make sense, so we explicitly return an error (rather than simply
+    /// producing no output as requested.)
+    ///
+    /// [`KeyingMaterialExporter::derive()`]: crate::KeyingMaterialExporter::derive()
+    ExporterOutputZeroLength,
+
+    /// [`Acceptor::accept()`][] called after it yielded a connection.
+    ///
+    /// [`Acceptor::accept()`]: crate::server::Acceptor::accept()
+    AcceptorPolledAfterCompletion,
+
+    /// Incorrect sample length provided to [`quic::HeaderProtectionKey::encrypt_in_place()`][]
+    ///
+    /// [`quic::HeaderProtectionKey::encrypt_in_place()`]: crate::quic::HeaderProtectionKey::encrypt_in_place()
+    InvalidQuicHeaderProtectionSampleLength,
+
+    /// Incorrect relation between sample length and header number length provided to
+    /// [`quic::HeaderProtectionKey::encrypt_in_place()`][]
+    ///
+    /// [`quic::HeaderProtectionKey::encrypt_in_place()`]: crate::quic::HeaderProtectionKey::encrypt_in_place()
+    InvalidQuicHeaderProtectionPacketNumberLength,
+
+    /// Raw keys cannot be used with TLS 1.2.
+    InvalidSignerForProtocolVersion,
+
+    /// QUIC attempted with a configuration that does not support TLS1.3.
+    QuicRequiresTls13Support,
+
+    /// QUIC attempted with a configuration that does not support a ciphersuite that supports QUIC.
+    NoQuicCompatibleCipherSuites,
+
+    /// An empty certificate chain was provided.
+    EmptyCertificateChain,
+
+    /// QUIC attempted with unsupported [`ServerConfig::max_early_data_size`][]
+    ///
+    /// This field must be either zero or [`u32::MAX`] for QUIC.
+    ///
+    /// [`ServerConfig::max_early_data_size`]: crate::server::ServerConfig::max_early_data_size
+    QuicRestrictsMaxEarlyDataSize,
+
+    /// A `CryptoProvider` must have at least one cipher suite.
+    NoCipherSuitesConfigured,
+
+    /// A `CryptoProvider` must have at least one key exchange group.
+    NoKeyExchangeGroupsConfigured,
+
+    /// An empty list of signature verification algorithms was provided.
+    NoSignatureVerificationAlgorithms,
+
+    /// ECH attempted with a configuration that does not support TLS1.3.
+    EchRequiresTls13Support,
+
+    /// ECH attempted with a configuration that also supports TLS1.2.
+    EchForbidsTls12Support,
+
+    /// Secret extraction operation attempted without opting-in to secret extraction.
+    ///
+    /// This is possible from:
+    ///
+    /// - [`ClientConnection::dangerous_extract_secrets()`][crate::client::ClientConnection::dangerous_extract_secrets]
+    /// - [`ServerConnection::dangerous_extract_secrets()`][crate::server::ServerConnection::dangerous_extract_secrets]
+    /// - [`ClientConnection::dangerous_into_kernel_connection()`][crate::client::UnbufferedClientConnection::dangerous_into_kernel_connection]
+    /// - [`ServerConnection::dangerous_into_kernel_connection()`][crate::server::UnbufferedServerConnection::dangerous_into_kernel_connection]
+    ///
+    /// You must set [`ServerConfig::enable_secret_extraction`][crate::server::ServerConfig::enable_secret_extraction] or
+    /// [`ClientConfig::enable_secret_extraction`][crate::client::ClientConfig::enable_secret_extraction] to true before calling
+    /// these functions.
+    SecretExtractionRequiresPriorOptIn,
+
+    /// Secret extraction operation attempted without first extracting all pending
+    /// TLS data.
+    ///
+    /// See [`Self::SecretExtractionRequiresPriorOptIn`] for a list of the affected
+    /// functions.  You must ensure any prior generated TLS records are extracted
+    /// from the library before using one of these functions.
+    SecretExtractionWithPendingSendableData,
+
+    /// Attempt to verify a certificate with an unsupported type.
+    ///
+    /// A verifier indicated support for a certificate type but then failed to verify the peer's
+    /// identity of that type.
+    UnverifiableCertificateType,
+
+    /// A verifier or resolver implementation signalled that it does not support any certificate types.
+    NoSupportedCertificateTypes,
+
+    /// [`Nonce::to_array()`][] called with incorrect array size.
+    ///
+    /// The nonce length does not match the requested array size `N`.
+    ///
+    /// [`Nonce::to_array()`]: crate::crypto::cipher::Nonce::to_array()
+    NonceArraySizeMismatch {
+        /// The expected array size (type parameter N)
+        expected: usize,
+        /// The actual nonce length
+        actual: usize,
+    },
+
+    /// [`Iv::new()`][] called with a value that exceeds the maximum IV length.
+    ///
+    /// The IV length must not exceed [`Iv::MAX_LEN`][].
+    ///
+    /// [`Iv::new()`]: crate::crypto::cipher::Iv::new()
+    /// [`Iv::MAX_LEN`]: crate::crypto::cipher::Iv::MAX_LEN
+    IvLengthExceedsMaximum {
+        /// The actual IV length provided
+        actual: usize,
+        /// The maximum allowed IV length
+        maximum: usize,
+    },
+}
+
+impl fmt::Display for ApiMisuse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl core::error::Error for ApiMisuse {}
+
+impl From<ApiMisuse> for Error {
+    fn from(e: ApiMisuse) -> Self {
+        Self::ApiMisuse(e)
+    }
+}
+
 mod other_error {
+    use core::error::Error as StdError;
     use core::fmt;
-    #[cfg(feature = "std")]
-    use std::error::Error as StdError;
 
     use super::Error;
-    #[cfg(feature = "std")]
     use crate::sync::Arc;
 
     /// Any other error that cannot be expressed by a more specific [`Error`] variant.
@@ -1043,7 +1267,14 @@ mod other_error {
     ///
     /// Enums holding this type will never compare equal to each other.
     #[derive(Debug, Clone)]
-    pub struct OtherError(#[cfg(feature = "std")] pub Arc<dyn StdError + Send + Sync>);
+    pub struct OtherError(Arc<dyn StdError + Send + Sync>);
+
+    impl OtherError {
+        /// Create a new `OtherError` from any error type.
+        pub fn new(err: impl StdError + Send + Sync + 'static) -> Self {
+            Self(Arc::new(err))
+        }
+    }
 
     impl PartialEq<Self> for OtherError {
         fn eq(&self, _other: &Self) -> bool {
@@ -1070,7 +1301,6 @@ mod other_error {
         }
     }
 
-    #[cfg(feature = "std")]
     impl StdError for OtherError {
         fn source(&self) -> Option<&(dyn StdError + 'static)> {
             Some(self.0.as_ref())
@@ -1079,6 +1309,8 @@ mod other_error {
 }
 
 pub use other_error::OtherError;
+
+use crate::msgs::codec::Codec;
 
 #[cfg(test)]
 mod tests {
@@ -1089,10 +1321,9 @@ mod tests {
     use pki_types::ServerName;
 
     use super::{
-        CertRevocationListError, Error, InconsistentKeys, InvalidMessage, OtherError, UnixTime,
+        AlertDescription, CertRevocationListError, Error, InconsistentKeys, InvalidMessage,
+        OtherError, UnixTime,
     };
-    #[cfg(feature = "std")]
-    use crate::sync::Arc;
 
     #[test]
     fn certificate_error_equality() {
@@ -1163,26 +1394,22 @@ mod tests {
             }
         );
         assert_eq!(BadSignature, BadSignature);
-        #[allow(deprecated)]
-        {
-            assert_eq!(UnsupportedSignatureAlgorithm, UnsupportedSignatureAlgorithm);
-        }
         assert_eq!(
-            UnsupportedSignatureAlgorithmContext {
+            UnsupportedSignatureAlgorithm {
                 signature_algorithm_id: vec![1, 2, 3],
                 supported_algorithms: vec![]
             },
-            UnsupportedSignatureAlgorithmContext {
+            UnsupportedSignatureAlgorithm {
                 signature_algorithm_id: vec![1, 2, 3],
                 supported_algorithms: vec![]
             }
         );
         assert_eq!(
-            UnsupportedSignatureAlgorithmForPublicKeyContext {
+            UnsupportedSignatureAlgorithmForPublicKey {
                 signature_algorithm_id: vec![1, 2, 3],
                 public_key_algorithm_id: vec![4, 5, 6]
             },
-            UnsupportedSignatureAlgorithmForPublicKeyContext {
+            UnsupportedSignatureAlgorithmForPublicKey {
                 signature_algorithm_id: vec![1, 2, 3],
                 public_key_algorithm_id: vec![4, 5, 6]
             }
@@ -1219,10 +1446,7 @@ mod tests {
             ApplicationVerificationFailure
         );
         assert_eq!(InvalidOcspResponse, InvalidOcspResponse);
-        let other = Other(OtherError(
-            #[cfg(feature = "std")]
-            Arc::from(Box::from("")),
-        ));
+        let other = Other(OtherError::new(TestError));
         assert_ne!(other, other);
         assert_ne!(BadEncoding, Expired);
     }
@@ -1231,26 +1455,22 @@ mod tests {
     fn crl_error_equality() {
         use super::CertRevocationListError::*;
         assert_eq!(BadSignature, BadSignature);
-        #[allow(deprecated)]
-        {
-            assert_eq!(UnsupportedSignatureAlgorithm, UnsupportedSignatureAlgorithm);
-        }
         assert_eq!(
-            UnsupportedSignatureAlgorithmContext {
+            UnsupportedSignatureAlgorithm {
                 signature_algorithm_id: vec![1, 2, 3],
                 supported_algorithms: vec![]
             },
-            UnsupportedSignatureAlgorithmContext {
+            UnsupportedSignatureAlgorithm {
                 signature_algorithm_id: vec![1, 2, 3],
                 supported_algorithms: vec![]
             }
         );
         assert_eq!(
-            UnsupportedSignatureAlgorithmForPublicKeyContext {
+            UnsupportedSignatureAlgorithmForPublicKey {
                 signature_algorithm_id: vec![1, 2, 3],
                 public_key_algorithm_id: vec![4, 5, 6]
             },
-            UnsupportedSignatureAlgorithmForPublicKeyContext {
+            UnsupportedSignatureAlgorithmForPublicKey {
                 signature_algorithm_id: vec![1, 2, 3],
                 public_key_algorithm_id: vec![4, 5, 6]
             }
@@ -1267,10 +1487,7 @@ mod tests {
         assert_eq!(UnsupportedDeltaCrl, UnsupportedDeltaCrl);
         assert_eq!(UnsupportedIndirectCrl, UnsupportedIndirectCrl);
         assert_eq!(UnsupportedRevocationReason, UnsupportedRevocationReason);
-        let other = Other(OtherError(
-            #[cfg(feature = "std")]
-            Arc::from(Box::from("")),
-        ));
+        let other = Other(OtherError::new(TestError));
         assert_ne!(other, other);
         assert_ne!(BadSignature, InvalidCrlNumber);
     }
@@ -1278,7 +1495,7 @@ mod tests {
     #[test]
     #[cfg(feature = "std")]
     fn other_error_equality() {
-        let other_error = OtherError(Arc::from(Box::from("")));
+        let other_error = OtherError::new(TestError);
         assert_ne!(other_error, other_error);
         let other: Error = other_error.into();
         assert_ne!(other, other);
@@ -1298,7 +1515,6 @@ mod tests {
                 got_type: HandshakeType::ServerHello,
             },
             Error::InvalidMessage(InvalidMessage::InvalidCcs),
-            Error::NoCertificatesPresented,
             Error::DecryptError,
             super::PeerIncompatible::Tls12NotOffered.into(),
             super::PeerMisbehaved::UnsolicitedCertExtension.into(),
@@ -1354,16 +1570,37 @@ mod tests {
             Error::InconsistentKeys(InconsistentKeys::KeyMismatch),
             Error::InconsistentKeys(InconsistentKeys::Unknown),
             Error::InvalidCertRevocationList(CertRevocationListError::BadSignature),
-            Error::Other(OtherError(
-                #[cfg(feature = "std")]
-                Arc::from(Box::from("")),
-            )),
+            Error::Unreachable("smoke"),
+            super::ApiMisuse::ExporterAlreadyUsed.into(),
+            Error::Other(OtherError::new(TestError)),
         ];
 
         for err in all {
             println!("{err:?}:");
             println!("  fmt '{err}'");
         }
+    }
+
+    #[derive(Debug)]
+    struct TestError;
+
+    impl core::fmt::Display for TestError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "test error")
+        }
+    }
+
+    impl core::error::Error for TestError {}
+
+    #[test]
+    fn alert_display() {
+        println!("Review the following error messages for syntax and grammar errors:");
+        for u in 0..=u8::MAX {
+            let err = Error::AlertReceived(AlertDescription::from(u));
+            println!(" - {err}");
+        }
+
+        // pipe the output of this test to `llm` for a quick check of these...
     }
 
     #[test]

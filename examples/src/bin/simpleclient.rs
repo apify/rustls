@@ -18,9 +18,12 @@ fn main() {
     let root_store = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.into(),
     };
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+
+    let mut config =
+        rustls::ClientConfig::builder(rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER.into())
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+            .unwrap();
 
     // Allow using SSLKEYLOGFILE.
     config.key_log = Arc::new(rustls::KeyLogFile::new());

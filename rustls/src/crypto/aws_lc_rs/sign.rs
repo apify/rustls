@@ -1,112 +1,76 @@
-#![allow(clippy::duplicate_mod)]
-
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use alloc::{format, vec};
 use core::fmt::{self, Debug, Formatter};
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{self, EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair};
 use pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfoDer, alg_id};
 
-use super::ring_like::rand::SystemRandom;
-use super::ring_like::signature::{self, EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair};
+#[cfg(any(test, bench))]
+use crate::crypto::CryptoProvider;
 use crate::crypto::signer::{Signer, SigningKey, public_key_to_spki};
-use crate::enums::{SignatureAlgorithm, SignatureScheme};
+use crate::enums::SignatureScheme;
 use crate::error::Error;
 use crate::sync::Arc;
 
-/// Parse `der` as any supported key encoding/type, returning
-/// the first which works.
-pub fn any_supported_type(der: &PrivateKeyDer<'_>) -> Result<Arc<dyn SigningKey>, Error> {
-    if let Ok(rsa) = RsaSigningKey::new(der) {
-        return Ok(Arc::new(rsa));
-    }
-
-    if let Ok(ecdsa) = any_ecdsa_type(der) {
-        return Ok(ecdsa);
-    }
-
-    if let PrivateKeyDer::Pkcs8(pkcs8) = der {
-        if let Ok(eddsa) = any_eddsa_type(pkcs8) {
-            return Ok(eddsa);
-        }
-    }
-
-    Err(Error::General(
-        "failed to parse private key as RSA, ECDSA, or EdDSA".into(),
-    ))
-}
-
-/// Parse `der` as any ECDSA key type, returning the first which works.
-///
-/// Both SEC1 (PEM section starting with 'BEGIN EC PRIVATE KEY') and PKCS8
-/// (PEM section starting with 'BEGIN PRIVATE KEY') encodings are supported.
-pub fn any_ecdsa_type(der: &PrivateKeyDer<'_>) -> Result<Arc<dyn SigningKey>, Error> {
-    if let Ok(ecdsa_p256) = EcdsaSigningKey::new(
-        der,
-        SignatureScheme::ECDSA_NISTP256_SHA256,
-        &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-    ) {
-        return Ok(Arc::new(ecdsa_p256));
-    }
-
-    if let Ok(ecdsa_p384) = EcdsaSigningKey::new(
-        der,
-        SignatureScheme::ECDSA_NISTP384_SHA384,
-        &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
-    ) {
-        return Ok(Arc::new(ecdsa_p384));
-    }
-
-    if let Ok(ecdsa_p521) = EcdsaSigningKey::new(
-        der,
-        SignatureScheme::ECDSA_NISTP521_SHA512,
-        &signature::ECDSA_P521_SHA512_ASN1_SIGNING,
-    ) {
-        return Ok(Arc::new(ecdsa_p521));
-    }
-
-    Err(Error::General(
-        "failed to parse ECDSA private key as PKCS#8 or SEC1".into(),
-    ))
-}
-
-/// Parse `der` as any EdDSA key type, returning the first which works.
-///
-/// Note that, at the time of writing, Ed25519 does not have wide support
-/// in browsers.  It is also not supported by the WebPKI, because the
-/// CA/Browser Forum Baseline Requirements do not support it for publicly
-/// trusted certificates.
-pub fn any_eddsa_type(der: &PrivatePkcs8KeyDer<'_>) -> Result<Arc<dyn SigningKey>, Error> {
-    // TODO: Add support for Ed448
-    Ok(Arc::new(Ed25519SigningKey::new(
-        der,
-        SignatureScheme::ED25519,
-    )?))
-}
-
 /// A `SigningKey` for RSA-PKCS1 or RSA-PSS.
-///
-/// This is used by the test suite, so it must be `pub`, but it isn't part of
-/// the public, stable, API.
-#[doc(hidden)]
-pub struct RsaSigningKey {
+pub(super) struct RsaSigningKey {
     key: Arc<RsaKeyPair>,
 }
 
-static ALL_RSA_SCHEMES: &[SignatureScheme] = &[
-    SignatureScheme::RSA_PSS_SHA512,
-    SignatureScheme::RSA_PSS_SHA384,
-    SignatureScheme::RSA_PSS_SHA256,
-    SignatureScheme::RSA_PKCS1_SHA512,
-    SignatureScheme::RSA_PKCS1_SHA384,
-    SignatureScheme::RSA_PKCS1_SHA256,
-];
-
 impl RsaSigningKey {
+    fn to_signer(&self, scheme: SignatureScheme) -> RsaSigner {
+        let encoding: &dyn signature::RsaEncoding = match scheme {
+            SignatureScheme::RSA_PKCS1_SHA256 => &signature::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384 => &signature::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512 => &signature::RSA_PKCS1_SHA512,
+            SignatureScheme::RSA_PSS_SHA256 => &signature::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384 => &signature::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512 => &signature::RSA_PSS_SHA512,
+            _ => unreachable!(),
+        };
+
+        RsaSigner {
+            key: self.key.clone(),
+            scheme,
+            encoding,
+        }
+    }
+
+    const SCHEMES: &[SignatureScheme] = &[
+        SignatureScheme::RSA_PSS_SHA512,
+        SignatureScheme::RSA_PSS_SHA384,
+        SignatureScheme::RSA_PSS_SHA256,
+        SignatureScheme::RSA_PKCS1_SHA512,
+        SignatureScheme::RSA_PKCS1_SHA384,
+        SignatureScheme::RSA_PKCS1_SHA256,
+    ];
+}
+
+impl SigningKey for RsaSigningKey {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+        Self::SCHEMES
+            .iter()
+            .find(|scheme| offered.contains(scheme))
+            .map(|&scheme| Box::new(self.to_signer(scheme)) as Box<dyn Signer>)
+    }
+
+    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+        Some(public_key_to_spki(
+            &alg_id::RSA_ENCRYPTION,
+            self.key.public_key(),
+        ))
+    }
+}
+
+impl TryFrom<&PrivateKeyDer<'_>> for RsaSigningKey {
+    type Error = Error;
+
     /// Make a new `RsaSigningKey` from a DER encoding, in either
     /// PKCS#1 or PKCS#8 format.
-    pub fn new(der: &PrivateKeyDer<'_>) -> Result<Self, Error> {
+    fn try_from(der: &PrivateKeyDer<'_>) -> Result<Self, Self::Error> {
         let key_pair = match der {
             PrivateKeyDer::Pkcs1(pkcs1) => RsaKeyPair::from_der(pkcs1.secret_pkcs1_der()),
             PrivateKeyDer::Pkcs8(pkcs8) => RsaKeyPair::from_pkcs8(pkcs8.secret_pkcs8_der()),
@@ -126,31 +90,9 @@ impl RsaSigningKey {
     }
 }
 
-impl SigningKey for RsaSigningKey {
-    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
-        ALL_RSA_SCHEMES
-            .iter()
-            .find(|scheme| offered.contains(scheme))
-            .map(|scheme| RsaSigner::new(self.key.clone(), *scheme))
-    }
-
-    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
-        Some(public_key_to_spki(
-            &alg_id::RSA_ENCRYPTION,
-            self.key.public_key(),
-        ))
-    }
-
-    fn algorithm(&self) -> SignatureAlgorithm {
-        SignatureAlgorithm::RSA
-    }
-}
-
 impl Debug for RsaSigningKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RsaSigningKey")
-            .field("algorithm", &self.algorithm())
-            .finish()
+        f.debug_struct("RsaSigningKey").finish()
     }
 }
 
@@ -161,26 +103,6 @@ struct RsaSigner {
 }
 
 impl RsaSigner {
-    fn new(key: Arc<RsaKeyPair>, scheme: SignatureScheme) -> Box<dyn Signer> {
-        let encoding: &dyn signature::RsaEncoding = match scheme {
-            SignatureScheme::RSA_PKCS1_SHA256 => &signature::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384 => &signature::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512 => &signature::RSA_PKCS1_SHA512,
-            SignatureScheme::RSA_PSS_SHA256 => &signature::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384 => &signature::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512 => &signature::RSA_PSS_SHA512,
-            _ => unreachable!(),
-        };
-
-        Box::new(Self {
-            key,
-            scheme,
-            encoding,
-        })
-    }
-}
-
-impl Signer for RsaSigner {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
         let mut sig = vec![0; self.key.public_modulus_len()];
 
@@ -189,6 +111,12 @@ impl Signer for RsaSigner {
             .sign(self.encoding, &rng, message, &mut sig)
             .map(|_| sig)
             .map_err(|_| Error::General("signing failed".to_string()))
+    }
+}
+
+impl Signer for RsaSigner {
+    fn sign(self: Box<Self>, message: &[u8]) -> Result<Vec<u8>, Error> {
+        (*self).sign(message)
     }
 
     fn scheme(&self) -> SignatureScheme {
@@ -204,26 +132,19 @@ impl Debug for RsaSigner {
     }
 }
 
-/// A SigningKey that uses exactly one TLS-level SignatureScheme
-/// and one ring-level signature::SigningAlgorithm.
+/// A [`SigningKey`] and [`Signer`] implementation for ECDSA.
 ///
-/// Compare this to RsaSigningKey, which for a particular key is
-/// willing to sign with several algorithms.  This is quite poor
-/// cryptography practice, but is necessary because a given RSA key
-/// is expected to work in TLS1.2 (PKCS#1 signatures) and TLS1.3
-/// (PSS signatures) -- nobody is willing to obtain certificates for
-/// different protocol versions.
-///
-/// Currently this is only implemented for ECDSA keys.
-struct EcdsaSigningKey {
+/// Unlike [`RsaSigningKey`]/[`RsaSigner`], where we have one key that supports
+/// multiple signature schemes, we can use the same type for both traits here.
+#[derive(Clone)]
+pub(super) struct EcdsaSigner {
     key: Arc<EcdsaKeyPair>,
     scheme: SignatureScheme,
 }
 
-impl EcdsaSigningKey {
-    /// Make a new `ECDSASigningKey` from a DER encoding in PKCS#8 or SEC1
-    /// format, expecting a key usable with precisely the given signature
-    /// scheme.
+impl EcdsaSigner {
+    /// Make a new [`EcdsaSigner`] from a DER encoding in PKCS#8 or SEC1
+    /// format, expecting a key usable with precisely the given signature scheme.
     fn new(
         der: &PrivateKeyDer<'_>,
         scheme: SignatureScheme,
@@ -245,15 +166,20 @@ impl EcdsaSigningKey {
             scheme,
         })
     }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
+        let rng = SystemRandom::new();
+        self.key
+            .sign(&rng, message)
+            .map_err(|_| Error::General("signing failed".into()))
+            .map(|sig| sig.as_ref().into())
+    }
 }
 
-impl SigningKey for EcdsaSigningKey {
+impl SigningKey for EcdsaSigner {
     fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
         if offered.contains(&self.scheme) {
-            Some(Box::new(EcdsaSigner {
-                key: self.key.clone(),
-                scheme: self.scheme,
-            }))
+            Some(Box::new(self.clone()))
         } else {
             None
         }
@@ -269,36 +195,53 @@ impl SigningKey for EcdsaSigningKey {
 
         Some(public_key_to_spki(&id, self.key.public_key()))
     }
-
-    fn algorithm(&self) -> SignatureAlgorithm {
-        self.scheme.algorithm()
-    }
-}
-
-impl Debug for EcdsaSigningKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("EcdsaSigningKey")
-            .field("algorithm", &self.algorithm())
-            .finish()
-    }
-}
-
-struct EcdsaSigner {
-    key: Arc<EcdsaKeyPair>,
-    scheme: SignatureScheme,
 }
 
 impl Signer for EcdsaSigner {
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
-        let rng = SystemRandom::new();
-        self.key
-            .sign(&rng, message)
-            .map_err(|_| Error::General("signing failed".into()))
-            .map(|sig| sig.as_ref().into())
+    fn sign(self: Box<Self>, message: &[u8]) -> Result<Vec<u8>, Error> {
+        (*self).sign(message)
     }
 
     fn scheme(&self) -> SignatureScheme {
         self.scheme
+    }
+}
+
+impl TryFrom<&PrivateKeyDer<'_>> for EcdsaSigner {
+    type Error = Error;
+
+    /// Parse `der` as any ECDSA key type, returning the first which works.
+    ///
+    /// Both SEC1 (PEM section starting with 'BEGIN EC PRIVATE KEY') and PKCS8
+    /// (PEM section starting with 'BEGIN PRIVATE KEY') encodings are supported.
+    fn try_from(der: &PrivateKeyDer<'_>) -> Result<Self, Error> {
+        if let Ok(ecdsa_p256) = Self::new(
+            der,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        ) {
+            return Ok(ecdsa_p256);
+        }
+
+        if let Ok(ecdsa_p384) = Self::new(
+            der,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
+        ) {
+            return Ok(ecdsa_p384);
+        }
+
+        if let Ok(ecdsa_p521) = Self::new(
+            der,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            &signature::ECDSA_P521_SHA512_ASN1_SIGNING,
+        ) {
+            return Ok(ecdsa_p521);
+        }
+
+        Err(Error::General(
+            "failed to parse ECDSA private key as PKCS#8 or SEC1".into(),
+        ))
     }
 }
 
@@ -310,45 +253,26 @@ impl Debug for EcdsaSigner {
     }
 }
 
-/// A SigningKey that uses exactly one TLS-level SignatureScheme
-/// and one ring-level signature::SigningAlgorithm.
+/// A [`SigningKey`] and [`Signer`] implementation for ED25519.
 ///
-/// Compare this to RsaSigningKey, which for a particular key is
-/// willing to sign with several algorithms.  This is quite poor
-/// cryptography practice, but is necessary because a given RSA key
-/// is expected to work in TLS1.2 (PKCS#1 signatures) and TLS1.3
-/// (PSS signatures) -- nobody is willing to obtain certificates for
-/// different protocol versions.
-///
-/// Currently this is only implemented for Ed25519 keys.
-struct Ed25519SigningKey {
+/// Unlike [`RsaSigningKey`]/[`RsaSigner`], where we have one key that supports
+/// multiple signature schemes, we can use the same type for both traits here.
+#[derive(Clone)]
+pub(super) struct Ed25519Signer {
     key: Arc<Ed25519KeyPair>,
     scheme: SignatureScheme,
 }
 
-impl Ed25519SigningKey {
-    /// Make a new `Ed25519SigningKey` from a DER encoding in PKCS#8 format,
-    /// expecting a key usable with precisely the given signature scheme.
-    fn new(der: &PrivatePkcs8KeyDer<'_>, scheme: SignatureScheme) -> Result<Self, Error> {
-        match Ed25519KeyPair::from_pkcs8_maybe_unchecked(der.secret_pkcs8_der()) {
-            Ok(key_pair) => Ok(Self {
-                key: Arc::new(key_pair),
-                scheme,
-            }),
-            Err(e) => Err(Error::General(format!(
-                "failed to parse Ed25519 private key: {e}"
-            ))),
-        }
+impl Ed25519Signer {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
+        Ok(self.key.sign(message).as_ref().into())
     }
 }
 
-impl SigningKey for Ed25519SigningKey {
+impl SigningKey for Ed25519Signer {
     fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
         if offered.contains(&self.scheme) {
-            Some(Box::new(Ed25519Signer {
-                key: self.key.clone(),
-                scheme: self.scheme,
-            }))
+            Some(Box::new(self.clone()))
         } else {
             None
         }
@@ -357,32 +281,37 @@ impl SigningKey for Ed25519SigningKey {
     fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
         Some(public_key_to_spki(&alg_id::ED25519, self.key.public_key()))
     }
-
-    fn algorithm(&self) -> SignatureAlgorithm {
-        self.scheme.algorithm()
-    }
-}
-
-impl Debug for Ed25519SigningKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Ed25519SigningKey")
-            .field("algorithm", &self.algorithm())
-            .finish()
-    }
-}
-
-struct Ed25519Signer {
-    key: Arc<Ed25519KeyPair>,
-    scheme: SignatureScheme,
 }
 
 impl Signer for Ed25519Signer {
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(self.key.sign(message).as_ref().into())
+    fn sign(self: Box<Self>, message: &[u8]) -> Result<Vec<u8>, Error> {
+        (*self).sign(message)
     }
 
     fn scheme(&self) -> SignatureScheme {
         self.scheme
+    }
+}
+
+impl TryFrom<&PrivatePkcs8KeyDer<'_>> for Ed25519Signer {
+    type Error = Error;
+
+    /// Parse `der` as an Ed25519 key.
+    ///
+    /// Note that, at the time of writing, Ed25519 does not have wide support
+    /// in browsers.  It is also not supported by the WebPKI, because the
+    /// CA/Browser Forum Baseline Requirements do not support it for publicly
+    /// trusted certificates.
+    fn try_from(der: &PrivatePkcs8KeyDer<'_>) -> Result<Self, Error> {
+        match Ed25519KeyPair::from_pkcs8_maybe_unchecked(der.secret_pkcs8_der()) {
+            Ok(key_pair) => Ok(Self {
+                key: Arc::new(key_pair),
+                scheme: SignatureScheme::ED25519,
+            }),
+            Err(e) => Err(Error::General(format!(
+                "failed to parse Ed25519 private key: {e}"
+            ))),
+        }
     }
 }
 
@@ -394,6 +323,16 @@ impl Debug for Ed25519Signer {
     }
 }
 
+#[cfg(any(test, bench))]
+fn load_key(
+    provider: &CryptoProvider,
+    der: PrivateKeyDer<'static>,
+) -> Result<Box<dyn SigningKey>, Error> {
+    provider
+        .key_provider
+        .load_private_key(der)
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::format;
@@ -401,15 +340,16 @@ mod tests {
     use pki_types::{PrivatePkcs1KeyDer, PrivateSec1KeyDer};
 
     use super::*;
+    use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 
     #[test]
     fn can_load_ecdsa_nistp256_pkcs8() {
         let key =
             PrivatePkcs8KeyDer::from(&include_bytes!("../../testdata/nistp256key.pkcs8.der")[..]);
-        assert!(any_eddsa_type(&key).is_err());
+        assert!(Ed25519Signer::try_from(&key).is_err());
         let key = PrivateKeyDer::Pkcs8(key);
-        assert!(any_supported_type(&key).is_ok());
-        assert!(any_ecdsa_type(&key).is_ok());
+        assert!(load_key(&DEFAULT_PROVIDER, key.clone_key()).is_ok());
+        assert!(EcdsaSigner::try_from(&key).is_ok());
     }
 
     #[test]
@@ -417,8 +357,8 @@ mod tests {
         let key = PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(
             &include_bytes!("../../testdata/nistp256key.der")[..],
         ));
-        assert!(any_supported_type(&key).is_ok());
-        assert!(any_ecdsa_type(&key).is_ok());
+        assert!(load_key(&DEFAULT_PROVIDER, key.clone_key()).is_ok());
+        assert!(EcdsaSigner::try_from(&key).is_ok());
     }
 
     #[test]
@@ -427,9 +367,11 @@ mod tests {
             &include_bytes!("../../testdata/nistp256key.der")[..],
         ));
 
-        let k = any_supported_type(&key).unwrap();
-        assert_eq!(format!("{k:?}"), "EcdsaSigningKey { algorithm: ECDSA }");
-        assert_eq!(k.algorithm(), SignatureAlgorithm::ECDSA);
+        let k = load_key(&DEFAULT_PROVIDER, key.clone_key()).unwrap();
+        assert_eq!(
+            format!("{k:?}"),
+            "EcdsaSigner { scheme: ECDSA_NISTP256_SHA256 }"
+        );
 
         assert!(
             k.choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
@@ -459,10 +401,10 @@ mod tests {
     fn can_load_ecdsa_nistp384_pkcs8() {
         let key =
             PrivatePkcs8KeyDer::from(&include_bytes!("../../testdata/nistp384key.pkcs8.der")[..]);
-        assert!(any_eddsa_type(&key).is_err());
+        assert!(Ed25519Signer::try_from(&key).is_err());
         let key = PrivateKeyDer::Pkcs8(key);
-        assert!(any_supported_type(&key).is_ok());
-        assert!(any_ecdsa_type(&key).is_ok());
+        assert!(load_key(&DEFAULT_PROVIDER, key.clone_key()).is_ok());
+        assert!(EcdsaSigner::try_from(&key).is_ok());
     }
 
     #[test]
@@ -470,8 +412,8 @@ mod tests {
         let key = PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(
             &include_bytes!("../../testdata/nistp384key.der")[..],
         ));
-        assert!(any_supported_type(&key).is_ok());
-        assert!(any_ecdsa_type(&key).is_ok());
+        assert!(load_key(&DEFAULT_PROVIDER, key.clone_key()).is_ok());
+        assert!(EcdsaSigner::try_from(&key).is_ok());
     }
 
     #[test]
@@ -480,9 +422,11 @@ mod tests {
             &include_bytes!("../../testdata/nistp384key.der")[..],
         ));
 
-        let k = any_supported_type(&key).unwrap();
-        assert_eq!(format!("{k:?}"), "EcdsaSigningKey { algorithm: ECDSA }");
-        assert_eq!(k.algorithm(), SignatureAlgorithm::ECDSA);
+        let k = load_key(&DEFAULT_PROVIDER, key.clone_key()).unwrap();
+        assert_eq!(
+            format!("{k:?}"),
+            "EcdsaSigner { scheme: ECDSA_NISTP384_SHA384 }"
+        );
 
         assert!(
             k.choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
@@ -512,10 +456,10 @@ mod tests {
     fn can_load_ecdsa_nistp521_pkcs8() {
         let key =
             PrivatePkcs8KeyDer::from(&include_bytes!("../../testdata/nistp521key.pkcs8.der")[..]);
-        assert!(any_eddsa_type(&key).is_err());
+        assert!(Ed25519Signer::try_from(&key).is_err());
         let key = PrivateKeyDer::Pkcs8(key);
-        assert!(any_supported_type(&key).is_ok());
-        assert!(any_ecdsa_type(&key).is_ok());
+        assert!(load_key(&DEFAULT_PROVIDER, key.clone_key()).is_ok());
+        assert!(EcdsaSigner::try_from(&key).is_ok());
     }
 
     #[test]
@@ -523,8 +467,8 @@ mod tests {
         let key = PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(
             &include_bytes!("../../testdata/nistp521key.der")[..],
         ));
-        assert!(any_supported_type(&key).is_ok());
-        assert!(any_ecdsa_type(&key).is_ok());
+        assert!(load_key(&DEFAULT_PROVIDER, key.clone_key()).is_ok());
+        assert!(EcdsaSigner::try_from(&key).is_ok());
     }
 
     #[test]
@@ -533,9 +477,11 @@ mod tests {
             &include_bytes!("../../testdata/nistp521key.der")[..],
         ));
 
-        let k = any_supported_type(&key).unwrap();
-        assert_eq!(format!("{k:?}"), "EcdsaSigningKey { algorithm: ECDSA }");
-        assert_eq!(k.algorithm(), SignatureAlgorithm::ECDSA);
+        let k = load_key(&DEFAULT_PROVIDER, key.clone_key()).unwrap();
+        assert_eq!(
+            format!("{k:?}"),
+            "EcdsaSigner { scheme: ECDSA_NISTP521_SHA512 }"
+        );
 
         assert!(
             k.choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
@@ -568,19 +514,18 @@ mod tests {
     #[test]
     fn can_load_eddsa_pkcs8() {
         let key = PrivatePkcs8KeyDer::from(&include_bytes!("../../testdata/eddsakey.der")[..]);
-        assert!(any_eddsa_type(&key).is_ok());
+        assert!(Ed25519Signer::try_from(&key).is_ok());
         let key = PrivateKeyDer::Pkcs8(key);
-        assert!(any_supported_type(&key).is_ok());
-        assert!(any_ecdsa_type(&key).is_err());
+        assert!(load_key(&DEFAULT_PROVIDER, key.clone_key()).is_ok());
+        assert!(EcdsaSigner::try_from(&key).is_err());
     }
 
     #[test]
     fn can_sign_eddsa() {
         let key = PrivatePkcs8KeyDer::from(&include_bytes!("../../testdata/eddsakey.der")[..]);
 
-        let k = any_eddsa_type(&key).unwrap();
-        assert_eq!(format!("{k:?}"), "Ed25519SigningKey { algorithm: ED25519 }");
-        assert_eq!(k.algorithm(), SignatureAlgorithm::ED25519);
+        let k = Ed25519Signer::try_from(&key).unwrap();
+        assert_eq!(format!("{k:?}"), "Ed25519Signer { scheme: ED25519 }");
 
         assert!(
             k.choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
@@ -602,10 +547,10 @@ mod tests {
     fn can_load_rsa2048_pkcs8() {
         let key =
             PrivatePkcs8KeyDer::from(&include_bytes!("../../testdata/rsa2048key.pkcs8.der")[..]);
-        assert!(any_eddsa_type(&key).is_err());
+        assert!(Ed25519Signer::try_from(&key).is_err());
         let key = PrivateKeyDer::Pkcs8(key);
-        assert!(any_supported_type(&key).is_ok());
-        assert!(any_ecdsa_type(&key).is_err());
+        assert!(load_key(&DEFAULT_PROVIDER, key.clone_key()).is_ok());
+        assert!(EcdsaSigner::try_from(&key).is_err());
     }
 
     #[test]
@@ -613,8 +558,8 @@ mod tests {
         let key = PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(
             &include_bytes!("../../testdata/rsa2048key.pkcs1.der")[..],
         ));
-        assert!(any_supported_type(&key).is_ok());
-        assert!(any_ecdsa_type(&key).is_err());
+        assert!(load_key(&DEFAULT_PROVIDER, key.clone_key()).is_ok());
+        assert!(EcdsaSigner::try_from(&key).is_err());
     }
 
     #[test]
@@ -623,9 +568,8 @@ mod tests {
             &include_bytes!("../../testdata/rsa2048key.pkcs8.der")[..],
         ));
 
-        let k = any_supported_type(&key).unwrap();
-        assert_eq!(format!("{k:?}"), "RsaSigningKey { algorithm: RSA }");
-        assert_eq!(k.algorithm(), SignatureAlgorithm::RSA);
+        let k = load_key(&DEFAULT_PROVIDER, key.clone_key()).unwrap();
+        assert_eq!(format!("{k:?}"), "RsaSigningKey");
 
         assert!(
             k.choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
@@ -659,19 +603,19 @@ mod tests {
     fn cannot_load_invalid_pkcs8_encoding() {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(&b"invalid"[..]));
         assert_eq!(
-            any_supported_type(&key).err(),
+            load_key(&DEFAULT_PROVIDER, key.clone_key()).err(),
             Some(Error::General(
                 "failed to parse private key as RSA, ECDSA, or EdDSA".into()
             ))
         );
         assert_eq!(
-            any_ecdsa_type(&key).err(),
+            EcdsaSigner::try_from(&key).err(),
             Some(Error::General(
                 "failed to parse ECDSA private key as PKCS#8 or SEC1".into()
             ))
         );
         assert_eq!(
-            RsaSigningKey::new(&key).err(),
+            RsaSigningKey::try_from(&key).err(),
             Some(Error::General(
                 "failed to parse RSA private key: InvalidEncoding".into()
             ))
@@ -681,17 +625,18 @@ mod tests {
 
 #[cfg(bench)]
 mod benchmarks {
-    use super::{PrivateKeyDer, PrivatePkcs8KeyDer, SignatureScheme};
+    use super::*;
+    use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 
     #[bench]
     fn bench_rsa2048_pkcs1_sha256(b: &mut test::Bencher) {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
             &include_bytes!("../../testdata/rsa2048key.pkcs8.der")[..],
         ));
-        let sk = super::any_supported_type(&key).unwrap();
-        let signer = sk
-            .choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
-            .unwrap();
+
+        let signer = RsaSigningKey::try_from(&key)
+            .unwrap()
+            .to_signer(SignatureScheme::RSA_PKCS1_SHA256);
 
         b.iter(|| {
             test::black_box(
@@ -707,10 +652,10 @@ mod benchmarks {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
             &include_bytes!("../../testdata/rsa2048key.pkcs8.der")[..],
         ));
-        let sk = super::any_supported_type(&key).unwrap();
-        let signer = sk
-            .choose_scheme(&[SignatureScheme::RSA_PSS_SHA256])
-            .unwrap();
+
+        let signer = RsaSigningKey::try_from(&key)
+            .unwrap()
+            .to_signer(SignatureScheme::RSA_PSS_SHA256);
 
         b.iter(|| {
             test::black_box(
@@ -723,13 +668,8 @@ mod benchmarks {
 
     #[bench]
     fn bench_eddsa(b: &mut test::Bencher) {
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            &include_bytes!("../../testdata/eddsakey.der")[..],
-        ));
-        let sk = super::any_supported_type(&key).unwrap();
-        let signer = sk
-            .choose_scheme(&[SignatureScheme::ED25519])
-            .unwrap();
+        let key = PrivatePkcs8KeyDer::from(&include_bytes!("../../testdata/eddsakey.der")[..]);
+        let signer = Ed25519Signer::try_from(&key).unwrap();
 
         b.iter(|| {
             test::black_box(
@@ -745,11 +685,8 @@ mod benchmarks {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
             &include_bytes!("../../testdata/nistp256key.pkcs8.der")[..],
         ));
-        let sk = super::any_supported_type(&key).unwrap();
-        let signer = sk
-            .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
-            .unwrap();
 
+        let signer = EcdsaSigner::try_from(&key).unwrap();
         b.iter(|| {
             test::black_box(
                 signer
@@ -764,11 +701,8 @@ mod benchmarks {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
             &include_bytes!("../../testdata/nistp384key.pkcs8.der")[..],
         ));
-        let sk = super::any_supported_type(&key).unwrap();
-        let signer = sk
-            .choose_scheme(&[SignatureScheme::ECDSA_NISTP384_SHA384])
-            .unwrap();
 
+        let signer = EcdsaSigner::try_from(&key).unwrap();
         b.iter(|| {
             test::black_box(
                 signer
@@ -783,11 +717,8 @@ mod benchmarks {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
             &include_bytes!("../../testdata/nistp521key.pkcs8.der")[..],
         ));
-        let sk = super::any_supported_type(&key).unwrap();
-        let signer = sk
-            .choose_scheme(&[SignatureScheme::ECDSA_NISTP521_SHA512])
-            .unwrap();
 
+        let signer = EcdsaSigner::try_from(&key).unwrap();
         b.iter(|| {
             test::black_box(
                 signer
@@ -804,7 +735,7 @@ mod benchmarks {
         ));
 
         b.iter(|| {
-            test::black_box(super::any_supported_type(&key).unwrap());
+            test::black_box(load_key(&DEFAULT_PROVIDER, key.clone_key()).unwrap());
         });
     }
 
@@ -815,7 +746,7 @@ mod benchmarks {
         ));
 
         b.iter(|| {
-            test::black_box(super::any_supported_type(&key).unwrap());
+            test::black_box(load_key(&DEFAULT_PROVIDER, key.clone_key()).unwrap());
         });
     }
 
@@ -826,7 +757,7 @@ mod benchmarks {
         ));
 
         b.iter(|| {
-            test::black_box(super::any_ecdsa_type(&key).unwrap());
+            test::black_box(EcdsaSigner::try_from(&key).unwrap());
         });
     }
 
@@ -837,7 +768,7 @@ mod benchmarks {
         ));
 
         b.iter(|| {
-            test::black_box(super::any_ecdsa_type(&key).unwrap());
+            test::black_box(EcdsaSigner::try_from(&key).unwrap());
         });
     }
 
@@ -848,7 +779,7 @@ mod benchmarks {
         ));
 
         b.iter(|| {
-            test::black_box(super::any_ecdsa_type(&key).unwrap());
+            test::black_box(EcdsaSigner::try_from(&key).unwrap());
         });
     }
 
@@ -857,7 +788,7 @@ mod benchmarks {
         let key = PrivatePkcs8KeyDer::from(&include_bytes!("../../testdata/eddsakey.der")[..]);
 
         b.iter(|| {
-            test::black_box(super::any_eddsa_type(&key).unwrap());
+            test::black_box(Ed25519Signer::try_from(&key).unwrap());
         });
     }
 

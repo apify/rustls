@@ -2,44 +2,36 @@
 use crate::KeyLogFile;
 #[cfg(not(feature = "impit"))]
 use crate::NoKeyLog;
-use crate::versions::TLS13;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 #[cfg(feature = "impit")]
 use std::vec;
 
-use pki_types::{CertificateDer, PrivateKeyDer};
+use pki_types::PrivateKeyDer;
 
 use super::client_conn::Resumption;
 use crate::builder::{ConfigBuilder, WantsVerifier};
-use crate::client::{ClientConfig, EchMode, ResolvesClientCert, handy};
-use crate::error::Error;
-use crate::sign::{CertifiedKey, SingleCertAndKey};
+use crate::client::{ClientConfig, EchMode, ClientCredentialResolver, handy};
+use crate::crypto::{Credentials, Identity, SingleCredential};
+use crate::error::{ApiMisuse, Error};
 use crate::sync::Arc;
 use crate::webpki::{self, WebPkiServerVerifier};
-use crate::{WantsVersions, compress, verify, versions};
+use crate::{compress, verify};
 
-impl ConfigBuilder<ClientConfig, WantsVersions> {
+impl ConfigBuilder<ClientConfig, WantsVerifier> {
     /// Enable Encrypted Client Hello (ECH) in the given mode.
     ///
-    /// This implicitly selects TLS 1.3 as the only supported protocol version to meet the
-    /// requirement to support ECH.
+    /// This requires TLS 1.3 as the only supported protocol version to meet the requirement
+    /// to support ECH.  At the end, the config building process will return an error if either
+    /// TLS1.3 _is not_ supported by the provider, or TLS1.2 _is_ supported.
     ///
     /// The `ClientConfig` that will be produced by this builder will be specific to the provided
     /// [`crate::client::EchConfig`] and may not be appropriate for all connections made by the program.
     /// In this case the configuration should only be shared by connections intended for domains
     /// that offer the provided [`crate::client::EchConfig`] in their DNS zone.
-    pub fn with_ech(
-        self,
-        mode: EchMode,
-    ) -> Result<ConfigBuilder<ClientConfig, WantsVerifier>, Error> {
-        #[cfg(not(feature = "impit"))]
-        let mut res = self.with_protocol_versions(&[&TLS13][..])?;
-        #[cfg(feature = "impit")]
-        let mut res = self.with_safe_default_protocol_versions()?; // It's alright to send the ECH with TLS 1.2, worst case, the server will ignore it.
-
-        res.state.client_ech_mode = Some(mode);
-        Ok(res)
+    pub fn with_ech(mut self, mode: EchMode) -> Self {
+        self.state.client_ech_mode = Some(mode);
+        self
     }
 }
 
@@ -52,7 +44,7 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
     /// ```diff
     /// - .with_root_certificates(root_store)
     /// + .with_webpki_verifier(
-    /// +   WebPkiServerVerifier::builder_with_provider(root_store, crypto_provider)
+    /// +   WebPkiServerVerifier::builder(root_store, crypto_provider)
     /// +   .with_crls(...)
     /// +   .build()?
     /// + )
@@ -72,14 +64,13 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
     /// Choose how to verify server certificates using a webpki verifier.
     ///
     /// See [`webpki::WebPkiServerVerifier::builder`] and
-    /// [`webpki::WebPkiServerVerifier::builder_with_provider`] for more information.
+    /// [`webpki::WebPkiServerVerifier::builder`] for more information.
     pub fn with_webpki_verifier(
         self,
         verifier: Arc<WebPkiServerVerifier>,
     ) -> ConfigBuilder<ClientConfig, WantsClientCert> {
         ConfigBuilder {
             state: WantsClientCert {
-                versions: self.state.versions,
                 verifier,
                 client_ech_mode: self.state.client_ech_mode,
             },
@@ -108,18 +99,17 @@ pub(super) mod danger {
     #[derive(Debug)]
     pub struct DangerousClientConfigBuilder {
         /// The underlying ClientConfigBuilder
-        pub cfg: ConfigBuilder<ClientConfig, WantsVerifier>,
+        pub(super) cfg: ConfigBuilder<ClientConfig, WantsVerifier>,
     }
 
     impl DangerousClientConfigBuilder {
         /// Set a custom certificate verifier.
         pub fn with_custom_certificate_verifier(
             self,
-            verifier: Arc<dyn verify::ServerCertVerifier>,
+            verifier: Arc<dyn verify::ServerVerifier>,
         ) -> ConfigBuilder<ClientConfig, WantsClientCert> {
             ConfigBuilder {
                 state: WantsClientCert {
-                    versions: self.cfg.state.versions,
                     verifier,
                     client_ech_mode: self.cfg.state.client_ech_mode,
                 },
@@ -133,6 +123,7 @@ pub(super) mod danger {
 
 #[cfg(feature = "impit")]
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 /// Emulate a browser's behavior.
 pub enum BrowserType {
     /// Emulate Chrome's behavior.
@@ -144,6 +135,7 @@ pub enum BrowserType {
 #[cfg(feature = "impit")]
 /// Struct holding the browser emulator configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BrowserEmulator {
     /// Emulated browser, e.g. Chrome or Firefox
     pub browser_type: BrowserType,
@@ -157,8 +149,7 @@ pub struct BrowserEmulator {
 /// For more information, see the [`ConfigBuilder`] documentation.
 #[derive(Clone)]
 pub struct WantsClientCert {
-    versions: versions::EnabledVersions,
-    verifier: Arc<dyn verify::ServerCertVerifier>,
+    verifier: Arc<dyn verify::ServerVerifier>,
     client_ech_mode: Option<EchMode>,
 }
 
@@ -171,7 +162,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
     ) -> ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
         ConfigBuilder {
             state: WantsClientCertWithBrowserEmulationEnabled {
-                versions: self.state.versions,
                 verifier: self.state.verifier,
                 client_ech_mode: self.state.client_ech_mode,
                 browser_emulator: browser_emulator.clone(),
@@ -192,24 +182,41 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
     /// This function fails if `key_der` is invalid.
     pub fn with_client_auth_cert(
         self,
-        cert_chain: Vec<CertificateDer<'static>>,
+        identity: Arc<Identity<'static>>,
         key_der: PrivateKeyDer<'static>,
     ) -> Result<ClientConfig, Error> {
-        let certified_key = CertifiedKey::from_der(cert_chain, key_der, &self.provider)?;
-        Ok(self.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+        let credentials = Credentials::from_der(identity, key_der, &self.provider)?;
+        self.with_client_credential_resolver(Arc::new(SingleCredential::from(credentials)))
     }
 
     /// Do not support client auth.
-    pub fn with_no_client_auth(self) -> ClientConfig {
-        self.with_client_cert_resolver(Arc::new(handy::FailResolveClientCert {}))
+    pub fn with_no_client_auth(self) -> Result<ClientConfig, Error> {
+        self.with_client_credential_resolver(Arc::new(handy::FailResolveClientCert {}))
     }
 
-    /// Sets a custom [`ResolvesClientCert`].
-    pub fn with_client_cert_resolver(
+    /// Sets a custom [`ClientCredentialResolver`].
+    pub fn with_client_credential_resolver(
         self,
-        client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
-    ) -> ClientConfig {
-        ClientConfig {
+        client_auth_cert_resolver: Arc<dyn ClientCredentialResolver>,
+    ) -> Result<ClientConfig, Error> {
+        self.provider.consistency_check()?;
+
+        if self.state.client_ech_mode.is_some() {
+            match (
+                self.provider
+                    .tls12_cipher_suites
+                    .is_empty(),
+                self.provider
+                    .tls13_cipher_suites
+                    .is_empty(),
+            ) {
+                (_, true) => return Err(ApiMisuse::EchRequiresTls13Support.into()),
+                (false, _) => return Err(ApiMisuse::EchForbidsTls12Support.into()),
+                (true, false) => {}
+            };
+        }
+
+        Ok(ClientConfig {
             provider: self.provider,
             alpn_protocols: Vec::new(),
             #[cfg(feature = "impit")]
@@ -217,7 +224,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             resumption: Resumption::default(),
             max_fragment_size: None,
             client_auth_cert_resolver,
-            versions: self.state.versions,
             enable_sni: true,
             verifier: self.state.verifier,
             #[cfg(feature = "impit")]
@@ -226,14 +232,13 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             key_log: Arc::new(NoKeyLog {}),
             enable_secret_extraction: false,
             enable_early_data: false,
-            #[cfg(feature = "tls12")]
             require_ems: cfg!(feature = "fips"),
             time_provider: self.time_provider,
             cert_compressors: compress::default_cert_compressors().to_vec(),
             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
             cert_decompressors: compress::default_cert_decompressors().to_vec(),
             ech_mode: self.state.client_ech_mode,
-        }
+        })
     }
 }
 
@@ -244,8 +249,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
 #[cfg(feature = "impit")]
 #[derive(Clone)]
 pub struct WantsClientCertWithBrowserEmulationEnabled {
-    versions: versions::EnabledVersions,
-    verifier: Arc<dyn verify::ServerCertVerifier>,
+    verifier: Arc<dyn verify::ServerVerifier>,
     client_ech_mode: Option<EchMode>,
     browser_emulator: BrowserEmulator,
 }
@@ -263,23 +267,40 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
     /// This function fails if `key_der` is invalid.
     pub fn with_client_auth_cert(
         self,
-        cert_chain: Vec<CertificateDer<'static>>,
+        identity: Arc<Identity<'static>>,
         key_der: PrivateKeyDer<'static>,
     ) -> Result<ClientConfig, Error> {
-        let certified_key = CertifiedKey::from_der(cert_chain, key_der, &self.provider)?;
-        Ok(self.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+        let credentials = Credentials::from_der(identity, key_der, &self.provider)?;
+        self.with_client_credential_resolver(Arc::new(SingleCredential::from(credentials)))
     }
 
     /// Do not support client auth.
-    pub fn with_no_client_auth(self) -> ClientConfig {
-        self.with_client_cert_resolver(Arc::new(handy::FailResolveClientCert {}))
+    pub fn with_no_client_auth(self) -> Result<ClientConfig, Error> {
+        self.with_client_credential_resolver(Arc::new(handy::FailResolveClientCert {}))
     }
 
     /// Sets a custom [`ResolvesClientCert`].
-    pub fn with_client_cert_resolver(
+    pub fn with_client_credential_resolver(
         self,
-        client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
-    ) -> ClientConfig {
+        client_auth_cert_resolver: Arc<dyn ClientCredentialResolver>,
+    ) -> Result<ClientConfig, Error> {
+        self.provider.consistency_check()?;
+
+        if self.state.client_ech_mode.is_some() {
+            match (
+                self.provider
+                    .tls12_cipher_suites
+                    .is_empty(),
+                self.provider
+                    .tls13_cipher_suites
+                    .is_empty(),
+            ) {
+                (_, true) => return Err(ApiMisuse::EchRequiresTls13Support.into()),
+                (false, _) => return Err(ApiMisuse::EchForbidsTls12Support.into()),
+                (true, false) => {}
+            };
+        }
+
         let (alpn_protocols, cert_compressors, cert_decompressors) =
             match self.state.browser_emulator {
                 BrowserEmulator {
@@ -287,8 +308,8 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
                     version: _,
                 } => (
                     vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-                    vec![crate::compress::BROTLI_COMPRESSOR],
-                    vec![crate::compress::BROTLI_DECOMPRESSOR],
+                    vec![compress::BROTLI_COMPRESSOR],
+                    vec![compress::BROTLI_DECOMPRESSOR],
                 ),
                 BrowserEmulator {
                     browser_type: BrowserType::Firefox,
@@ -296,18 +317,16 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
                 } => (vec![b"h2".to_vec(), b"http/1.1".to_vec()], vec![], vec![]),
             };
 
-        ClientConfig {
+        Ok(ClientConfig {
             browser_emulation: Some(self.state.browser_emulator),
             provider: self.provider,
             resumption: Resumption::default(),
             max_fragment_size: None,
             client_auth_cert_resolver,
-            versions: self.state.versions,
             enable_sni: true,
             verifier: self.state.verifier,
             enable_secret_extraction: false,
             enable_early_data: false,
-            #[cfg(feature = "tls12")]
             require_ems: cfg!(feature = "fips"),
             time_provider: self.time_provider,
             alpn_protocols,
@@ -316,6 +335,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
             cert_decompressors,
             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
             ech_mode: self.state.client_ech_mode,
-        }
+        })
     }
 }

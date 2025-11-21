@@ -2,17 +2,16 @@ use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::borrow::Borrow;
+use core::fmt;
 use core::ops::Deref;
 
 use pki_types::ServerName;
 
-#[cfg(feature = "tls12")]
-use super::tls12;
-use super::{ResolvesClientCert, Tls12Resumption};
 use crate::NamedGroup;
 use crate::SupportedCipherSuite;
-#[cfg(feature = "logging")]
 use crate::bs_debug;
+use super::{ClientCredentialResolver, Tls12Resumption};
 use crate::check::inappropriate_handshake_message;
 #[cfg(feature = "impit")]
 use crate::client::BrowserEmulator;
@@ -23,37 +22,41 @@ use crate::client::common::ClientHelloDetails;
 use crate::client::ech::EchState;
 use crate::client::{ClientConfig, EchMode, EchStatus, tls13};
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
-use crate::conn::ConnectionRandoms;
-use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
+use crate::crypto::cipher::Payload;
+use crate::crypto::{CryptoProvider, KeyExchangeAlgorithm, StartedKeyExchange};
 use crate::enums::{
     AlertDescription, CertificateType, CipherSuite, ContentType, HandshakeType, ProtocolVersion,
 };
-use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
+use crate::error::{ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
-use crate::msgs::base::Payload;
 #[cfg(feature = "impit")]
 use crate::msgs::base::{PayloadU8, PayloadU16};
 use crate::msgs::enums::{Compression, ExtensionType};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
     ClientSessionTicket, EncryptedClientHello, HandshakeMessagePayload, HandshakePayload,
-    HelloRetryRequest, KeyShareEntry, ProtocolName, PskKeyExchangeModes, Random, ServerNamePayload,
-    SessionId, SupportedEcPointFormats, SupportedProtocolVersions, TransportParameters,
+    HelloRetryRequest, KeyShareEntry, ProtocolName, PskKeyExchangeModes, Random,
+    ServerHelloPayload, ServerNamePayload, SessionId, SupportedEcPointFormats,
+    SupportedProtocolVersions, TransportParameters,
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
+use crate::sealed::Sealed;
+use crate::suites::Suite;
 use crate::sync::Arc;
+use crate::tls12::Tls12CipherSuite;
+use crate::tls13::Tls13CipherSuite;
 use crate::tls13::key_schedule::KeyScheduleEarly;
-use crate::verify::ServerCertVerifier;
+use crate::verify::ServerVerifier;
 
-pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
-pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
+pub(super) type NextState = Box<dyn State<ClientConnectionData>>;
+pub(super) type NextStateOrError = Result<NextState, Error>;
 pub(super) type ClientContext<'a> = crate::common_state::Context<'a, ClientConnectionData>;
 
-struct ExpectServerHello {
-    input: ClientHelloInput,
-    transcript_buffer: HandshakeHashBuffer,
+pub(crate) struct ExpectServerHello {
+    pub(super) input: ClientHelloInput,
+    pub(super) transcript_buffer: HandshakeHashBuffer,
     // The key schedule for sending early data.
     //
     // If the server accepts the PSK used for early data then
@@ -61,10 +64,154 @@ struct ExpectServerHello {
     // Otherwise, it is thrown away.
     //
     // If this is `None` then we do not support early data.
-    early_data_key_schedule: Option<KeyScheduleEarly>,
-    offered_key_share: Option<Box<dyn ActiveKeyExchange>>,
-    suite: Option<SupportedCipherSuite>,
-    ech_state: Option<EchState>,
+    pub(super) early_data_key_schedule: Option<KeyScheduleEarly>,
+    pub(super) offered_key_share: Option<StartedKeyExchange>,
+    pub(super) suite: Option<SupportedCipherSuite>,
+    pub(super) ech_state: Option<EchState>,
+}
+
+impl ExpectServerHello {
+    fn with_version<T: Suite + 'static>(
+        mut self,
+        server_hello: &ServerHelloPayload,
+        message: &Message<'_>,
+        cx: &mut ClientContext<'_>,
+    ) -> NextStateOrError
+    where
+        CryptoProvider: Borrow<[&'static T]>,
+        SupportedCipherSuite: From<&'static T>,
+    {
+        if server_hello.compression_method != Compression::Null {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::SelectedUnofferedCompression,
+                )
+            });
+        }
+
+        let allowed_unsolicited = [ExtensionType::RenegotiationInfo];
+        if self
+            .input
+            .hello
+            .server_sent_unsolicited_extensions(server_hello, &allowed_unsolicited)
+        {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::UnsupportedExtension,
+                PeerMisbehaved::UnsolicitedServerHelloExtension,
+            ));
+        }
+
+        cx.common.negotiated_version = Some(T::VERSION);
+
+        // Extract ALPN protocol
+        if !cx.common.is_tls13() {
+            process_alpn_protocol(
+                cx.common,
+                &self.input.hello.alpn_protocols,
+                server_hello
+                    .selected_protocol
+                    .as_ref()
+                    .map(|s| s.as_ref()),
+            )?;
+        }
+
+        // If ECPointFormats extension is supplied by the server, it must contain
+        // Uncompressed.  But it's allowed to be omitted.
+        if let Some(point_fmts) = &server_hello.ec_point_formats {
+            if !point_fmts.uncompressed {
+                return Err(cx.common.send_fatal_alert(
+                    AlertDescription::HandshakeFailure,
+                    PeerMisbehaved::ServerHelloMustOfferUncompressedEcPoints,
+                ));
+            }
+        }
+
+        let suite = <CryptoProvider as Borrow<[&'static T]>>::borrow(&self.input.config.provider)
+            .iter()
+            .find(|cs| cs.common().suite == server_hello.cipher_suite)
+            .ok_or_else(|| {
+                cx.common.send_fatal_alert(
+                    AlertDescription::HandshakeFailure,
+                    PeerMisbehaved::SelectedUnofferedCipherSuite,
+                )
+            })?;
+
+        match self.suite {
+            Some(prev_suite) if prev_suite.suite() != suite.common().suite => {
+                return Err({
+                    cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::SelectedDifferentCipherSuiteAfterRetry,
+                    )
+                });
+            }
+            _ => {
+                debug!("Using ciphersuite {suite:?}");
+                self.suite = Some(SupportedCipherSuite::from(suite));
+                cx.common.suite = Some(SupportedCipherSuite::from(suite));
+            }
+        }
+
+        // For TLS1.3, start message encryption using
+        // handshake_traffic_secret.
+        suite
+            .client_handler()
+            .handle_server_hello(suite, server_hello, message, self, cx)
+    }
+}
+
+impl State<ClientConnectionData> for ExpectServerHello {
+    fn handle(self: Box<Self>, cx: &mut ClientContext<'_>, m: Message<'_>) -> NextStateOrError {
+        let server_hello =
+            require_handshake_msg!(m, HandshakeType::ServerHello, HandshakePayload::ServerHello)?;
+        trace!("We got ServerHello {server_hello:#?}");
+
+        use ProtocolVersion::{TLSv1_2, TLSv1_3};
+        let config = &self.input.config;
+        let tls13_supported = config.supports_version(TLSv1_3);
+
+        let server_version = if server_hello.legacy_version == TLSv1_2 {
+            server_hello
+                .selected_version
+                .unwrap_or(server_hello.legacy_version)
+        } else {
+            server_hello.legacy_version
+        };
+
+        match server_version {
+            TLSv1_3 if tls13_supported => {
+                self.with_version::<Tls13CipherSuite>(server_hello, &m, cx)
+            }
+            TLSv1_2 if config.supports_version(TLSv1_2) => {
+                if cx.data.early_data.is_enabled() && cx.common.early_traffic {
+                    // The client must fail with a dedicated error code if the server
+                    // responds with TLS 1.2 when offering 0-RTT.
+                    return Err(PeerMisbehaved::OfferedEarlyDataWithOldProtocolVersion.into());
+                }
+
+                if server_hello.selected_version.is_some() {
+                    return Err({
+                        cx.common.send_fatal_alert(
+                            AlertDescription::IllegalParameter,
+                            PeerMisbehaved::SelectedTls12UsingTls13VersionExtension,
+                        )
+                    });
+                }
+
+                self.with_version::<Tls12CipherSuite>(server_hello, &m, cx)
+            }
+            _ => {
+                let reason = match server_version {
+                    TLSv1_2 | TLSv1_3 => PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig,
+                    _ => PeerIncompatible::ServerDoesNotSupportTls12Or13,
+                };
+                Err(cx
+                    .common
+                    .send_fatal_alert(AlertDescription::ProtocolVersion, reason))
+            }
+        }
+    }
 }
 
 struct ExpectServerHelloOrHelloRetryRequest {
@@ -72,7 +219,219 @@ struct ExpectServerHelloOrHelloRetryRequest {
     extra_exts: ClientExtensionsInput<'static>,
 }
 
-pub(super) struct ClientHelloInput {
+impl ExpectServerHelloOrHelloRetryRequest {
+    fn into_expect_server_hello(self) -> NextState {
+        Box::new(self.next)
+    }
+
+    fn handle_hello_retry_request(
+        mut self,
+        cx: &mut ClientContext<'_>,
+        m: Message<'_>,
+    ) -> NextStateOrError {
+        let hrr = require_handshake_msg!(
+            m,
+            HandshakeType::HelloRetryRequest,
+            HandshakePayload::HelloRetryRequest
+        )?;
+        trace!("Got HRR {hrr:?}");
+
+        cx.common.check_aligned_handshake()?;
+
+        // We always send a key share when TLS 1.3 is enabled.
+        let offered_key_share = self.next.offered_key_share.unwrap();
+
+        // A retry request is illegal if it contains no cookie and asks for
+        // retry of a group we already sent.
+        let config = &self.next.input.config;
+
+        if let (None, Some(req_group)) = (&hrr.cookie, hrr.key_share) {
+            let offered_hybrid = offered_key_share
+                .as_hybrid_checked(&config.provider.kx_groups, ProtocolVersion::TLSv1_3)
+                .map(|(hybrid, _)| hybrid.component().0);
+
+            if req_group == offered_key_share.group() || Some(req_group) == offered_hybrid {
+                return Err({
+                    cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::IllegalHelloRetryRequestWithOfferedGroup,
+                    )
+                });
+            }
+        }
+
+        // Or has an empty cookie.
+        if let Some(cookie) = &hrr.cookie {
+            if cookie.0.is_empty() {
+                return Err({
+                    cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::IllegalHelloRetryRequestWithEmptyCookie,
+                    )
+                });
+            }
+        }
+
+        // Or asks us to change nothing.
+        if hrr.cookie.is_none() && hrr.key_share.is_none() {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithNoChanges,
+                )
+            });
+        }
+
+        // Or does not echo the session_id from our ClientHello:
+        //
+        // > the HelloRetryRequest has the same format as a ServerHello message,
+        // > and the legacy_version, legacy_session_id_echo, cipher_suite, and
+        // > legacy_compression_method fields have the same meaning
+        // <https://www.rfc-editor.org/rfc/rfc8446#section-4.1.4>
+        //
+        // and
+        //
+        // > A client which receives a legacy_session_id_echo field that does not
+        // > match what it sent in the ClientHello MUST abort the handshake with an
+        // > "illegal_parameter" alert.
+        // <https://www.rfc-editor.org/rfc/rfc8446#section-4.1.3>
+        if hrr.session_id != self.next.input.session_id {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithWrongSessionId,
+                )
+            });
+        }
+
+        // Or asks us to talk a protocol we didn't offer, or doesn't support HRR at all.
+        match hrr.supported_versions {
+            Some(ProtocolVersion::TLSv1_3) => {
+                cx.common.negotiated_version = Some(ProtocolVersion::TLSv1_3);
+            }
+            _ => {
+                return Err({
+                    cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::IllegalHelloRetryRequestWithUnsupportedVersion,
+                    )
+                });
+            }
+        }
+
+        // Or asks us to use a ciphersuite we didn't offer.
+        let Some(cs) = config.find_cipher_suite(hrr.cipher_suite) else {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedCipherSuite,
+                )
+            });
+        };
+
+        // Or offers ECH related extensions when we didn't offer ECH.
+        if cx.data.ech_status == EchStatus::NotOffered && hrr.encrypted_client_hello.is_some() {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::UnsupportedExtension,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithInvalidEch,
+                )
+            });
+        }
+
+        // HRR selects the ciphersuite.
+        cx.common.suite = Some(cs);
+        cx.common.handshake_kind = Some(HandshakeKind::FullWithHelloRetryRequest);
+
+        // If we offered ECH, we need to confirm that the server accepted it.
+        match (self.next.ech_state.as_ref(), cs) {
+            (Some(ech_state), SupportedCipherSuite::Tls13(tls13_cs)) => {
+                if !ech_state.confirm_hrr_acceptance(hrr, tls13_cs, cx.common)? {
+                    // If the server did not confirm, then note the new ECH status but
+                    // continue the handshake. We will abort with an ECH required error
+                    // at the end.
+                    cx.data.ech_status = EchStatus::Rejected;
+                }
+            }
+            (Some(_), SupportedCipherSuite::Tls12(_)) => {
+                unreachable!("ECH state should only be set when TLS 1.3 was negotiated")
+            }
+            _ => {}
+        };
+
+        // This is the draft19 change where the transcript became a tree
+        let transcript = self
+            .next
+            .transcript_buffer
+            .start_hash(cs.hash_provider());
+        let mut transcript_buffer = transcript.into_hrr_buffer();
+        transcript_buffer.add_message(&m);
+
+        // If we offered ECH and the server accepted, we also need to update the separate
+        // ECH transcript with the hello retry request message.
+        if let Some(ech_state) = self.next.ech_state.as_mut() {
+            ech_state.transcript_hrr_update(cs.hash_provider(), &m);
+        }
+
+        // Early data is not allowed after HelloRetryrequest
+        if cx.data.early_data.is_enabled() {
+            cx.data.early_data.rejected();
+        }
+
+        let key_share = match hrr.key_share {
+            Some(group) if group != offered_key_share.group() => {
+                let Some(skxg) = config
+                    .provider
+                    .find_kx_group(group, ProtocolVersion::TLSv1_3)
+                else {
+                    return Err(cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedNamedGroup,
+                    ));
+                };
+
+                cx.common.kx_state = KxState::Start(skxg);
+                skxg.start()?
+            }
+            _ => offered_key_share,
+        };
+
+        emit_client_hello_for_retry(
+            transcript_buffer,
+            Some(hrr),
+            Some(key_share),
+            self.extra_exts,
+            Some(cs),
+            self.next.input,
+            cx,
+            self.next.ech_state,
+        )
+    }
+}
+
+impl State<ClientConnectionData> for ExpectServerHelloOrHelloRetryRequest {
+    fn handle(self: Box<Self>, cx: &mut ClientContext<'_>, m: Message<'_>) -> NextStateOrError {
+        match m.payload {
+            MessagePayload::Handshake {
+                parsed: HandshakeMessagePayload(HandshakePayload::ServerHello(..)),
+                ..
+            } => self
+                .into_expect_server_hello()
+                .handle(cx, m),
+            MessagePayload::Handshake {
+                parsed: HandshakeMessagePayload(HandshakePayload::HelloRetryRequest(..)),
+                ..
+            } => self.handle_hello_retry_request(cx, m),
+            payload => Err(inappropriate_handshake_message(
+                &payload,
+                &[ContentType::Handshake],
+                &[HandshakeType::ServerHello, HandshakeType::HelloRetryRequest],
+            )),
+        }
+    }
+}
+
+pub(crate) struct ClientHelloInput {
     pub(super) config: Arc<ClientConfig>,
     pub(super) resuming: Option<persist::Retrieved<ClientSessionValue>>,
     pub(super) random: Random,
@@ -92,10 +451,9 @@ impl ClientHelloInput {
     ) -> Result<Self, Error> {
         let mut resuming = ClientSessionValue::retrieve(&server_name, &config, cx);
         let session_id = match &mut resuming {
-            Some(_resuming) => {
+            Some(resuming) => {
                 debug!("Resuming session");
-                match &mut _resuming.value {
-                    #[cfg(feature = "tls12")]
+                match &mut resuming.value {
                     ClientSessionValue::Tls12(inner) => {
                         // If we have a ticket, we use the sessionid as a signal that
                         // we're  doing an abbreviated handshake.  See section 3.4 in
@@ -115,7 +473,7 @@ impl ClientHelloInput {
         };
 
         // https://tools.ietf.org/html/rfc8446#appendix-D.4
-        // https://tools.ietf.org/html/draft-ietf-quic-tls-34#section-8.4
+        // https://tools.ietf.org/html/rfc9001#section-8.4
         let session_id = match session_id {
             Some(session_id) => session_id,
             None if cx.common.is_quic() => SessionId::empty(),
@@ -147,12 +505,13 @@ impl ClientHelloInput {
         self,
         extra_exts: ClientExtensionsInput<'static>,
         cx: &mut ClientContext<'_>,
-    ) -> NextStateOrError<'static> {
+    ) -> NextStateOrError {
         let mut transcript_buffer = HandshakeHashBuffer::new();
-        if self
+        if !self
             .config
             .client_auth_cert_resolver
-            .has_certs()
+            .supported_certificate_types()
+            .is_empty()
         {
             transcript_buffer.set_client_auth_enabled();
         }
@@ -195,13 +554,13 @@ impl ClientHelloInput {
 fn emit_client_hello_for_retry(
     mut transcript_buffer: HandshakeHashBuffer,
     retryreq: Option<&HelloRetryRequest>,
-    key_share: Option<Box<dyn ActiveKeyExchange>>,
+    key_share: Option<StartedKeyExchange>,
     extra_exts: ClientExtensionsInput<'static>,
     suite: Option<SupportedCipherSuite>,
     mut input: ClientHelloInput,
     cx: &mut ClientContext<'_>,
     mut ech_state: Option<EchState>,
-) -> NextStateOrError<'static> {
+) -> NextStateOrError {
     let config = &input.config;
     // Defense in depth: the ECH state should be None if ECH is disabled based on config
     // builder semantics.
@@ -216,34 +575,25 @@ fn emit_client_hello_for_retry(
     assert!(supported_versions.any(|_| true));
 
     // offer groups which are usable for any offered version
-    #[cfg(not(feature = "impit"))]
-    let offered_groups: Vec<NamedGroup> = config
-        .provider
-        .kx_groups
-        .iter()
-        .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
-        .map(|skxg| skxg.name())
-        .collect();
-
-    #[cfg(feature = "impit")]
     let mut offered_groups: Vec<NamedGroup> = config
-        .provider
-        .kx_groups
-        .iter()
-        .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
-        .map(|skxg| skxg.name())
-        .collect();
+                .provider
+                .kx_groups
+                .iter()
+                .filter_map(|skxg| {
+                    let named_group = skxg.name();
+                    supported_versions
+                        .any(|v| named_group.usable_for_version(v))
+                        .then_some(named_group)
+                })
+                .collect();
 
     #[cfg(feature = "impit")]
-    match config.browser_emulation {
-        Some(BrowserEmulator {
+    if let Some(BrowserEmulator {
             browser_type: BrowserType::Chrome,
             version: _,
-        }) => {
-            offered_groups.push(NamedGroup::GREASE);
-            // offered_groups.push(NamedGroup::X25519Kyber768Draft00);
-        }
-        _ => {}
+        }) = config.browser_emulation {
+        offered_groups.push(NamedGroup::GREASE);
+        // offered_groups.push(NamedGroup::X25519Kyber768Draft00);
     }
 
     let mut exts = Box::new(ClientExtensions {
@@ -256,7 +606,10 @@ fn emit_client_hello_for_retry(
                 .supported_verify_schemes(),
         ),
         extended_master_secret_request: Some(()),
-        certificate_status_request: Some(CertificateStatusRequest::build_ocsp()),
+        certificate_status_request: match config.verifier.request_ocsp_response() {
+            true => Some(CertificateStatusRequest::build_ocsp()),
+            false => None,
+        },
         protocols: extra_exts.protocols.clone(),
         ..Default::default()
     });
@@ -292,15 +645,13 @@ fn emit_client_hello_for_retry(
         _ => {}
     }
 
-    match extra_exts.transport_parameters.clone() {
-        Some(TransportParameters::Quic(v)) => exts.transport_parameters = Some(v),
-        Some(TransportParameters::QuicDraft(v)) => exts.transport_parameters_draft = Some(v),
-        None => {}
-    };
+    if let Some(TransportParameters::Quic(v)) = &extra_exts.transport_parameters {
+        exts.transport_parameters = Some(v.clone());
+    }
 
     if supported_versions.tls13 {
         if let Some(cas_extension) = config.verifier.root_hint_subjects() {
-            exts.certificate_authority_names = Some(cas_extension.to_owned());
+            exts.certificate_authority_names = Some(cas_extension.to_vec());
         }
     }
 
@@ -343,16 +694,11 @@ fn emit_client_hello_for_retry(
             // Only for the initial client hello, or a HRR that does not specify a kx group,
             // see if we can send a second KeyShare for "free".  We only do this if the same
             // algorithm is also supported separately by our provider for this version
-            // (`find_kx_group` looks that up).
-            if let Some((component_group, component_share)) =
-                key_share
-                    .hybrid_component()
-                    .filter(|(group, _)| {
-                        config
-                            .find_kx_group(*group, ProtocolVersion::TLSv1_3)
-                            .is_some()
-                    })
+            // (via `component_separately_supported`).
+            if let Some((hybrid, _)) =
+                key_share.as_hybrid_checked(&config.provider.kx_groups, ProtocolVersion::TLSv1_3)
             {
+                let (component_group, component_share) = hybrid.component();
                 shares.push(KeyShareEntry::new(component_group, component_share));
             }
         }
@@ -387,18 +733,25 @@ fn emit_client_hello_for_retry(
             false
         };
 
-    if config
+    let client_certificate_types = config
         .client_auth_cert_resolver
-        .only_raw_public_keys()
-    {
-        exts.client_certificate_types = Some(vec![CertificateType::RawPublicKey]);
+        .supported_certificate_types();
+    match client_certificate_types {
+        &[] | &[CertificateType::X509] => {}
+        supported => {
+            exts.client_certificate_types = Some(supported.to_vec());
+        }
     }
 
-    if config
+    let server_certificate_types = config
         .verifier
-        .requires_raw_public_keys()
-    {
-        exts.server_certificate_types = Some(vec![CertificateType::RawPublicKey]);
+        .supported_certificate_types();
+    match server_certificate_types {
+        [] => return Err(ApiMisuse::NoSupportedCertificateTypes.into()),
+        [CertificateType::X509] => {}
+        supported => {
+            exts.server_certificate_types = Some(supported.to_vec());
+        }
     }
 
     // If this is a second client hello we're constructing in response to an HRR, and
@@ -419,8 +772,7 @@ fn emit_client_hello_for_retry(
 
     let mut cipher_suites: Vec<_> = config
         .provider
-        .cipher_suites
-        .iter()
+        .iter_cipher_suites()
         .filter_map(|cs| match cs.usable_for_protocol(cx.common.protocol) {
             true => Some(cs.suite()),
             false => None,
@@ -656,7 +1008,6 @@ fn prepare_resumption<'a>(
     // If the server selected TLS 1.2, we can't resume.
     let suite = match suite {
         Some(SupportedCipherSuite::Tls13(suite)) => Some(suite),
-        #[cfg(feature = "tls12")]
         Some(SupportedCipherSuite::Tls12(_)) => return None,
         None => None,
     };
@@ -709,459 +1060,8 @@ pub(super) fn process_alpn_protocol(
     Ok(())
 }
 
-pub(super) fn process_server_cert_type_extension(
-    common: &mut CommonState,
-    config: &ClientConfig,
-    server_cert_extension: Option<&CertificateType>,
-) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
-    process_cert_type_extension(
-        common,
-        config
-            .verifier
-            .requires_raw_public_keys(),
-        server_cert_extension.copied(),
-        ExtensionType::ServerCertificateType,
-    )
-}
-
-pub(super) fn process_client_cert_type_extension(
-    common: &mut CommonState,
-    config: &ClientConfig,
-    client_cert_extension: Option<&CertificateType>,
-) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
-    process_cert_type_extension(
-        common,
-        config
-            .client_auth_cert_resolver
-            .only_raw_public_keys(),
-        client_cert_extension.copied(),
-        ExtensionType::ClientCertificateType,
-    )
-}
-
-impl State<ClientConnectionData> for ExpectServerHello {
-    fn handle<'m>(
-        mut self: Box<Self>,
-        cx: &mut ClientContext<'_>,
-        m: Message<'m>,
-    ) -> NextStateOrError<'m>
-    where
-        Self: 'm,
-    {
-        let server_hello =
-            require_handshake_msg!(m, HandshakeType::ServerHello, HandshakePayload::ServerHello)?;
-        trace!("We got ServerHello {server_hello:#?}");
-
-        use crate::ProtocolVersion::{TLSv1_2, TLSv1_3};
-        let config = &self.input.config;
-        let tls13_supported = config.supports_version(TLSv1_3);
-
-        let server_version = if server_hello.legacy_version == TLSv1_2 {
-            server_hello
-                .selected_version
-                .unwrap_or(server_hello.legacy_version)
-        } else {
-            server_hello.legacy_version
-        };
-
-        let version = match server_version {
-            TLSv1_3 if tls13_supported => TLSv1_3,
-            TLSv1_2 if config.supports_version(TLSv1_2) => {
-                if cx.data.early_data.is_enabled() && cx.common.early_traffic {
-                    // The client must fail with a dedicated error code if the server
-                    // responds with TLS 1.2 when offering 0-RTT.
-                    return Err(PeerMisbehaved::OfferedEarlyDataWithOldProtocolVersion.into());
-                }
-
-                if server_hello.selected_version.is_some() {
-                    return Err({
-                        cx.common.send_fatal_alert(
-                            AlertDescription::IllegalParameter,
-                            PeerMisbehaved::SelectedTls12UsingTls13VersionExtension,
-                        )
-                    });
-                }
-
-                TLSv1_2
-            }
-            _ => {
-                let reason = match server_version {
-                    TLSv1_2 | TLSv1_3 => PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig,
-                    _ => PeerIncompatible::ServerDoesNotSupportTls12Or13,
-                };
-                return Err(cx
-                    .common
-                    .send_fatal_alert(AlertDescription::ProtocolVersion, reason));
-            }
-        };
-
-        if server_hello.compression_method != Compression::Null {
-            return Err({
-                cx.common.send_fatal_alert(
-                    AlertDescription::IllegalParameter,
-                    PeerMisbehaved::SelectedUnofferedCompression,
-                )
-            });
-        }
-
-        let allowed_unsolicited = [ExtensionType::RenegotiationInfo];
-        if self
-            .input
-            .hello
-            .server_sent_unsolicited_extensions(server_hello, &allowed_unsolicited)
-        {
-            return Err(cx.common.send_fatal_alert(
-                AlertDescription::UnsupportedExtension,
-                PeerMisbehaved::UnsolicitedServerHelloExtension,
-            ));
-        }
-
-        cx.common.negotiated_version = Some(version);
-
-        // Extract ALPN protocol
-        if !cx.common.is_tls13() {
-            process_alpn_protocol(
-                cx.common,
-                &self.input.hello.alpn_protocols,
-                server_hello
-                    .selected_protocol
-                    .as_ref()
-                    .map(|s| s.as_ref()),
-            )?;
-        }
-
-        // If ECPointFormats extension is supplied by the server, it must contain
-        // Uncompressed.  But it's allowed to be omitted.
-        if let Some(point_fmts) = &server_hello.ec_point_formats {
-            if !point_fmts.uncompressed {
-                return Err(cx.common.send_fatal_alert(
-                    AlertDescription::HandshakeFailure,
-                    PeerMisbehaved::ServerHelloMustOfferUncompressedEcPoints,
-                ));
-            }
-        }
-
-        let suite = config
-            .find_cipher_suite(server_hello.cipher_suite)
-            .ok_or_else(|| {
-                cx.common.send_fatal_alert(
-                    AlertDescription::HandshakeFailure,
-                    PeerMisbehaved::SelectedUnofferedCipherSuite,
-                )
-            })?;
-
-        if version != suite.version().version {
-            return Err({
-                cx.common.send_fatal_alert(
-                    AlertDescription::IllegalParameter,
-                    PeerMisbehaved::SelectedUnusableCipherSuiteForVersion,
-                )
-            });
-        }
-
-        match self.suite {
-            Some(prev_suite) if prev_suite != suite => {
-                return Err({
-                    cx.common.send_fatal_alert(
-                        AlertDescription::IllegalParameter,
-                        PeerMisbehaved::SelectedDifferentCipherSuiteAfterRetry,
-                    )
-                });
-            }
-            _ => {
-                debug!("Using ciphersuite {suite:?}");
-                self.suite = Some(suite);
-                cx.common.suite = Some(suite);
-            }
-        }
-
-        // Start our handshake hash, and input the server-hello.
-        let mut transcript = self
-            .transcript_buffer
-            .start_hash(suite.hash_provider());
-        transcript.add_message(&m);
-
-        let randoms = ConnectionRandoms::new(self.input.random, server_hello.random);
-        // For TLS1.3, start message encryption using
-        // handshake_traffic_secret.
-        match suite {
-            SupportedCipherSuite::Tls13(suite) => {
-                tls13::handle_server_hello(
-                    cx,
-                    server_hello,
-                    randoms,
-                    suite,
-                    transcript,
-                    self.early_data_key_schedule,
-                    // We always send a key share when TLS 1.3 is enabled.
-                    self.offered_key_share.unwrap(),
-                    &m,
-                    self.ech_state,
-                    self.input,
-                )
-            }
-            #[cfg(feature = "tls12")]
-            SupportedCipherSuite::Tls12(suite) => tls12::CompleteServerHelloHandling {
-                randoms,
-                transcript,
-                input: self.input,
-            }
-            .handle_server_hello(cx, suite, server_hello, tls13_supported),
-        }
-    }
-
-    fn into_owned(self: Box<Self>) -> NextState<'static> {
-        self
-    }
-}
-
-impl ExpectServerHelloOrHelloRetryRequest {
-    fn into_expect_server_hello(self) -> NextState<'static> {
-        Box::new(self.next)
-    }
-
-    fn handle_hello_retry_request(
-        mut self,
-        cx: &mut ClientContext<'_>,
-        m: Message<'_>,
-    ) -> NextStateOrError<'static> {
-        let hrr = require_handshake_msg!(
-            m,
-            HandshakeType::HelloRetryRequest,
-            HandshakePayload::HelloRetryRequest
-        )?;
-        trace!("Got HRR {hrr:?}");
-
-        cx.common.check_aligned_handshake()?;
-
-        // We always send a key share when TLS 1.3 is enabled.
-        let offered_key_share = self.next.offered_key_share.unwrap();
-
-        // A retry request is illegal if it contains no cookie and asks for
-        // retry of a group we already sent.
-        let config = &self.next.input.config;
-
-        if let (None, Some(req_group)) = (&hrr.cookie, hrr.key_share) {
-            let offered_hybrid = offered_key_share
-                .hybrid_component()
-                .and_then(|(group_name, _)| {
-                    config.find_kx_group(group_name, ProtocolVersion::TLSv1_3)
-                })
-                .map(|skxg| skxg.name());
-
-            if req_group == offered_key_share.group() || Some(req_group) == offered_hybrid {
-                return Err({
-                    cx.common.send_fatal_alert(
-                        AlertDescription::IllegalParameter,
-                        PeerMisbehaved::IllegalHelloRetryRequestWithOfferedGroup,
-                    )
-                });
-            }
-        }
-
-        // Or has an empty cookie.
-        if let Some(cookie) = &hrr.cookie {
-            if cookie.0.is_empty() {
-                return Err({
-                    cx.common.send_fatal_alert(
-                        AlertDescription::IllegalParameter,
-                        PeerMisbehaved::IllegalHelloRetryRequestWithEmptyCookie,
-                    )
-                });
-            }
-        }
-
-        // Or asks us to change nothing.
-        if hrr.cookie.is_none() && hrr.key_share.is_none() {
-            return Err({
-                cx.common.send_fatal_alert(
-                    AlertDescription::IllegalParameter,
-                    PeerMisbehaved::IllegalHelloRetryRequestWithNoChanges,
-                )
-            });
-        }
-
-        // Or does not echo the session_id from our ClientHello:
-        //
-        // > the HelloRetryRequest has the same format as a ServerHello message,
-        // > and the legacy_version, legacy_session_id_echo, cipher_suite, and
-        // > legacy_compression_method fields have the same meaning
-        // <https://www.rfc-editor.org/rfc/rfc8446#section-4.1.4>
-        //
-        // and
-        //
-        // > A client which receives a legacy_session_id_echo field that does not
-        // > match what it sent in the ClientHello MUST abort the handshake with an
-        // > "illegal_parameter" alert.
-        // <https://www.rfc-editor.org/rfc/rfc8446#section-4.1.3>
-        if hrr.session_id != self.next.input.session_id {
-            return Err({
-                cx.common.send_fatal_alert(
-                    AlertDescription::IllegalParameter,
-                    PeerMisbehaved::IllegalHelloRetryRequestWithWrongSessionId,
-                )
-            });
-        }
-
-        // Or asks us to talk a protocol we didn't offer, or doesn't support HRR at all.
-        match hrr.supported_versions {
-            Some(ProtocolVersion::TLSv1_3) => {
-                cx.common.negotiated_version = Some(ProtocolVersion::TLSv1_3);
-            }
-            _ => {
-                return Err({
-                    cx.common.send_fatal_alert(
-                        AlertDescription::IllegalParameter,
-                        PeerMisbehaved::IllegalHelloRetryRequestWithUnsupportedVersion,
-                    )
-                });
-            }
-        }
-
-        // Or asks us to use a ciphersuite we didn't offer.
-        let Some(cs) = config.find_cipher_suite(hrr.cipher_suite) else {
-            return Err({
-                cx.common.send_fatal_alert(
-                    AlertDescription::IllegalParameter,
-                    PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedCipherSuite,
-                )
-            });
-        };
-
-        // Or offers ECH related extensions when we didn't offer ECH.
-        if cx.data.ech_status == EchStatus::NotOffered && hrr.encrypted_client_hello.is_some() {
-            return Err({
-                cx.common.send_fatal_alert(
-                    AlertDescription::UnsupportedExtension,
-                    PeerMisbehaved::IllegalHelloRetryRequestWithInvalidEch,
-                )
-            });
-        }
-
-        // HRR selects the ciphersuite.
-        cx.common.suite = Some(cs);
-        cx.common.handshake_kind = Some(HandshakeKind::FullWithHelloRetryRequest);
-
-        // If we offered ECH, we need to confirm that the server accepted it.
-        match (self.next.ech_state.as_ref(), cs.tls13()) {
-            (Some(ech_state), Some(tls13_cs)) => {
-                if !ech_state.confirm_hrr_acceptance(hrr, tls13_cs, cx.common)? {
-                    // If the server did not confirm, then note the new ECH status but
-                    // continue the handshake. We will abort with an ECH required error
-                    // at the end.
-                    cx.data.ech_status = EchStatus::Rejected;
-                }
-            }
-            (Some(_), None) => {
-                unreachable!("ECH state should only be set when TLS 1.3 was negotiated")
-            }
-            _ => {}
-        };
-
-        // This is the draft19 change where the transcript became a tree
-        let transcript = self
-            .next
-            .transcript_buffer
-            .start_hash(cs.hash_provider());
-        let mut transcript_buffer = transcript.into_hrr_buffer();
-        transcript_buffer.add_message(&m);
-
-        // If we offered ECH and the server accepted, we also need to update the separate
-        // ECH transcript with the hello retry request message.
-        if let Some(ech_state) = self.next.ech_state.as_mut() {
-            ech_state.transcript_hrr_update(cs.hash_provider(), &m);
-        }
-
-        // Early data is not allowed after HelloRetryrequest
-        if cx.data.early_data.is_enabled() {
-            cx.data.early_data.rejected();
-        }
-
-        let key_share = match hrr.key_share {
-            Some(group) if group != offered_key_share.group() => {
-                let Some(skxg) = config.find_kx_group(group, ProtocolVersion::TLSv1_3) else {
-                    return Err(cx.common.send_fatal_alert(
-                        AlertDescription::IllegalParameter,
-                        PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedNamedGroup,
-                    ));
-                };
-
-                cx.common.kx_state = KxState::Start(skxg);
-                skxg.start()?
-            }
-            _ => offered_key_share,
-        };
-
-        emit_client_hello_for_retry(
-            transcript_buffer,
-            Some(hrr),
-            Some(key_share),
-            self.extra_exts,
-            Some(cs),
-            self.next.input,
-            cx,
-            self.next.ech_state,
-        )
-    }
-}
-
-impl State<ClientConnectionData> for ExpectServerHelloOrHelloRetryRequest {
-    fn handle<'m>(
-        self: Box<Self>,
-        cx: &mut ClientContext<'_>,
-        m: Message<'m>,
-    ) -> NextStateOrError<'m>
-    where
-        Self: 'm,
-    {
-        match m.payload {
-            MessagePayload::Handshake {
-                parsed: HandshakeMessagePayload(HandshakePayload::ServerHello(..)),
-                ..
-            } => self
-                .into_expect_server_hello()
-                .handle(cx, m),
-            MessagePayload::Handshake {
-                parsed: HandshakeMessagePayload(HandshakePayload::HelloRetryRequest(..)),
-                ..
-            } => self.handle_hello_retry_request(cx, m),
-            payload => Err(inappropriate_handshake_message(
-                &payload,
-                &[ContentType::Handshake],
-                &[HandshakeType::ServerHello, HandshakeType::HelloRetryRequest],
-            )),
-        }
-    }
-
-    fn into_owned(self: Box<Self>) -> NextState<'static> {
-        self
-    }
-}
-
-fn process_cert_type_extension(
-    common: &mut CommonState,
-    client_expects: bool,
-    server_negotiated: Option<CertificateType>,
-    extension_type: ExtensionType,
-) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
-    match (client_expects, server_negotiated) {
-        (true, Some(CertificateType::RawPublicKey)) => {
-            Ok(Some((extension_type, CertificateType::RawPublicKey)))
-        }
-        (true, _) => Err(common.send_fatal_alert(
-            AlertDescription::HandshakeFailure,
-            Error::PeerIncompatible(PeerIncompatible::IncorrectCertificateTypeExtension),
-        )),
-        (_, Some(CertificateType::RawPublicKey)) => {
-            unreachable!("Caught by `PeerMisbehaved::UnsolicitedEncryptedExtension`")
-        }
-        (_, _) => Ok(None),
-    }
-}
-
 pub(super) enum ClientSessionValue {
     Tls13(persist::Tls13ClientSessionValue),
-    #[cfg(feature = "tls12")]
     Tls12(persist::Tls12ClientSessionValue),
 }
 
@@ -1177,17 +1077,11 @@ impl ClientSessionValue {
             .take_tls13_ticket(server_name)
             .map(ClientSessionValue::Tls13)
             .or_else(|| {
-                #[cfg(feature = "tls12")]
-                {
-                    config
-                        .resumption
-                        .store
-                        .tls12_session(server_name)
-                        .map(ClientSessionValue::Tls12)
-                }
-
-                #[cfg(not(feature = "tls12"))]
-                None
+                config
+                    .resumption
+                    .store
+                    .tls12_session(server_name)
+                    .map(ClientSessionValue::Tls12)
             })
             .and_then(|resuming| {
                 resuming.compatible_config(&config.verifier, &config.client_auth_cert_resolver)
@@ -1223,7 +1117,6 @@ impl ClientSessionValue {
     fn common(&self) -> &persist::ClientSessionCommon {
         match self {
             Self::Tls13(inner) => &inner.common,
-            #[cfg(feature = "tls12")]
             Self::Tls12(inner) => &inner.common,
         }
     }
@@ -1231,21 +1124,19 @@ impl ClientSessionValue {
     fn tls13(&self) -> Option<&persist::Tls13ClientSessionValue> {
         match self {
             Self::Tls13(v) => Some(v),
-            #[cfg(feature = "tls12")]
             Self::Tls12(_) => None,
         }
     }
 
     fn compatible_config(
         self,
-        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
-        client_creds: &Arc<dyn ResolvesClientCert>,
+        server_cert_verifier: &Arc<dyn ServerVerifier>,
+        client_creds: &Arc<dyn ClientCredentialResolver>,
     ) -> Option<Self> {
         match &self {
             Self::Tls13(v) => v
                 .compatible_config(server_cert_verifier, client_creds)
                 .then_some(self),
-            #[cfg(feature = "tls12")]
             Self::Tls12(v) => v
                 .compatible_config(server_cert_verifier, client_creds)
                 .then_some(self),
@@ -1259,4 +1150,15 @@ impl Deref for ClientSessionValue {
     fn deref(&self) -> &Self::Target {
         self.common()
     }
+}
+
+pub(crate) trait ClientHandler<T>: fmt::Debug + Sealed + Send + Sync {
+    fn handle_server_hello(
+        &self,
+        suite: &'static T,
+        server_hello: &ServerHelloPayload,
+        message: &Message<'_>,
+        st: ExpectServerHello,
+        cx: &mut ClientContext<'_>,
+    ) -> NextStateOrError;
 }

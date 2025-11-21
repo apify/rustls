@@ -6,7 +6,10 @@ use crate::conn::{ConnectionCommon, SideData};
 /// This type implements `io::Read` and `io::Write`, encapsulating
 /// a Connection `C` and an underlying transport `T`, such as a socket.
 ///
+/// Relies on [`ConnectionCommon::complete_io()`] to perform the necessary I/O.
+///
 /// This allows you to use a rustls Connection like a normal stream.
+#[expect(clippy::exhaustive_structs)]
 #[derive(Debug)]
 pub struct Stream<'a, C: 'a + ?Sized, T: 'a + Read + Write + ?Sized> {
     /// Our TLS connection
@@ -78,12 +81,6 @@ where
         self.prepare_read()?;
         self.conn.reader().read(buf)
     }
-
-    #[cfg(read_buf)]
-    fn read_buf(&mut self, cursor: core::io::BorrowedCursor<'_>) -> Result<()> {
-        self.prepare_read()?;
-        self.conn.reader().read_buf(cursor)
-    }
 }
 
 impl<'a, C, T, S> BufRead for Stream<'a, C, T>
@@ -153,10 +150,12 @@ where
 }
 
 /// This type implements `io::Read` and `io::Write`, encapsulating
-/// and owning a Connection `C` and an underlying blocking transport
-/// `T`, such as a socket.
+/// and owning a Connection `C` and an underlying transport `T`, such as a socket.
+///
+/// Relies on [`ConnectionCommon::complete_io()`] to perform the necessary I/O.
 ///
 /// This allows you to use a rustls Connection like a normal stream.
+#[expect(clippy::exhaustive_structs)]
 #[derive(Debug)]
 pub struct StreamOwned<C: Sized, T: Read + Write + Sized> {
     /// Our connection
@@ -219,11 +218,6 @@ where
 {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         self.as_stream().read(buf)
-    }
-
-    #[cfg(read_buf)]
-    fn read_buf(&mut self, cursor: core::io::BorrowedCursor<'_>) -> Result<()> {
-        self.as_stream().read_buf(cursor)
     }
 }
 

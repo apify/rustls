@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::prelude::v1::*;
 use std::{format, fs, println, vec};
 
-use super::base::Payload;
 use super::codec::Reader;
 use super::enums::AlertLevel;
-use super::message::{Message, OutboundOpaqueMessage, PlainMessage};
+use super::message::Message;
+use crate::crypto::cipher::{Payload, PlainMessage};
 use crate::enums::{AlertDescription, HandshakeType};
 use crate::msgs::base::{MaybeEmpty, NonEmpty, PayloadU8, PayloadU16, PayloadU24};
 
@@ -29,9 +29,7 @@ fn test_read_fuzz_corpus() {
         f.read_to_end(&mut bytes).unwrap();
 
         let mut rd = Reader::init(&bytes);
-        let msg = OutboundOpaqueMessage::read(&mut rd)
-            .unwrap()
-            .into_plain_message();
+        let msg = PlainMessage::read(&mut rd).unwrap();
         println!("{msg:?}");
 
         let Ok(msg) = Message::try_from(msg) else {
@@ -69,15 +67,15 @@ fn can_read_safari_client_hello_with_ip_address_in_sni_extension() {
         \x79\x2f\x33\x08\x68\x74\x74\x70\x2f\x31\x2e\x31\x00\x0b\x00\x02\
         \x01\x00\x00\x0a\x00\x0a\x00\x08\x00\x1d\x00\x17\x00\x18\x00\x19";
     let mut rd = Reader::init(bytes);
-    let m = OutboundOpaqueMessage::read(&mut rd).unwrap();
+    let m = PlainMessage::read(&mut rd).unwrap();
     println!("m = {m:?}");
-    Message::try_from(m.into_plain_message()).unwrap();
+    Message::try_from(m).unwrap();
 }
 
 #[test]
 fn alert_is_not_handshake() {
     let m = Message::build_alert(AlertLevel::Fatal, AlertDescription::DecodeError);
-    assert!(!m.is_handshake_type(HandshakeType::ClientHello));
+    assert_ne!(m.handshake_type(), Some(HandshakeType::ClientHello));
 }
 
 #[test]
@@ -90,9 +88,9 @@ fn construct_all_types() {
         &b"\x18\x03\x04\x00\x04\x11\x22\x33\x44"[..],
     ];
     for &bytes in samples.iter() {
-        let m = OutboundOpaqueMessage::read(&mut Reader::init(bytes)).unwrap();
+        let m = PlainMessage::read(&mut Reader::init(bytes)).unwrap();
         println!("m = {m:?}");
-        let m = Message::try_from(m.into_plain_message());
+        let m = Message::try_from(m);
         println!("m' = {m:?}");
     }
 }
@@ -110,7 +108,10 @@ fn debug_payload() {
     );
     assert_eq!(
         "01020304",
-        format!("{:?}", PayloadU24(Payload::new(vec![1, 2, 3, 4])))
+        format!(
+            "{:?}",
+            PayloadU24::<'static, NonEmpty>::from(Payload::new(vec![1, 2, 3, 4]))
+        )
     );
 }
 

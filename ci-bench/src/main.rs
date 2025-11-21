@@ -5,7 +5,6 @@
     clippy::use_self,
     clippy::upper_case_acronyms,
     elided_lifetimes_in_paths,
-    trivial_casts,
     trivial_numeric_casts,
     unreachable_pub,
     unused_import_braces,
@@ -26,16 +25,16 @@ use std::time::Instant;
 use anyhow::Context;
 use async_trait::async_trait;
 use clap::{Parser, Subcommand, ValueEnum};
-use fxhash::FxHashMap;
 use itertools::Itertools;
 use rayon::iter::Either;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use rustls::client::Resumption;
-use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom, aws_lc_rs, ring};
+use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom, TicketProducer, aws_lc_rs};
+use rustls::enums::{CipherSuite, ProtocolVersion};
 use rustls::server::{NoServerSessionStorage, ServerSessionMemoryCache, WebPkiClientVerifier};
 use rustls::{
-    CipherSuite, ClientConfig, ClientConnection, HandshakeKind, ProtocolVersion, RootCertStore,
-    ServerConfig, ServerConnection,
+    ClientConfig, ClientConnection, HandshakeKind, RootCertStore, ServerConfig, ServerConnection,
 };
 use rustls_test::KeyType;
 
@@ -43,16 +42,16 @@ use crate::benchmark::{
     AuthKeySource, Benchmark, BenchmarkKind, BenchmarkParams, ResumptionKind,
     get_reported_instr_count, validate_benchmarks,
 };
-use crate::callgrind::{CallgrindRunner, CountInstructions};
 use crate::util::async_io::{self, AsyncRead, AsyncWrite};
 use crate::util::transport::{
     read_handshake_message, read_plaintext_to_end_bounded, send_handshake_message,
     write_all_plaintext_bounded,
 };
+use crate::valgrind::{CallgrindRunner, CountInstructions, DhatRunner, MemoryDetails};
 
 mod benchmark;
-mod callgrind;
 mod util;
+mod valgrind;
 
 /// The size in bytes of the plaintext sent in the transfer benchmark
 const TRANSFER_PLAINTEXT_SIZE: usize = 1024 * 1024 * 10; // 10 MB
@@ -74,6 +73,9 @@ const RESUMED_HANDSHAKE_RUNS: usize = 30;
 /// The name of the file where the instruction counts are stored after a `run-all` run
 const ICOUNTS_FILENAME: &str = "icounts.csv";
 
+/// The name of the file where the memory data are stored after a `run-all` run
+const MEMORY_FILENAME: &str = "memory.csv";
+
 /// Default size in bytes for internal buffers (256 KB)
 const DEFAULT_BUFFER_SIZE: usize = 262144;
 
@@ -92,14 +94,26 @@ pub enum Command {
         output_dir: PathBuf,
     },
     /// Run a single benchmark at the provided index (used by the bench runner to start each benchmark in its own process)
-    RunSingle { index: u32, side: Side },
+    RunSingle {
+        index: u32,
+        side: Side,
+        measurement_mode: Mode,
+    },
     /// Run all benchmarks in walltime mode and print the measured timings in CSV format
     Walltime {
         #[arg(short, long)]
         iterations_per_scenario: usize,
     },
-    /// Compare the results from two previous benchmark runs and print a user-friendly markdown overview
+    /// Compare the icount results from two previous benchmark runs and print a user-friendly markdown overview
     Compare {
+        /// Path to the directory with the results of a previous `run-all` execution
+        baseline_dir: PathBuf,
+        /// Path to the directory with the results of a previous `run-all` execution
+        candidate_dir: PathBuf,
+    },
+    /// Compare the memory results from two previous benchmark runs and print a user-friendly markdown overview
+    CompareMemory {
+        comparator: CompareMemoryOperand,
         /// Path to the directory with the results of a previous `run-all` execution
         baseline_dir: PathBuf,
         /// Path to the directory with the results of a previous `run-all` execution
@@ -107,10 +121,36 @@ pub enum Command {
     },
 }
 
+#[derive(Copy, Clone, Debug, Default, ValueEnum)]
+pub enum CompareMemoryOperand {
+    #[default]
+    TotalBytes,
+    TotalBlocks,
+    PeakBytes,
+    PeakBlocks,
+}
+
+impl CompareMemoryOperand {
+    fn choose(&self, memory: MemoryDetails) -> u64 {
+        match self {
+            Self::TotalBytes => memory.heap_total_bytes,
+            Self::TotalBlocks => memory.heap_total_blocks,
+            Self::PeakBytes => memory.heap_peak_bytes,
+            Self::PeakBlocks => memory.heap_peak_blocks,
+        }
+    }
+}
+
 #[derive(Copy, Clone, ValueEnum)]
 pub enum Side {
     Server,
     Client,
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+pub enum Mode {
+    Instruction,
+    Memory,
 }
 
 impl Side {
@@ -135,20 +175,35 @@ fn main() -> anyhow::Result<()> {
             // Output results in CSV (note: not using a library here to avoid extra dependencies)
             let mut csv_file = File::create(output_dir.join(ICOUNTS_FILENAME))
                 .context("cannot create output csv file")?;
-            for (name, instr_count) in results {
-                writeln!(csv_file, "{name},{instr_count}")?;
-            }
-        }
-        Command::RunSingle { index, side } => {
-            // `u32::MAX` is used as a signal to do nothing and return. By "running" an empty
-            // benchmark we can measure the startup overhead.
-            if index == u32::MAX {
-                return Ok(());
+            for (name, combined) in &results {
+                writeln!(csv_file, "{name},{}", combined.instructions)?;
             }
 
+            let mut csv_file = File::create(output_dir.join(MEMORY_FILENAME))
+                .context("cannot create output csv file")?;
+            for (name, combined) in results {
+                writeln!(
+                    csv_file,
+                    "{name},{},{},{},{}",
+                    combined.memory.heap_total_bytes,
+                    combined.memory.heap_total_blocks,
+                    combined.memory.heap_peak_bytes,
+                    combined.memory.heap_peak_blocks,
+                )?;
+            }
+        }
+        Command::RunSingle {
+            index,
+            side,
+            measurement_mode,
+        } => {
             let bench = benchmarks
                 .get(index as usize)
                 .ok_or(anyhow::anyhow!("Benchmark not found: {index}"))?;
+
+            if let Some(warm_up) = bench.params.warm_up {
+                warm_up();
+            }
 
             let stdin_lock = io::stdin().lock();
             let stdout_lock = io::stdout().lock();
@@ -163,6 +218,13 @@ fn main() -> anyhow::Result<()> {
             // duration of the lock
             let mut stdin = unsafe { File::from_raw_fd(stdin_lock.as_raw_fd()) };
             let mut stdout = unsafe { File::from_raw_fd(stdout_lock.as_raw_fd()) };
+
+            // When measuring instructions, we do multiple resumed handshakes, for
+            // reasons explained in the comments to `RESUMED_HANDSHAKE_RUNS`.
+            let resumed_reps = match measurement_mode {
+                Mode::Instruction => RESUMED_HANDSHAKE_RUNS,
+                _ => 1,
+            };
 
             let handshake_buf = &mut [0u8; DEFAULT_BUFFER_SIZE];
             let resumption_kind = bench.kind.resumption_kind();
@@ -183,6 +245,7 @@ fn main() -> anyhow::Result<()> {
                                 ),
                             },
                             bench.kind,
+                            resumed_reps,
                         )
                         .await
                     }
@@ -197,6 +260,7 @@ fn main() -> anyhow::Result<()> {
                                 ),
                             },
                             bench.kind,
+                            resumed_reps,
                         )
                         .await
                     }
@@ -240,6 +304,7 @@ fn main() -> anyhow::Result<()> {
                                 config: ServerSideStepper::make_config(params, resumption_kind),
                             },
                             bench.kind,
+                            RESUMED_HANDSHAKE_RUNS,
                         )
                         .await
                     };
@@ -257,6 +322,7 @@ fn main() -> anyhow::Result<()> {
                                 config: ClientSideStepper::make_config(params, resumption_kind),
                             },
                             bench.kind,
+                            RESUMED_HANDSHAKE_RUNS,
                         )
                         .await
                     };
@@ -285,10 +351,21 @@ fn main() -> anyhow::Result<()> {
             baseline_dir,
             candidate_dir,
         } => {
-            let baseline = read_results(&baseline_dir.join(ICOUNTS_FILENAME))?;
-            let candidate = read_results(&candidate_dir.join(ICOUNTS_FILENAME))?;
-            let result = compare_results(&baseline_dir, &candidate_dir, &baseline, &candidate)?;
-            print_report(&result);
+            let baseline = read_icount_results(&baseline_dir.join(ICOUNTS_FILENAME))?;
+            let candidate = read_icount_results(&candidate_dir.join(ICOUNTS_FILENAME))?;
+            let result =
+                compare_icount_results(&baseline_dir, &candidate_dir, &baseline, &candidate)?;
+            print_icount_report(&result);
+        }
+        Command::CompareMemory {
+            comparator,
+            baseline_dir,
+            candidate_dir,
+        } => {
+            let baseline = read_memory_results(&baseline_dir.join(MEMORY_FILENAME))?;
+            let candidate = read_memory_results(&candidate_dir.join(MEMORY_FILENAME))?;
+
+            print_memory_report(&compare_memory_results(&baseline, &candidate, comparator)?);
         }
     }
 
@@ -310,117 +387,123 @@ fn all_benchmarks() -> anyhow::Result<Vec<Benchmark>> {
 fn all_benchmarks_params() -> Vec<BenchmarkParams> {
     let mut all = Vec::new();
 
-    for (provider, suites, ticketer, provider_name) in [
+    for (provider, ticketer, provider_name, warm_up) in [
         (
-            derandomize(ring::default_provider()),
-            ring::ALL_CIPHER_SUITES,
-            #[allow(trivial_casts)]
-            &(ring_ticketer as fn() -> Arc<dyn rustls::server::ProducesTickets>),
+            derandomize(rustls_ring::DEFAULT_PROVIDER),
+            &(ring_ticketer as fn() -> Arc<dyn TicketProducer>),
             "ring",
+            None,
         ),
         (
-            derandomize(aws_lc_rs::default_provider()),
-            aws_lc_rs::ALL_CIPHER_SUITES,
-            #[allow(trivial_casts)]
-            &(aws_lc_rs_ticketer as fn() -> Arc<dyn rustls::server::ProducesTickets>),
+            derandomize(aws_lc_rs::DEFAULT_PROVIDER),
+            &(aws_lc_rs_ticketer as fn() -> Arc<dyn TicketProducer>),
             "aws_lc_rs",
+            Some(warm_up_aws_lc_rs as fn()),
         ),
     ] {
         for (key_type, suite_name, version, name) in [
             (
                 KeyType::Rsa2048,
                 CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                &rustls::version::TLS12,
+                ProtocolVersion::TLSv1_2,
                 "1.2_rsa_aes",
             ),
             (
                 KeyType::Rsa2048,
                 CipherSuite::TLS13_AES_128_GCM_SHA256,
-                &rustls::version::TLS13,
+                ProtocolVersion::TLSv1_3,
                 "1.3_rsa_aes",
             ),
             (
                 KeyType::EcdsaP256,
                 CipherSuite::TLS13_AES_128_GCM_SHA256,
-                &rustls::version::TLS13,
+                ProtocolVersion::TLSv1_3,
                 "1.3_ecdsap256_aes",
             ),
             (
                 KeyType::EcdsaP384,
                 CipherSuite::TLS13_AES_128_GCM_SHA256,
-                &rustls::version::TLS13,
+                ProtocolVersion::TLSv1_3,
                 "1.3_ecdsap384_aes",
             ),
             (
                 KeyType::Rsa2048,
                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-                &rustls::version::TLS13,
+                ProtocolVersion::TLSv1_3,
                 "1.3_rsa_chacha",
             ),
             (
                 KeyType::EcdsaP256,
                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-                &rustls::version::TLS13,
+                ProtocolVersion::TLSv1_3,
                 "1.3_ecdsap256_chacha",
             ),
             (
                 KeyType::EcdsaP384,
                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-                &rustls::version::TLS13,
+                ProtocolVersion::TLSv1_3,
                 "1.3_ecdsap384_chacha",
             ),
         ] {
             all.push(BenchmarkParams::new(
-                provider.clone(),
+                select_suite(provider.clone(), suite_name),
                 ticketer,
                 AuthKeySource::KeyType(key_type),
-                find_suite(suites, suite_name),
                 version,
                 format!("{provider_name}_{name}"),
+                warm_up,
             ));
         }
     }
 
-    #[allow(trivial_casts)] // false positive
-    let make_ticketer = &((|| Arc::new(rustls_fuzzing_provider::Ticketer))
-        as fn() -> Arc<dyn rustls::server::ProducesTickets>);
+    let make_ticketer =
+        &((|| Arc::new(rustls_fuzzing_provider::Ticketer)) as fn() -> Arc<dyn TicketProducer>);
 
     all.push(BenchmarkParams::new(
-        rustls_fuzzing_provider::provider(),
+        rustls_fuzzing_provider::PROVIDER_TLS13.into(),
         make_ticketer,
         AuthKeySource::FuzzingProvider,
-        rustls_fuzzing_provider::TLS13_FUZZING_SUITE,
-        &rustls::version::TLS13,
+        ProtocolVersion::TLSv1_3,
         "1.3_no_crypto".to_string(),
+        None,
     ));
 
     all.push(BenchmarkParams::new(
-        rustls_fuzzing_provider::provider(),
+        rustls_fuzzing_provider::PROVIDER_TLS12.into(),
         make_ticketer,
         AuthKeySource::FuzzingProvider,
-        rustls_fuzzing_provider::TLS_FUZZING_SUITE,
-        &rustls::version::TLS12,
+        ProtocolVersion::TLSv1_2,
         "1.2_no_crypto".to_string(),
+        None,
     ));
 
     all
 }
 
-fn find_suite(
-    all: &[rustls::SupportedCipherSuite],
-    name: CipherSuite,
-) -> rustls::SupportedCipherSuite {
-    *all.iter()
-        .find(|suite| suite.suite() == name)
-        .unwrap_or_else(|| panic!("cannot find cipher suite {name:?}"))
+fn ring_ticketer() -> Arc<dyn TicketProducer> {
+    rustls_ring::DEFAULT_PROVIDER
+        .ticketer_factory
+        .ticketer()
+        .unwrap()
 }
 
-fn ring_ticketer() -> Arc<dyn rustls::server::ProducesTickets> {
-    ring::Ticketer::new().unwrap()
+fn aws_lc_rs_ticketer() -> Arc<dyn TicketProducer> {
+    aws_lc_rs::DEFAULT_PROVIDER
+        .ticketer_factory
+        .ticketer()
+        .unwrap()
 }
 
-fn aws_lc_rs_ticketer() -> Arc<dyn rustls::server::ProducesTickets> {
-    aws_lc_rs::Ticketer::new().unwrap()
+fn select_suite(mut provider: CryptoProvider, name: CipherSuite) -> Arc<CryptoProvider> {
+    provider
+        .tls12_cipher_suites
+        .to_mut()
+        .retain(|suite| suite.common.suite == name);
+    provider
+        .tls13_cipher_suites
+        .to_mut()
+        .retain(|suite| suite.common.suite == name);
+    provider.into()
 }
 
 fn derandomize(base: CryptoProvider) -> CryptoProvider {
@@ -428,6 +511,16 @@ fn derandomize(base: CryptoProvider) -> CryptoProvider {
         secure_random: &NotRandom,
         ..base
     }
+}
+
+fn warm_up_aws_lc_rs() {
+    // "Warm up" provider's actual entropy source.  aws-lc-rs particularly
+    // has an expensive process here, which is one-time (per calling thread)
+    // so not useful to include in benchmark measurements.
+    aws_lc_rs::DEFAULT_PROVIDER
+        .secure_random
+        .fill(&mut [0u8])
+        .unwrap();
 }
 
 #[derive(Debug)]
@@ -475,18 +568,31 @@ pub fn run_all(
     executable: String,
     output_dir: PathBuf,
     benches: &[Benchmark],
-) -> anyhow::Result<Vec<(String, u64)>> {
+) -> anyhow::Result<Vec<(String, CombinedMeasurement)>> {
+    for bench in benches {
+        if let Some(warm_up) = bench.params.warm_up {
+            warm_up();
+        }
+    }
+
     // Run the benchmarks in parallel
-    let runner = CallgrindRunner::new(executable, output_dir)?;
-    let results: Vec<_> = benches
+    let cg_runner = CallgrindRunner::new(executable.clone(), output_dir.clone())?;
+    let cg_results: Vec<_> = benches
         .par_iter()
         .enumerate()
-        .map(|(i, bench)| (bench, runner.run_bench(i as u32, bench)))
+        .map(|(i, bench)| (bench, cg_runner.run_bench(i as u32, bench)))
+        .collect();
+
+    let dh_runner = DhatRunner::new(executable, output_dir)?;
+    let dh_results: Vec<_> = benches
+        .par_iter()
+        .enumerate()
+        .map(|(i, bench)| (bench, dh_runner.run_bench(i as u32, bench)))
         .collect();
 
     // Report possible errors
-    let (errors, results): (Vec<_>, FxHashMap<_, _>) =
-        results
+    let (errors, cg_results): (Vec<_>, FxHashMap<_, _>) =
+        cg_results
             .into_iter()
             .partition_map(|(bench, result)| match result {
                 Err(_) => Either::Left(()),
@@ -498,16 +604,47 @@ pub fn run_all(
         // crashing
         anyhow::bail!("One or more benchmarks crashed");
     }
+    let (errors, dh_results): (Vec<_>, FxHashMap<_, _>) =
+        dh_results
+            .into_iter()
+            .partition_map(|(bench, result)| match result {
+                Err(_) => Either::Left(()),
+                Ok(heap_profile) => Either::Right((bench.name(), heap_profile)),
+            });
+    if !errors.is_empty() {
+        // Note: there is no need to explicitly report the names of each crashed benchmark, because
+        // names and other details are automatically printed to stderr by the child process upon
+        // crashing
+        anyhow::bail!("One or more benchmarks crashed");
+    }
 
     // Gather results keeping the original order of the benchmarks
     let mut measurements = Vec::new();
     for bench in benches {
-        let instr_counts = get_reported_instr_count(bench, &results);
-        measurements.push((bench.name_with_side(Side::Server), instr_counts.server));
-        measurements.push((bench.name_with_side(Side::Client), instr_counts.client));
+        let instr_counts = get_reported_instr_count(bench, &cg_results);
+        let memory = &dh_results[bench.name()];
+        measurements.push((
+            bench.name_with_side(Side::Server),
+            CombinedMeasurement {
+                instructions: instr_counts.server,
+                memory: memory.server,
+            },
+        ));
+        measurements.push((
+            bench.name_with_side(Side::Client),
+            CombinedMeasurement {
+                instructions: instr_counts.client,
+                memory: memory.client,
+            },
+        ));
     }
 
     Ok(measurements)
+}
+
+pub struct CombinedMeasurement {
+    instructions: u64,
+    memory: MemoryDetails,
 }
 
 /// Drives the different steps in a benchmark.
@@ -539,17 +676,7 @@ struct ClientSideStepper<'a> {
 
 impl ClientSideStepper<'_> {
     fn make_config(params: &BenchmarkParams, resume: ResumptionKind) -> Arc<ClientConfig> {
-        assert_eq!(params.ciphersuite.version(), params.version);
-
-        let cfg = ClientConfig::builder_with_provider(
-            CryptoProvider {
-                cipher_suites: vec![params.ciphersuite],
-                ..params.provider.clone()
-            }
-            .into(),
-        )
-        .with_protocol_versions(&[params.version])
-        .unwrap();
+        let cfg = ClientConfig::builder(params.provider.clone());
 
         let mut cfg = match params.auth_key {
             AuthKeySource::KeyType(key_type) => {
@@ -560,12 +687,14 @@ impl ClientSideStepper<'_> {
 
                 cfg.with_root_certificates(root_store)
                     .with_no_client_auth()
+                    .unwrap()
             }
 
             AuthKeySource::FuzzingProvider => cfg
                 .dangerous()
                 .with_custom_certificate_verifier(rustls_fuzzing_provider::server_verifier())
-                .with_no_client_auth(),
+                .with_no_client_auth()
+                .unwrap(),
         };
 
         if resume != ResumptionKind::No {
@@ -634,27 +763,24 @@ struct ServerSideStepper<'a> {
 
 impl ServerSideStepper<'_> {
     fn make_config(params: &BenchmarkParams, resume: ResumptionKind) -> Arc<ServerConfig> {
-        assert_eq!(params.ciphersuite.version(), params.version);
-
-        let cfg = ServerConfig::builder_with_provider(params.provider.clone().into())
-            .with_protocol_versions(&[params.version])
-            .unwrap();
+        let cfg = ServerConfig::builder(params.provider.clone());
 
         let mut cfg = match params.auth_key {
             AuthKeySource::KeyType(key_type) => cfg
                 .with_client_cert_verifier(WebPkiClientVerifier::no_client_auth())
-                .with_single_cert(key_type.get_chain(), key_type.get_key())
+                .with_single_cert(key_type.identity(), key_type.key())
                 .expect("bad certs/private key?"),
 
             AuthKeySource::FuzzingProvider => cfg
                 .with_client_cert_verifier(WebPkiClientVerifier::no_client_auth())
-                .with_cert_resolver(rustls_fuzzing_provider::server_cert_resolver()),
+                .with_server_credential_resolver(rustls_fuzzing_provider::server_cert_resolver())
+                .unwrap(),
         };
 
         if resume == ResumptionKind::SessionId {
             cfg.session_storage = ServerSessionMemoryCache::new(128);
         } else if resume == ResumptionKind::Tickets {
-            cfg.ticketer = (params.ticketer)();
+            cfg.ticketer = Some((params.ticketer)());
         } else {
             cfg.session_storage = Arc::new(NoServerSessionStorage {});
         }
@@ -697,7 +823,11 @@ impl BenchStepper for ServerSideStepper<'_> {
 }
 
 /// Runs the benchmark using the provided stepper
-async fn run_bench<T: BenchStepper>(mut stepper: T, kind: BenchmarkKind) -> anyhow::Result<()> {
+async fn run_bench<T: BenchStepper>(
+    mut stepper: T,
+    kind: BenchmarkKind,
+    resumed_reps: usize,
+) -> anyhow::Result<()> {
     match kind {
         BenchmarkKind::Handshake(ResumptionKind::No) => {
             // Just count instructions for one handshake.
@@ -709,10 +839,8 @@ async fn run_bench<T: BenchStepper>(mut stepper: T, kind: BenchmarkKind) -> anyh
             // session ID / ticket.  This is not measured.
             stepper.handshake().await?;
 
-            // From now on we can perform resumed handshakes. We do it multiple
-            // times, for reasons explained in the comments to `RESUMED_HANDSHAKE_RUNS`.
             let _count = CountInstructions::start();
-            for _ in 0..RESUMED_HANDSHAKE_RUNS {
+            for _ in 0..resumed_reps {
                 // Wait for the endpoints to sync (i.e. the server must have discarded the previous
                 // connection and be ready for a new handshake, otherwise the client will start a
                 // handshake before the server is ready and the bytes will be fed to the old
@@ -747,6 +875,13 @@ struct CompareResult {
     missing_in_baseline: Vec<String>,
 }
 
+/// The results of a comparison between two `run-all` executions
+struct MemoryCompareResult {
+    diffs: Vec<MemoryDiff>,
+    /// Benchmark scenarios present in the candidate but missing in the baseline
+    missing_in_baseline: Vec<String>,
+}
+
 /// Contains information about instruction counts and their difference for a specific scenario
 #[derive(Clone)]
 struct Diff {
@@ -757,8 +892,19 @@ struct Diff {
     diff_ratio: f64,
 }
 
+/// Contains information about memory usage and a difference for a specific scenario & comparator
+#[derive(Clone)]
+struct MemoryDiff {
+    scenario: String,
+    baseline: MemoryDetails,
+    candidate: MemoryDetails,
+    comparator: CompareMemoryOperand,
+    diff: i64,
+    diff_ratio: f64,
+}
+
 /// Reads the (benchmark, instruction count) pairs from previous CSV output
-fn read_results(path: &Path) -> anyhow::Result<HashMap<String, u64>> {
+fn read_icount_results(path: &Path) -> anyhow::Result<HashMap<String, u64>> {
     let file = File::open(path).context(format!(
         "CSV file for comparison not found: {}",
         path.display()
@@ -785,9 +931,54 @@ fn read_results(path: &Path) -> anyhow::Result<HashMap<String, u64>> {
     Ok(measurements)
 }
 
+/// Reads the (benchmark, instruction count) pairs from previous CSV output
+fn read_memory_results(path: &Path) -> anyhow::Result<HashMap<String, MemoryDetails>> {
+    let file = File::open(path).context(format!(
+        "CSV file for comparison not found: {}",
+        path.display()
+    ))?;
+
+    let mut measurements = HashMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.context("Unable to read results from CSV file")?;
+        let line = line.trim();
+        let mut parts = line.split(',');
+        measurements.insert(
+            parts
+                .next()
+                .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                .to_string(),
+            MemoryDetails {
+                heap_total_bytes: parts
+                    .next()
+                    .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .parse()
+                    .context("Unable to parse heap total bytes from CSV")?,
+                heap_total_blocks: parts
+                    .next()
+                    .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .parse()
+                    .context("Unable to parse heap total blocks from CSV")?,
+                heap_peak_bytes: parts
+                    .next()
+                    .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .parse()
+                    .context("Unable to parse heap peak bytes from CSV")?,
+                heap_peak_blocks: parts
+                    .next()
+                    .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .parse()
+                    .context("Unable to parse heap peak blocks from CSV")?,
+            },
+        );
+    }
+
+    Ok(measurements)
+}
+
 /// Returns an internal representation of the comparison between the baseline and the candidate
 /// measurements
-fn compare_results(
+fn compare_icount_results(
     baseline_dir: &Path,
     candidate_dir: &Path,
     baseline: &HashMap<String, u64>,
@@ -824,7 +1015,7 @@ fn compare_results(
 
     let mut diffs_with_callgrind_diff = Vec::new();
     for diff in diffs {
-        let detailed_diff = callgrind::diff(baseline_dir, candidate_dir, &diff.scenario)?;
+        let detailed_diff = valgrind::callgrind_diff(baseline_dir, candidate_dir, &diff.scenario)?;
         diffs_with_callgrind_diff.push((diff, detailed_diff));
     }
 
@@ -834,8 +1025,54 @@ fn compare_results(
     })
 }
 
+/// Returns an internal representation of the comparison between the baseline and the candidate
+/// measurements
+fn compare_memory_results(
+    baseline: &HashMap<String, MemoryDetails>,
+    candidate: &HashMap<String, MemoryDetails>,
+    comparator: CompareMemoryOperand,
+) -> anyhow::Result<MemoryCompareResult> {
+    let mut diffs = Vec::new();
+    let mut missing = Vec::new();
+
+    for (scenario, &candidate_memory) in candidate {
+        let Some(&baseline_memory) = baseline.get(scenario) else {
+            missing.push(scenario.clone());
+            continue;
+        };
+
+        let candidate_count = comparator.choose(candidate_memory);
+        let baseline_count = comparator.choose(baseline_memory);
+
+        let diff = candidate_count as i64 - baseline_count as i64;
+        let diff_ratio = diff as f64 / baseline_count as f64;
+        let diff = MemoryDiff {
+            scenario: scenario.clone(),
+            baseline: baseline_memory,
+            candidate: candidate_memory,
+            comparator,
+            diff,
+            diff_ratio,
+        };
+
+        diffs.push(diff);
+    }
+
+    diffs.sort_by(|diff1, diff2| {
+        diff2
+            .diff_ratio
+            .abs()
+            .total_cmp(&diff1.diff_ratio.abs())
+    });
+
+    Ok(MemoryCompareResult {
+        diffs,
+        missing_in_baseline: missing,
+    })
+}
+
 /// Prints a report of the comparison to stdout, using GitHub-flavored markdown
-fn print_report(result: &CompareResult) {
+fn print_icount_report(result: &CompareResult) {
     println!("# Benchmark results");
 
     if !result.missing_in_baseline.is_empty() {
@@ -873,6 +1110,29 @@ fn print_report(result: &CompareResult) {
     }
 }
 
+fn print_memory_report(result: &MemoryCompareResult) {
+    println!("# Memory measurement results");
+
+    if !result.missing_in_baseline.is_empty() {
+        println!("### ⚠️ Warning: missing benchmarks");
+        println!();
+        println!(
+            "The following benchmark scenarios are present in the candidate but not in the baseline:"
+        );
+        println!();
+        for scenario in &result.missing_in_baseline {
+            println!("* {scenario}");
+        }
+    }
+
+    println!("## Memory measurement differences");
+    if result.diffs.is_empty() {
+        println!("_There are no memory measurement differences_");
+    } else {
+        memory_table(&result.diffs, true);
+    }
+}
+
 /// Renders the diffs as a markdown table
 fn table<'a>(diffs: impl Iterator<Item = &'a Diff>, emoji_feedback: bool) {
     println!("| Scenario | Baseline | Candidate | Diff |");
@@ -896,6 +1156,32 @@ fn table<'a>(diffs: impl Iterator<Item = &'a Diff>, emoji_feedback: bool) {
     }
 }
 
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+/// Renders the diffs as a markdown table
+fn memory_table(diffs: &[MemoryDiff], emoji_feedback: bool) {
+    println!("| Scenario | Baseline | Candidate | Diff |");
+    println!("| --- | ---: | ---: | ---: |");
+    for diff in diffs {
+        let emoji = match emoji_feedback {
+            true if diff.diff_ratio > 0.01 => "⚠️ ",
+            true if diff.diff_ratio < -0.01 => "✅ ",
+            _ => "",
+        };
+
+        println!(
+            "| {} | Total {}B / {}# <br/> Peak {}B / {}# | Total {}B / {}# <br/> Peak {}B / {}# | {:?} {}{} ({:.2}%) |",
+            diff.scenario,
+            diff.baseline.heap_total_bytes,
+            diff.baseline.heap_total_blocks,
+            diff.baseline.heap_peak_bytes,
+            diff.baseline.heap_peak_blocks,
+            diff.candidate.heap_total_bytes,
+            diff.candidate.heap_total_blocks,
+            diff.candidate.heap_peak_bytes,
+            diff.candidate.heap_peak_blocks,
+            diff.comparator,
+            emoji,
+            diff.diff,
+            diff.diff_ratio * 100.0
+        )
+    }
+}

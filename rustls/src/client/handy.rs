@@ -1,9 +1,10 @@
 use pki_types::ServerName;
 
-use crate::enums::SignatureScheme;
+use super::CredentialRequest;
+use crate::crypto::SelectedCredential;
+use crate::enums::CertificateType;
 use crate::msgs::persist;
-use crate::sync::Arc;
-use crate::{NamedGroup, client, sign};
+use crate::{NamedGroup, client};
 
 /// An implementer of `ClientSessionStore` which does nothing.
 #[derive(Debug)]
@@ -48,7 +49,6 @@ mod cache {
         kx_hint: Option<NamedGroup>,
 
         // Zero or one TLS1.2 sessions.
-        #[cfg(feature = "tls12")]
         tls12: Option<persist::Tls12ClientSessionValue>,
 
         // Up to MAX_TLS13_TICKETS_PER_SERVER TLS1.3 tickets, oldest first.
@@ -59,7 +59,6 @@ mod cache {
         fn default() -> Self {
             Self {
                 kx_hint: None,
-                #[cfg(feature = "tls12")]
                 tls12: None,
                 tls13: VecDeque::with_capacity(MAX_TLS13_TICKETS_PER_SERVER),
             }
@@ -116,39 +115,33 @@ mod cache {
 
         fn set_tls12_session(
             &self,
-            _server_name: ServerName<'static>,
-            _value: persist::Tls12ClientSessionValue,
+            server_name: ServerName<'static>,
+            value: persist::Tls12ClientSessionValue,
         ) {
-            #[cfg(feature = "tls12")]
             self.servers
                 .lock()
                 .unwrap()
-                .get_or_insert_default_and_edit(_server_name.clone(), |data| {
-                    data.tls12 = Some(_value)
+                .get_or_insert_default_and_edit(server_name.clone(), |data| {
+                    data.tls12 = Some(value)
                 });
         }
 
         fn tls12_session(
             &self,
-            _server_name: &ServerName<'_>,
+            server_name: &ServerName<'_>,
         ) -> Option<persist::Tls12ClientSessionValue> {
-            #[cfg(not(feature = "tls12"))]
-            return None;
-
-            #[cfg(feature = "tls12")]
             self.servers
                 .lock()
                 .unwrap()
-                .get(_server_name)
+                .get(server_name)
                 .and_then(|sd| sd.tls12.as_ref().cloned())
         }
 
-        fn remove_tls12_session(&self, _server_name: &ServerName<'static>) {
-            #[cfg(feature = "tls12")]
+        fn remove_tls12_session(&self, server_name: &ServerName<'static>) {
             self.servers
                 .lock()
                 .unwrap()
-                .get_mut(_server_name)
+                .get_mut(server_name)
                 .and_then(|data| data.tls12.take());
         }
 
@@ -195,160 +188,114 @@ pub use cache::ClientSessionMemoryCache;
 #[derive(Debug)]
 pub(super) struct FailResolveClientCert {}
 
-impl client::ResolvesClientCert for FailResolveClientCert {
-    fn resolve(
-        &self,
-        _root_hint_subjects: &[&[u8]],
-        _sigschemes: &[SignatureScheme],
-    ) -> Option<Arc<sign::CertifiedKey>> {
+impl client::ClientCredentialResolver for FailResolveClientCert {
+    fn resolve(&self, _: &CredentialRequest<'_>) -> Option<SelectedCredential> {
         None
     }
 
-    fn has_certs(&self) -> bool {
-        false
-    }
-}
-
-/// An exemplar `ResolvesClientCert` implementation that always resolves to a single
-/// [RFC 7250] raw public key.
-///
-/// [RFC 7250]: https://tools.ietf.org/html/rfc7250
-#[derive(Clone, Debug)]
-pub struct AlwaysResolvesClientRawPublicKeys(Arc<sign::CertifiedKey>);
-impl AlwaysResolvesClientRawPublicKeys {
-    /// Create a new `AlwaysResolvesClientRawPublicKeys` instance.
-    pub fn new(certified_key: Arc<sign::CertifiedKey>) -> Self {
-        Self(certified_key)
-    }
-}
-
-impl client::ResolvesClientCert for AlwaysResolvesClientRawPublicKeys {
-    fn resolve(
-        &self,
-        _root_hint_subjects: &[&[u8]],
-        _sigschemes: &[SignatureScheme],
-    ) -> Option<Arc<sign::CertifiedKey>> {
-        Some(self.0.clone())
-    }
-
-    fn only_raw_public_keys(&self) -> bool {
-        true
-    }
-
-    /// Returns true if the resolver is ready to present an identity.
-    ///
-    /// Even though the function is called `has_certs`, it returns true
-    /// although only an RPK (Raw Public Key) is available, not an actual certificate.
-    fn has_certs(&self) -> bool {
-        true
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        &[]
     }
 }
 
 #[cfg(test)]
-#[macro_rules_attribute::apply(test_for_each_provider)]
 mod tests {
+    use core::time::Duration;
     use std::prelude::v1::*;
 
-    use pki_types::{ServerName, UnixTime};
+    use pki_types::{CertificateDer, ServerName, UnixTime};
 
     use super::NoClientSessionStorage;
-    use super::provider::cipher_suite;
-    use crate::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use crate::client::{ClientSessionStore, ResolvesClientCert};
+    use crate::TEST_PROVIDERS;
+    use crate::client::danger::{HandshakeSignatureValid, PeerVerified, ServerVerifier};
+    use crate::client::{ClientCredentialResolver, ClientSessionStore, CredentialRequest};
+    use crate::crypto::{
+        CertificateIdentity, Identity, SelectedCredential, tls12_suite, tls13_suite,
+    };
+    use crate::enums::{CertificateType, CipherSuite, SignatureScheme};
+    use crate::error::Error;
     use crate::msgs::base::PayloadU16;
     use crate::msgs::enums::NamedGroup;
-    use crate::msgs::handshake::CertificateChain;
-    #[cfg(feature = "tls12")]
     use crate::msgs::handshake::SessionId;
-    use crate::msgs::persist::Tls13ClientSessionValue;
-    use crate::pki_types::CertificateDer;
-    use crate::suites::SupportedCipherSuite;
+    use crate::msgs::persist::{Tls12ClientSessionValue, Tls13ClientSessionValue};
     use crate::sync::Arc;
-    use crate::{DigitallySignedStruct, Error, SignatureScheme, sign};
+    use crate::verify::{ServerIdentity, SignatureVerificationInput};
 
     #[test]
     fn test_noclientsessionstorage_does_nothing() {
         let c = NoClientSessionStorage {};
         let name = ServerName::try_from("example.com").unwrap();
         let now = UnixTime::now();
-        let server_cert_verifier: Arc<dyn ServerCertVerifier> = Arc::new(DummyServerCertVerifier);
-        let resolves_client_cert: Arc<dyn ResolvesClientCert> = Arc::new(DummyResolvesClientCert);
+        let server_cert_verifier: Arc<dyn ServerVerifier> = Arc::new(DummyServerVerifier);
+        let resolves_client_cert: Arc<dyn ClientCredentialResolver> =
+            Arc::new(DummyClientCredentialResolver);
 
         c.set_kx_hint(name.clone(), NamedGroup::X25519);
         assert_eq!(None, c.kx_hint(&name));
 
-        #[cfg(feature = "tls12")]
-        {
-            use crate::msgs::persist::Tls12ClientSessionValue;
-            let SupportedCipherSuite::Tls12(tls12_suite) =
-                cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-            else {
-                unreachable!()
-            };
+        for provider in TEST_PROVIDERS {
+            {
+                c.set_tls12_session(
+                    name.clone(),
+                    Tls12ClientSessionValue::new(
+                        tls12_suite(
+                            CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                            provider,
+                        ),
+                        SessionId::empty(),
+                        Arc::new(PayloadU16::empty()),
+                        &[0u8; 48],
+                        Identity::X509(CertificateIdentity {
+                            end_entity: CertificateDer::from(&[][..]),
+                            intermediates: Vec::new(),
+                        }),
+                        &server_cert_verifier,
+                        &resolves_client_cert,
+                        now,
+                        Duration::ZERO,
+                        true,
+                    ),
+                );
+                assert!(c.tls12_session(&name).is_none());
+                c.remove_tls12_session(&name);
+            }
 
-            c.set_tls12_session(
+            c.insert_tls13_ticket(
                 name.clone(),
-                Tls12ClientSessionValue::new(
-                    tls12_suite,
-                    SessionId::empty(),
+                Tls13ClientSessionValue::new(
+                    tls13_suite(CipherSuite::TLS13_AES_256_GCM_SHA384, provider),
                     Arc::new(PayloadU16::empty()),
                     &[],
-                    CertificateChain::default(),
+                    Identity::X509(CertificateIdentity {
+                        end_entity: CertificateDer::from(&[][..]),
+                        intermediates: Vec::new(),
+                    }),
                     &server_cert_verifier,
                     &resolves_client_cert,
                     now,
+                    Duration::ZERO,
                     0,
-                    true,
+                    0,
                 ),
             );
-            assert!(c.tls12_session(&name).is_none());
-            c.remove_tls12_session(&name);
-        }
 
-        let SupportedCipherSuite::Tls13(tls13_suite) = cipher_suite::TLS13_AES_256_GCM_SHA384
-        else {
-            unreachable!();
-        };
-        c.insert_tls13_ticket(
-            name.clone(),
-            Tls13ClientSessionValue::new(
-                tls13_suite,
-                Arc::new(PayloadU16::empty()),
-                &[],
-                CertificateChain::default(),
-                &server_cert_verifier,
-                &resolves_client_cert,
-                now,
-                0,
-                0,
-                0,
-            ),
-        );
-        assert!(c.take_tls13_ticket(&name).is_none());
+            assert!(c.take_tls13_ticket(&name).is_none());
+        }
     }
 
     #[derive(Debug)]
-    struct DummyServerCertVerifier;
+    struct DummyServerVerifier;
 
-    impl ServerCertVerifier for DummyServerCertVerifier {
+    impl ServerVerifier for DummyServerVerifier {
         #[cfg_attr(coverage_nightly, coverage(off))]
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, Error> {
+        fn verify_identity(&self, _identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
             unreachable!()
         }
 
         #[cfg_attr(coverage_nightly, coverage(off))]
         fn verify_tls12_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            _input: &SignatureVerificationInput<'_>,
         ) -> Result<HandshakeSignatureValid, Error> {
             unreachable!()
         }
@@ -356,9 +303,7 @@ mod tests {
         #[cfg_attr(coverage_nightly, coverage(off))]
         fn verify_tls13_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            _input: &SignatureVerificationInput<'_>,
         ) -> Result<HandshakeSignatureValid, Error> {
             unreachable!()
         }
@@ -367,23 +312,24 @@ mod tests {
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
             unreachable!()
         }
+
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        fn request_ocsp_response(&self) -> bool {
+            unreachable!()
+        }
     }
 
     #[derive(Debug)]
-    struct DummyResolvesClientCert;
+    struct DummyClientCredentialResolver;
 
-    impl ResolvesClientCert for DummyResolvesClientCert {
+    impl ClientCredentialResolver for DummyClientCredentialResolver {
         #[cfg_attr(coverage_nightly, coverage(off))]
-        fn resolve(
-            &self,
-            _root_hint_subjects: &[&[u8]],
-            _sigschemes: &[SignatureScheme],
-        ) -> Option<Arc<sign::CertifiedKey>> {
+        fn resolve(&self, _: &CredentialRequest<'_>) -> Option<SelectedCredential> {
             unreachable!()
         }
 
         #[cfg_attr(coverage_nightly, coverage(off))]
-        fn has_certs(&self) -> bool {
+        fn supported_certificate_types(&self) -> &'static [CertificateType] {
             unreachable!()
         }
     }

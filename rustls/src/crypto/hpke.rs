@@ -5,10 +5,11 @@ use core::fmt::Debug;
 use zeroize::Zeroize;
 
 use crate::Error;
-use crate::msgs::enums::HpkeKem;
-use crate::msgs::handshake::HpkeSymmetricCipherSuite;
+pub use crate::msgs::enums::{HpkeAead, HpkeKdf, HpkeKem};
+pub use crate::msgs::handshake::HpkeSymmetricCipherSuite;
 
 /// An HPKE suite, specifying a key encapsulation mechanism and a symmetric cipher suite.
+#[expect(clippy::exhaustive_structs)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HpkeSuite {
     /// The choice of HPKE key encapsulation mechanism.
@@ -107,6 +108,7 @@ pub trait HpkeOpener: Debug + Send + Sync + 'static {
 }
 
 /// An HPKE public key.
+#[expect(clippy::exhaustive_structs)]
 #[derive(Clone, Debug)]
 pub struct HpkePublicKey(pub Vec<u8>);
 
@@ -133,6 +135,7 @@ impl Drop for HpkePrivateKey {
 }
 
 /// An HPKE key pair, made of a matching public and private key.
+#[expect(clippy::exhaustive_structs)]
 pub struct HpkeKeyPair {
     /// A HPKE public key.
     pub public_key: HpkePublicKey,
@@ -141,5 +144,6 @@ pub struct HpkeKeyPair {
 }
 
 /// An encapsulated secret returned from setting up a sender or receiver context.
+#[expect(clippy::exhaustive_structs)]
 #[derive(Debug)]
 pub struct EncapsulatedSecret(pub Vec<u8>);

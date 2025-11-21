@@ -3,20 +3,40 @@ macro_rules! enum_builder {
     (
         $(#[doc = $comment:literal])*
         #[repr($uint:ty)]
+        $(#[$metas:meta])*
         $enum_vis:vis enum $enum_name:ident
         {
-          $( $enum_var:ident => $enum_val:literal),* $(,)?
-          $( !Debug:
-            $( $enum_var_nd:ident => $enum_val_nd:literal),* $(,)?
+          $(
+              $(#[$enum_metas:meta])*
+              $enum_var:ident => $enum_val:literal
+          ),*
+          $(,)?
+          $(
+              !Debug:
+              $(
+                  $(#[$enum_metas_no_debug:meta])*
+                  $enum_var_no_debug:ident => $enum_val_no_debug:literal
+              ),*
+              $(,)?
           )?
         }
     ) => {
         $(#[doc = $comment])*
+        $(#[$metas])*
         #[non_exhaustive]
         #[derive(PartialEq, Eq, Clone, Copy)]
         $enum_vis enum $enum_name {
-            $( $enum_var),*
-            $(, $($enum_var_nd),* )?
+            $(
+                $(#[$enum_metas])*
+                $enum_var
+            ),*
+            $(
+                ,
+                $(
+                    $(#[$enum_metas_no_debug])*
+                    $enum_var_no_debug
+                ),*
+            )?
             ,Unknown($uint)
         }
 
@@ -32,15 +52,13 @@ macro_rules! enum_builder {
             $enum_vis fn as_str(&self) -> Option<&'static str> {
                 match self {
                     $( $enum_name::$enum_var => Some(stringify!($enum_var))),*
-                    $(, $( $enum_name::$enum_var_nd => Some(stringify!($enum_var_nd))),* )?
+                    $(, $( $enum_name::$enum_var_no_debug => Some(stringify!($enum_var_no_debug))),* )?
                     ,$enum_name::Unknown(_) => None,
                 }
             }
         }
 
         impl Codec<'_> for $enum_name {
-            // NOTE(allow) fully qualified Vec is only needed in no-std mode
-            #[allow(unused_qualifications)]
             fn encode(&self, bytes: &mut alloc::vec::Vec<u8>) {
                 <$uint>::from(*self).encode(bytes);
             }
@@ -58,7 +76,7 @@ macro_rules! enum_builder {
             fn from(x: $uint) -> Self {
                 match x {
                     $($enum_val => $enum_name::$enum_var),*
-                    $(, $($enum_val_nd => $enum_name::$enum_var_nd),* )?
+                    $(, $($enum_val_no_debug => $enum_name::$enum_var_no_debug),* )?
                     , x => $enum_name::Unknown(x),
                 }
             }
@@ -68,7 +86,7 @@ macro_rules! enum_builder {
             fn from(value: $enum_name) -> Self {
                 match value {
                     $( $enum_name::$enum_var => $enum_val),*
-                    $(, $( $enum_name::$enum_var_nd => $enum_val_nd),* )?
+                    $(, $( $enum_name::$enum_var_no_debug => $enum_val_no_debug),* )?
                     ,$enum_name::Unknown(x) => x
                 }
             }

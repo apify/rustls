@@ -21,25 +21,26 @@ mod connection {
     use core::fmt::{self, Debug};
     use core::ops::{Deref, DerefMut};
 
-    use pki_types::ServerName;
+    use pki_types::{DnsName, ServerName};
 
     use super::{DirectionalKeys, KeyChange, Version};
     use crate::client::{ClientConfig, ClientConnectionData};
     use crate::common_state::{CommonState, DEFAULT_BUFFER_LIMIT, Protocol};
-    use crate::conn::{ConnectionCore, SideData};
+    use crate::conn::{ConnectionCore, KeyingMaterialExporter, SideData};
+    use crate::crypto::cipher::{InboundPlainMessage, Payload};
     use crate::enums::{AlertDescription, ContentType, ProtocolVersion};
-    use crate::error::Error;
-    use crate::msgs::base::Payload;
+    use crate::error::{ApiMisuse, Error};
     use crate::msgs::deframer::buffers::{DeframerVecBuffer, Locator};
     use crate::msgs::handshake::{
         ClientExtensionsInput, ServerExtensionsInput, TransportParameters,
     };
-    use crate::msgs::message::InboundPlainMessage;
     use crate::server::{ServerConfig, ServerConnectionData};
+    use crate::suites::SupportedCipherSuite;
     use crate::sync::Arc;
     use crate::vecbuf::ChunkVecBuffer;
 
     /// A QUIC client or server connection.
+    #[expect(clippy::exhaustive_enums)]
     #[derive(Debug)]
     pub enum Connection {
         /// A client connection
@@ -94,38 +95,6 @@ mod connection {
             match self {
                 Self::Client(conn) => conn.alert(),
                 Self::Server(conn) => conn.alert(),
-            }
-        }
-
-        /// Derives key material from the agreed connection secrets.
-        ///
-        /// This function fills in `output` with `output.len()` bytes of key
-        /// material derived from the master session secret using `label`
-        /// and `context` for diversification. Ownership of the buffer is taken
-        /// by the function and returned via the Ok result to ensure no key
-        /// material leaks if the function fails.
-        ///
-        /// See RFC5705 for more details on what this does and is for.
-        ///
-        /// For TLS1.3 connections, this function does not use the
-        /// "early" exporter at any point.
-        ///
-        /// This function fails if called prior to the handshake completing;
-        /// check with [`CommonState::is_handshaking`] first.
-        #[inline]
-        pub fn export_keying_material<T: AsMut<[u8]>>(
-            &self,
-            output: T,
-            label: &[u8],
-            context: Option<&[u8]>,
-        ) -> Result<T, Error> {
-            match self {
-                Self::Client(conn) => conn
-                    .core
-                    .export_keying_material(output, label, context),
-                Self::Server(conn) => conn
-                    .core
-                    .export_keying_material(output, label, context),
             }
         }
     }
@@ -183,21 +152,20 @@ mod connection {
             params: Vec<u8>,
             alpn_protocols: Vec<Vec<u8>>,
         ) -> Result<Self, Error> {
-            if !config.supports_version(ProtocolVersion::TLSv1_3) {
-                return Err(Error::General(
-                    "TLS 1.3 support is required for QUIC".into(),
-                ));
+            let suites = &config.provider.tls13_cipher_suites;
+            if suites.is_empty() {
+                return Err(ApiMisuse::QuicRequiresTls13Support.into());
             }
 
-            if !config.supports_protocol(Protocol::Quic) {
-                return Err(Error::General(
-                    "at least one ciphersuite must support QUIC".into(),
-                ));
+            if !suites
+                .iter()
+                .any(|scs| scs.quic.is_some())
+            {
+                return Err(ApiMisuse::NoQuicCompatibleCipherSuites.into());
             }
 
             let exts = ClientExtensionsInput {
                 transport_parameters: Some(match quic_version {
-                    Version::V1Draft => TransportParameters::QuicDraft(Payload::new(params)),
                     Version::V1 | Version::V2 => TransportParameters::Quic(Payload::new(params)),
                 }),
 
@@ -223,6 +191,23 @@ mod connection {
         /// Returns the number of TLS1.3 tickets that have been received.
         pub fn tls13_tickets_received(&self) -> u32 {
             self.inner.tls13_tickets_received
+        }
+
+        /// Returns an object that can derive key material from the agreed connection secrets.
+        ///
+        /// See [RFC5705][] for more details on what this is for.
+        ///
+        /// This function can be called at most once per connection.
+        ///
+        /// This function will error:
+        ///
+        /// - if called prior to the handshake completing; (check with
+        ///   [`CommonState::is_handshaking`] first).
+        /// - if called more than once per connection.
+        ///
+        /// [RFC5705]: https://datatracker.ietf.org/doc/html/rfc5705
+        pub fn exporter(&mut self) -> Result<KeyingMaterialExporter, Error> {
+            self.core.exporter()
         }
     }
 
@@ -268,27 +253,24 @@ mod connection {
             quic_version: Version,
             params: Vec<u8>,
         ) -> Result<Self, Error> {
-            if !config.supports_version(ProtocolVersion::TLSv1_3) {
-                return Err(Error::General(
-                    "TLS 1.3 support is required for QUIC".into(),
-                ));
+            let suites = &config.provider.tls13_cipher_suites;
+            if suites.is_empty() {
+                return Err(ApiMisuse::QuicRequiresTls13Support.into());
             }
 
-            if !config.supports_protocol(Protocol::Quic) {
-                return Err(Error::General(
-                    "at least one ciphersuite must support QUIC".into(),
-                ));
+            if !suites
+                .iter()
+                .any(|scs| scs.quic.is_some())
+            {
+                return Err(ApiMisuse::NoQuicCompatibleCipherSuites.into());
             }
 
             if config.max_early_data_size != 0 && config.max_early_data_size != 0xffff_ffff {
-                return Err(Error::General(
-                    "QUIC sessions must set a max early data of 0 or 2^32-1".into(),
-                ));
+                return Err(ApiMisuse::QuicRestrictsMaxEarlyDataSize.into());
             }
 
             let exts = ServerExtensionsInput {
                 transport_parameters: Some(match quic_version {
-                    Version::V1Draft => TransportParameters::QuicDraft(Payload::new(params)),
                     Version::V1 | Version::V2 => TransportParameters::Quic(Payload::new(params)),
                 }),
             };
@@ -323,8 +305,49 @@ mod connection {
         /// when the client provides the SNI extension.
         ///
         /// The server name is also used to match sessions during session resumption.
-        pub fn server_name(&self) -> Option<&str> {
-            self.inner.core.get_sni_str()
+        pub fn server_name(&self) -> Option<&DnsName<'_>> {
+            self.inner.core.side.sni.as_ref()
+        }
+
+        /// Set the resumption data to embed in future resumption tickets supplied to the client.
+        ///
+        /// Defaults to the empty byte string. Must be less than 2^15 bytes to allow room for other
+        /// data. Should be called while `is_handshaking` returns true to ensure all transmitted
+        /// resumption tickets are affected.
+        ///
+        /// Integrity will be assured by rustls, but the data will be visible to the client. If secrecy
+        /// from the client is desired, encrypt the data separately.
+        pub fn set_resumption_data(&mut self, data: &[u8]) {
+            assert!(data.len() < 2usize.pow(15));
+            self.inner.core.side.resumption_data = data.into();
+        }
+
+        /// Retrieves the resumption data supplied by the client, if any.
+        ///
+        /// Returns `Some` if and only if a valid resumption ticket has been received from the client.
+        pub fn received_resumption_data(&self) -> Option<&[u8]> {
+            self.inner
+                .core
+                .side
+                .received_resumption_data
+                .as_deref()
+        }
+
+        /// Returns an object that can derive key material from the agreed connection secrets.
+        ///
+        /// See [RFC5705][] for more details on what this is for.
+        ///
+        /// This function can be called at most once per connection.
+        ///
+        /// This function will error:
+        ///
+        /// - if called prior to the handshake completing; (check with
+        ///   [`CommonState::is_handshaking`] first).
+        /// - if called more than once per connection.
+        ///
+        /// [RFC5705]: https://datatracker.ietf.org/doc/html/rfc5705
+        pub fn exporter(&mut self) -> Result<KeyingMaterialExporter, Error> {
+            self.core.exporter()
         }
     }
 
@@ -356,13 +379,13 @@ mod connection {
     }
 
     /// A shared interface for QUIC connections.
-    pub struct ConnectionCommon<Data> {
-        core: ConnectionCore<Data>,
+    pub struct ConnectionCommon<Side: SideData> {
+        core: ConnectionCore<Side>,
         deframer_buffer: DeframerVecBuffer,
         sendable_plaintext: ChunkVecBuffer,
     }
 
-    impl<Data: SideData> ConnectionCommon<Data> {
+    impl<Side: SideData> ConnectionCommon<Side> {
         /// Return the TLS-encoded transport parameters for the session's peer.
         ///
         /// While the transport parameters are technically available prior to the
@@ -385,7 +408,10 @@ mod connection {
                 .core
                 .common_state
                 .suite
-                .and_then(|suite| suite.tls13())?;
+                .and_then(|suite| match suite {
+                    SupportedCipherSuite::Tls13(suite) => Some(suite),
+                    _ => None,
+                })?;
             Some(DirectionalKeys::new(
                 suite,
                 suite.quic?,
@@ -442,7 +468,7 @@ mod connection {
         }
     }
 
-    impl<Data> Deref for ConnectionCommon<Data> {
+    impl<Side: SideData> Deref for ConnectionCommon<Side> {
         type Target = CommonState;
 
         fn deref(&self) -> &Self::Target {
@@ -450,14 +476,14 @@ mod connection {
         }
     }
 
-    impl<Data> DerefMut for ConnectionCommon<Data> {
+    impl<Side: SideData> DerefMut for ConnectionCommon<Side> {
         fn deref_mut(&mut self) -> &mut Self::Target {
             &mut self.core.common_state
         }
     }
 
-    impl<Data> From<ConnectionCore<Data>> for ConnectionCommon<Data> {
-        fn from(core: ConnectionCore<Data>) -> Self {
+    impl<Side: SideData> From<ConnectionCore<Side>> for ConnectionCommon<Side> {
+        fn from(core: ConnectionCore<Side>) -> Self {
             Self {
                 core,
                 deframer_buffer: DeframerVecBuffer::default(),
@@ -588,6 +614,7 @@ impl Secrets {
 }
 
 /// Keys used to communicate in a single direction
+#[expect(clippy::exhaustive_structs)]
 pub struct DirectionalKeys {
     /// Encrypts or decrypts a packet's headers
     pub header: Box<dyn HeaderProtectionKey>,
@@ -719,30 +746,38 @@ pub trait HeaderProtectionKey: Send + Sync {
 pub trait PacketKey: Send + Sync {
     /// Encrypt a QUIC packet
     ///
-    /// Takes a `packet_number`, used to derive the nonce; the packet `header`, which is used as
-    /// the additional authenticated data; and the `payload`. The authentication tag is returned if
-    /// encryption succeeds.
+    /// Takes a `packet_number` and optional `path_id`, used to derive the nonce; the packet
+    /// `header`, which is used as the additional authenticated data; and the `payload`. The
+    /// authentication tag is returned if encryption succeeds.
     ///
     /// Fails if and only if the payload is longer than allowed by the cipher suite's AEAD algorithm.
+    ///
+    /// When provided, the `path_id` is used for multipath encryption as described in
+    /// <https://www.ietf.org/archive/id/draft-ietf-quic-multipath-15.html#section-2.4>.
     fn encrypt_in_place(
         &self,
         packet_number: u64,
         header: &[u8],
         payload: &mut [u8],
+        path_id: Option<u32>,
     ) -> Result<Tag, Error>;
 
     /// Decrypt a QUIC packet
     ///
-    /// Takes the packet `header`, which is used as the additional authenticated data, and the
-    /// `payload`, which includes the authentication tag.
+    /// Takes a `packet_number` and optional `path_id`, used to derive the nonce; the packet
+    /// `header`, which is used as the additional authenticated data, and the `payload`, which
+    /// includes the authentication tag.
     ///
-    /// If the return value is `Ok`, the decrypted payload can be found in `payload`, up to the
-    /// length found in the return value.
+    /// On success, returns the slice of `payload` containing the decrypted data.
+    ///
+    /// When provided, the `path_id` is used for multipath encryption as described in
+    /// <https://www.ietf.org/archive/id/draft-ietf-quic-multipath-15.html#section-2.4>.
     fn decrypt_in_place<'a>(
         &self,
         packet_number: u64,
         header: &[u8],
         payload: &'a mut [u8],
+        path_id: Option<u32>,
     ) -> Result<&'a [u8], Error>;
 
     /// Tag length for the underlying AEAD algorithm
@@ -772,6 +807,7 @@ pub trait PacketKey: Send + Sync {
 }
 
 /// Packet protection keys for bidirectional 1-RTT communication
+#[expect(clippy::exhaustive_structs)]
 pub struct PacketKeySet {
     /// Encrypts outgoing packets
     pub local: Box<dyn PacketKey>,
@@ -790,14 +826,16 @@ impl PacketKeySet {
     }
 }
 
-pub(crate) struct KeyBuilder<'a> {
+/// Helper for building QUIC packet and header protection keys
+pub struct KeyBuilder<'a> {
     expander: Box<dyn HkdfExpander>,
     version: Version,
     alg: &'a dyn Algorithm,
 }
 
 impl<'a> KeyBuilder<'a> {
-    pub(crate) fn new(
+    /// Create a new KeyBuilder
+    pub fn new(
         secret: &OkmBlock,
         version: Version,
         alg: &'a dyn Algorithm,
@@ -811,7 +849,7 @@ impl<'a> KeyBuilder<'a> {
     }
 
     /// Derive packet keys
-    pub(crate) fn packet_key(&self) -> Box<dyn PacketKey> {
+    pub fn packet_key(&self) -> Box<dyn PacketKey> {
         let aead_key_len = self.alg.aead_key_len();
         let packet_key = hkdf_expand_label_aead_key(
             self.expander.as_ref(),
@@ -827,7 +865,7 @@ impl<'a> KeyBuilder<'a> {
     }
 
     /// Derive header protection keys
-    pub(crate) fn header_protection_key(&self) -> Box<dyn HeaderProtectionKey> {
+    pub fn header_protection_key(&self) -> Box<dyn HeaderProtectionKey> {
         let header_key = hkdf_expand_label_aead_key(
             self.expander.as_ref(),
             self.alg.aead_key_len(),
@@ -840,6 +878,7 @@ impl<'a> KeyBuilder<'a> {
 }
 
 /// Produces QUIC initial keys from a TLS 1.3 ciphersuite and a QUIC key generation algorithm.
+#[non_exhaustive]
 #[derive(Clone, Copy)]
 pub struct Suite {
     /// The TLS 1.3 ciphersuite used to derive keys.
@@ -862,6 +901,7 @@ impl Suite {
 }
 
 /// Complete set of keys used to communicate with the peer
+#[expect(clippy::exhaustive_structs)]
 pub struct Keys {
     /// Encrypts outgoing packets
     pub local: DirectionalKeys,
@@ -918,6 +958,7 @@ impl Keys {
 /// Once the 1-RTT keys have been exchanged, either side may initiate a key update. Progressive
 /// update keys can be obtained from the [`Secrets`] returned in [`KeyChange::OneRtt`]. Note that
 /// only packet keys are updated by key updates; header protection keys remain the same.
+#[expect(clippy::exhaustive_enums)]
 pub enum KeyChange {
     /// Keys for the handshake space
     Handshake {
@@ -937,11 +978,10 @@ pub enum KeyChange {
 ///
 /// Governs version-specific behavior in the TLS layer
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum Version {
-    /// Draft versions 29, 30, 31 and 32
-    V1Draft,
     /// First stable RFC
+    #[default]
     V1,
     /// Anti-ossification variant of V1
     V2,
@@ -950,18 +990,13 @@ pub enum Version {
 impl Version {
     fn initial_salt(self) -> &'static [u8; 20] {
         match self {
-            Self::V1Draft => &[
-                // https://datatracker.ietf.org/doc/html/draft-ietf-quic-tls-32#section-5.2
-                0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61,
-                0x11, 0xe0, 0x43, 0x90, 0xa8, 0x99,
-            ],
             Self::V1 => &[
                 // https://www.rfc-editor.org/rfc/rfc9001.html#name-initial-secrets
                 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8,
                 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
             ],
             Self::V2 => &[
-                // https://www.ietf.org/archive/id/draft-ietf-quic-v2-10.html#name-initial-salt-2
+                // https://tools.ietf.org/html/rfc9369.html#name-initial-salt
                 0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26,
                 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9,
             ],
@@ -971,7 +1006,7 @@ impl Version {
     /// Key derivation label for packet keys.
     pub(crate) fn packet_key_label(&self) -> &'static [u8] {
         match self {
-            Self::V1Draft | Self::V1 => b"quic key",
+            Self::V1 => b"quic key",
             Self::V2 => b"quicv2 key",
         }
     }
@@ -979,7 +1014,7 @@ impl Version {
     /// Key derivation label for packet "IV"s.
     pub(crate) fn packet_iv_label(&self) -> &'static [u8] {
         match self {
-            Self::V1Draft | Self::V1 => b"quic iv",
+            Self::V1 => b"quic iv",
             Self::V2 => b"quicv2 iv",
         }
     }
@@ -987,22 +1022,16 @@ impl Version {
     /// Key derivation for header keys.
     pub(crate) fn header_key_label(&self) -> &'static [u8] {
         match self {
-            Self::V1Draft | Self::V1 => b"quic hp",
+            Self::V1 => b"quic hp",
             Self::V2 => b"quicv2 hp",
         }
     }
 
     fn key_update_label(&self) -> &'static [u8] {
         match self {
-            Self::V1Draft | Self::V1 => b"quic ku",
+            Self::V1 => b"quic ku",
             Self::V2 => b"quicv2 ku",
         }
-    }
-}
-
-impl Default for Version {
-    fn default() -> Self {
-        Self::V1
     }
 }
 
@@ -1011,7 +1040,70 @@ mod tests {
     use std::prelude::v1::*;
 
     use super::PacketKey;
-    use crate::quic::HeaderProtectionKey;
+    use crate::crypto::tls13::OkmBlock;
+    use crate::enums::CipherSuite;
+    use crate::quic::{HeaderProtectionKey, Secrets, Version};
+    use crate::{Side, TEST_PROVIDERS};
+
+    #[test]
+    fn key_update_test_vector() {
+        fn equal_okm(x: &OkmBlock, y: &OkmBlock) -> bool {
+            x.as_ref() == y.as_ref()
+        }
+
+        for provider in TEST_PROVIDERS {
+            let aes_128_gcm = provider
+                .tls13_cipher_suites
+                .iter()
+                .find(|cs| cs.common.suite == CipherSuite::TLS13_AES_128_GCM_SHA256)
+                .unwrap();
+            let quic_suite = aes_128_gcm.quic.unwrap();
+
+            let mut secrets = Secrets::new(
+                // Constant dummy values for reproducibility
+                OkmBlock::new(
+                    &[
+                        0xb8, 0x76, 0x77, 0x08, 0xf8, 0x77, 0x23, 0x58, 0xa6, 0xea, 0x9f, 0xc4,
+                        0x3e, 0x4a, 0xdd, 0x2c, 0x96, 0x1b, 0x3f, 0x52, 0x87, 0xa6, 0xd1, 0x46,
+                        0x7e, 0xe0, 0xae, 0xab, 0x33, 0x72, 0x4d, 0xbf,
+                    ][..],
+                ),
+                OkmBlock::new(
+                    &[
+                        0x42, 0xdc, 0x97, 0x21, 0x40, 0xe0, 0xf2, 0xe3, 0x98, 0x45, 0xb7, 0x67,
+                        0x61, 0x34, 0x39, 0xdc, 0x67, 0x58, 0xca, 0x43, 0x25, 0x9b, 0x87, 0x85,
+                        0x06, 0x82, 0x4e, 0xb1, 0xe4, 0x38, 0xd8, 0x55,
+                    ][..],
+                ),
+                aes_128_gcm,
+                quic_suite,
+                Side::Client,
+                Version::V1,
+            );
+            secrets.update();
+
+            assert!(equal_okm(
+                &secrets.client,
+                &OkmBlock::new(
+                    &[
+                        0x42, 0xca, 0xc8, 0xc9, 0x1c, 0xd5, 0xeb, 0x40, 0x68, 0x2e, 0x43, 0x2e,
+                        0xdf, 0x2d, 0x2b, 0xe9, 0xf4, 0x1a, 0x52, 0xca, 0x6b, 0x22, 0xd8, 0xe6,
+                        0xcd, 0xb1, 0xe8, 0xac, 0xa9, 0x6, 0x1f, 0xce
+                    ][..]
+                )
+            ));
+            assert!(equal_okm(
+                &secrets.server,
+                &OkmBlock::new(
+                    &[
+                        0xeb, 0x7f, 0x5e, 0x2a, 0x12, 0x3f, 0x40, 0x7d, 0xb4, 0x99, 0xe3, 0x61,
+                        0xca, 0xe5, 0x90, 0xd4, 0xd9, 0x92, 0xe1, 0x4b, 0x7a, 0xce, 0x3, 0xc2,
+                        0x44, 0xe0, 0x42, 0x21, 0x15, 0xb6, 0xd3, 0x8a
+                    ][..]
+                )
+            ));
+        }
+    }
 
     #[test]
     fn auto_traits() {

@@ -9,17 +9,18 @@ use pki_types::{ServerName, UnixTime};
 use super::BrowserEmulator;
 use super::handy::NoClientSessionStorage;
 use super::hs::{self, ClientHelloInput};
-#[cfg(feature = "std")]
-use crate::WantsVerifier;
 use crate::builder::ConfigBuilder;
 use crate::client::{EchMode, EchStatus};
 use crate::common_state::{CommonState, Protocol, Side};
 use crate::conn::{ConnectionCore, UnbufferedConnectionCommon};
-use crate::crypto::{CryptoProvider, SupportedKxGroup};
-use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
+#[cfg(doc)]
+use crate::crypto;
+use crate::crypto::{CryptoProvider, SelectedCredential};
+use crate::enums::{CertificateType, CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::error::Error;
 use crate::kernel::KernelConnection;
 use crate::log::trace;
+use crate::msgs::deframer::buffers::Locator;
 use crate::msgs::enums::NamedGroup;
 use crate::msgs::handshake::ClientExtensionsInput;
 use crate::msgs::persist;
@@ -29,9 +30,7 @@ use crate::sync::Arc;
 use crate::time_provider::DefaultTimeProvider;
 use crate::time_provider::TimeProvider;
 use crate::unbuffered::{EncryptError, TransmitTlsData};
-#[cfg(doc)]
-use crate::{DistinguishedName, crypto};
-use crate::{KeyLog, WantsVersions, compress, sign, verify, versions};
+use crate::{DistinguishedName, KeyLog, WantsVerifier, compress, verify};
 
 /// A trait for the ability to store client session data, so that sessions
 /// can be resumed in future connections.
@@ -97,41 +96,70 @@ pub trait ClientSessionStore: fmt::Debug + Send + Sync {
 
 /// A trait for the ability to choose a certificate chain and
 /// private key for the purposes of client authentication.
-pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
-    /// Resolve a client certificate chain/private key to use as the client's
-    /// identity.
+pub trait ClientCredentialResolver: fmt::Debug + Send + Sync {
+    /// Resolve a client certificate chain/private key to use as the client's identity.
     ///
-    /// `root_hint_subjects` is an optional list of certificate authority
-    /// subject distinguished names that the client can use to help
-    /// decide on a client certificate the server is likely to accept. If
-    /// the list is empty, the client should send whatever certificate it
-    /// has. The hints are expected to be DER-encoded X.500 distinguished names,
-    /// per [RFC 5280 A.1]. See [`DistinguishedName`] for more information
-    /// on decoding with external crates like `x509-parser`.
-    ///
-    /// `sigschemes` is the list of the [`SignatureScheme`]s the server
-    /// supports.
+    /// The `SelectedCredential` returned from this method contains an identity and a
+    /// one-time-use [`Signer`] wrapping the private key. This is usually obtained via a
+    /// [`Credentials`], on which an implementation can call [`Credentials::signer()`].
+    /// An implementation can either store long-lived [`Credentials`] values, or instantiate
+    /// them as needed using one of its constructors.
     ///
     /// Return `None` to continue the handshake without any client
     /// authentication.  The server may reject the handshake later
     /// if it requires authentication.
     ///
     /// [RFC 5280 A.1]: https://www.rfc-editor.org/rfc/rfc5280#appendix-A.1
-    fn resolve(
-        &self,
-        root_hint_subjects: &[&[u8]],
-        sigschemes: &[SignatureScheme],
-    ) -> Option<Arc<sign::CertifiedKey>>;
-
-    /// Return true if the client only supports raw public keys.
     ///
-    /// See [RFC 7250](https://www.rfc-editor.org/rfc/rfc7250).
-    fn only_raw_public_keys(&self) -> bool {
-        false
+    /// [`Credentials`]: crate::crypto::Credentials
+    /// [`Credentials::signer()`]: crate::crypto::Credentials::signer
+    /// [`Signer`]: crate::crypto::Signer
+    fn resolve(&self, request: &CredentialRequest<'_>) -> Option<SelectedCredential>;
+
+    /// Returns which [`CertificateType`]s this resolver supports.
+    ///
+    /// Should return the empty slice if the resolver does not have any credentials to send.
+    /// Implementations should return the same value every time.
+    ///
+    /// See [RFC 7250](https://tools.ietf.org/html/rfc7250) for more information.
+    fn supported_certificate_types(&self) -> &'static [CertificateType];
+}
+
+/// Context from the server to inform client credential selection.
+pub struct CredentialRequest<'a> {
+    pub(super) negotiated_type: CertificateType,
+    pub(super) root_hint_subjects: &'a [DistinguishedName],
+    pub(super) signature_schemes: &'a [SignatureScheme],
+}
+
+impl CredentialRequest<'_> {
+    /// List of certificate authority subject distinguished names provided by the server.
+    ///
+    /// If the list is empty, the client should send whatever certificate it has. The hints
+    /// are expected to be DER-encoded X.500 distinguished names, per [RFC 5280 A.1]. Note that
+    /// the encoding comes from the server and has not been validated by rustls.
+    ///
+    /// See [`DistinguishedName`] for more information on decoding with external crates like
+    /// `x509-parser`.
+    ///
+    /// [`DistinguishedName`]: crate::DistinguishedName
+    pub fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.root_hint_subjects
     }
 
-    /// Return true if any certificates at all are available.
-    fn has_certs(&self) -> bool;
+    /// Get the compatible signature schemes.
+    pub fn signature_schemes(&self) -> &[SignatureScheme] {
+        self.signature_schemes
+    }
+
+    /// The negotiated certificate type.
+    ///
+    /// If the server does not support [RFC 7250], this will be `CertificateType::X509`.
+    ///
+    /// [RFC 7250]: https://tools.ietf.org/html/rfc7250
+    pub fn negotiated_type(&self) -> CertificateType {
+        self.negotiated_type
+    }
 }
 
 /// Common configuration for (typically) all connections made by a program.
@@ -141,7 +169,7 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
 /// (the rustls-native-certs crate is often used for this) may take on the order of a few hundred
 /// milliseconds.
 ///
-/// These must be created via the [`ClientConfig::builder()`] or [`ClientConfig::builder_with_provider()`]
+/// These must be created via the [`ClientConfig::builder()`] or [`ClientConfig::builder()`]
 /// function.
 ///
 /// Note that using [`ConfigBuilder<ClientConfig, WantsVersions>::with_ech()`] will produce a common
@@ -209,7 +237,7 @@ pub struct ClientConfig {
     pub max_fragment_size: Option<usize>,
 
     /// How to decide what client auth certificate/keys to use.
-    pub client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
+    pub client_auth_cert_resolver: Arc<dyn ClientCredentialResolver>,
 
     /// Whether to send the Server Name Indication (SNI) extension
     /// during the client handshake.
@@ -243,21 +271,16 @@ pub struct ClientConfig {
     ///
     /// [RFC 7627]: https://datatracker.ietf.org/doc/html/rfc7627
     /// [FIPS 140-3 IG.pdf]: https://csrc.nist.gov/csrc/media/Projects/cryptographic-module-validation-program/documents/fips%20140-3/FIPS%20140-3%20IG.pdf
-    #[cfg(feature = "tls12")]
     pub require_ems: bool,
 
     /// Provides the current system time
     pub time_provider: Arc<dyn TimeProvider>,
 
     /// Source of randomness and other crypto.
-    pub(super) provider: Arc<CryptoProvider>,
-
-    /// Supported versions, in no particular order.  The default
-    /// is all supported versions.
-    pub(super) versions: versions::EnabledVersions,
+    pub(crate) provider: Arc<CryptoProvider>,
 
     /// How to verify the server certificate chain.
-    pub(super) verifier: Arc<dyn verify::ServerCertVerifier>,
+    pub(super) verifier: Arc<dyn verify::ServerVerifier>,
 
     /// How to decompress the server's certificate chain.
     ///
@@ -294,61 +317,16 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-    /// Create a builder for a client configuration with
-    /// [the process-default `CryptoProvider`][CryptoProvider#using-the-per-process-default-cryptoprovider]
-    /// and safe protocol version defaults.
-    ///
-    /// For more information, see the [`ConfigBuilder`] documentation.
-    #[cfg(feature = "std")]
-    pub fn builder() -> ConfigBuilder<Self, WantsVerifier> {
-        Self::builder_with_protocol_versions(versions::DEFAULT_VERSIONS)
-    }
-
-    /// Create a builder for a client configuration with
-    /// [the process-default `CryptoProvider`][CryptoProvider#using-the-per-process-default-cryptoprovider]
-    /// and the provided protocol versions.
-    ///
-    /// Panics if
-    /// - the supported versions are not compatible with the provider (eg.
-    ///   the combination of ciphersuites supported by the provider and supported
-    ///   versions lead to zero cipher suites being usable),
-    /// - if a `CryptoProvider` cannot be resolved using a combination of
-    ///   the crate features and process default.
-    ///
-    /// For more information, see the [`ConfigBuilder`] documentation.
-    #[cfg(feature = "std")]
-    pub fn builder_with_protocol_versions(
-        versions: &[&'static versions::SupportedProtocolVersion],
-    ) -> ConfigBuilder<Self, WantsVerifier> {
-        // Safety assumptions:
-        // 1. that the provider has been installed (explicitly or implicitly)
-        // 2. that the process-level default provider is usable with the supplied protocol versions.
-        Self::builder_with_provider(
-            CryptoProvider::get_default_or_install_from_crate_features().clone(),
-        )
-        .with_protocol_versions(versions)
-        .unwrap()
-    }
-
     /// Create a builder for a client configuration with a specific [`CryptoProvider`].
     ///
-    /// This will use the provider's configured ciphersuites. You must additionally choose
-    /// which protocol versions to enable, using `with_protocol_versions` or
-    /// `with_safe_default_protocol_versions` and handling the `Result` in case a protocol
-    /// version is not supported by the provider's ciphersuites.
+    /// This will use the provider's configured ciphersuites.
     ///
     /// For more information, see the [`ConfigBuilder`] documentation.
     #[cfg(feature = "std")]
-    pub fn builder_with_provider(
-        provider: Arc<CryptoProvider>,
-    ) -> ConfigBuilder<Self, WantsVersions> {
-        ConfigBuilder {
-            state: WantsVersions {},
-            provider,
-            time_provider: Arc::new(DefaultTimeProvider),
-            side: PhantomData,
-        }
+    pub fn builder(provider: Arc<CryptoProvider>) -> ConfigBuilder<Self, WantsVerifier> {
+        Self::builder_with_details(provider, Arc::new(DefaultTimeProvider))
     }
+
     /// Create a builder for a client configuration with no default implementation details.
     ///
     /// This API must be used by `no_std` users.
@@ -357,18 +335,15 @@ impl ClientConfig {
     ///
     /// You must provide a specific [`CryptoProvider`].
     ///
-    /// This will use the provider's configured ciphersuites. You must additionally choose
-    /// which protocol versions to enable, using `with_protocol_versions` or
-    /// `with_safe_default_protocol_versions` and handling the `Result` in case a protocol
-    /// version is not supported by the provider's ciphersuites.
-    ///
     /// For more information, see the [`ConfigBuilder`] documentation.
     pub fn builder_with_details(
         provider: Arc<CryptoProvider>,
         time_provider: Arc<dyn TimeProvider>,
-    ) -> ConfigBuilder<Self, WantsVersions> {
+    ) -> ConfigBuilder<Self, WantsVerifier> {
         ConfigBuilder {
-            state: WantsVersions {},
+            state: WantsVerifier {
+                client_ech_mode: None,
+            },
             provider,
             time_provider,
             side: PhantomData,
@@ -382,12 +357,7 @@ impl ClientConfig {
     /// is concerned only with cryptography, whereas this _also_ covers TLS-level
     /// configuration that NIST recommends, as well as ECH HPKE suites if applicable.
     pub fn fips(&self) -> bool {
-        let mut is_fips = self.provider.fips();
-
-        #[cfg(feature = "tls12")]
-        {
-            is_fips = is_fips && self.require_ems
-        }
+        let mut is_fips = self.provider.fips() && self.require_ems;
 
         if let Some(ech_mode) = &self.ech_mode {
             is_fips = is_fips && ech_mode.fips();
@@ -411,44 +381,14 @@ impl ClientConfig {
         self.supports_version(ProtocolVersion::TLSv1_3)
     }
 
-    /// We support a given TLS version if it's quoted in the configured
-    /// versions *and* at least one ciphersuite for this version is
-    /// also configured.
     pub(crate) fn supports_version(&self, v: ProtocolVersion) -> bool {
-        self.versions.contains(v)
-            && self
-                .provider
-                .cipher_suites
-                .iter()
-                .any(|cs| cs.version().version == v)
-    }
-
-    #[cfg(feature = "std")]
-    pub(crate) fn supports_protocol(&self, proto: Protocol) -> bool {
-        self.provider
-            .cipher_suites
-            .iter()
-            .any(|cs| cs.usable_for_protocol(proto))
+        self.provider.supports_version(v)
     }
 
     pub(super) fn find_cipher_suite(&self, suite: CipherSuite) -> Option<SupportedCipherSuite> {
         self.provider
-            .cipher_suites
-            .iter()
-            .copied()
+            .iter_cipher_suites()
             .find(|&scs| scs.suite() == suite)
-    }
-
-    pub(super) fn find_kx_group(
-        &self,
-        group: NamedGroup,
-        version: ProtocolVersion,
-    ) -> Option<&'static dyn SupportedKxGroup> {
-        self.provider
-            .kx_groups
-            .iter()
-            .copied()
-            .find(|skxg| skxg.usable_for_version(version) && skxg.name() == group)
     }
 
     pub(super) fn current_time(&self) -> Result<UnixTime, Error> {
@@ -525,6 +465,7 @@ impl Default for Resumption {
 }
 
 /// What mechanisms to support for resuming a TLS 1.2 session.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tls12Resumption {
     /// Disable 1.2 resumption.
@@ -543,19 +484,19 @@ pub enum Tls12Resumption {
 /// Container for unsafe APIs
 pub(super) mod danger {
     use super::ClientConfig;
-    use super::verify::ServerCertVerifier;
+    use super::verify::ServerVerifier;
     use crate::sync::Arc;
 
     /// Accessor for dangerous configuration options.
     #[derive(Debug)]
     pub struct DangerousClientConfig<'a> {
         /// The underlying ClientConfig
-        pub cfg: &'a mut ClientConfig,
+        pub(super) cfg: &'a mut ClientConfig,
     }
 
     impl DangerousClientConfig<'_> {
-        /// Overrides the default `ServerCertVerifier` with something else.
-        pub fn set_certificate_verifier(&mut self, verifier: Arc<dyn ServerCertVerifier>) {
+        /// Overrides the default `ServerVerifier` with something else.
+        pub fn set_certificate_verifier(&mut self, verifier: Arc<dyn ServerVerifier>) {
             self.cfg.verifier = verifier;
         }
     }
@@ -649,15 +590,19 @@ mod connection {
     use pki_types::ServerName;
 
     use super::{ClientConnectionData, ClientExtensionsInput};
-    use crate::ClientConfig;
     use crate::client::EchStatus;
     use crate::common_state::Protocol;
     use crate::conn::{ConnectionCommon, ConnectionCore};
     use crate::error::Error;
     use crate::suites::ExtractedSecrets;
     use crate::sync::Arc;
+    use crate::{ClientConfig, KeyingMaterialExporter};
 
-    /// Stub that implements io::Write and dispatches to `write_early_data`.
+    /// Allows writing of early data in resumed TLS 1.3 connections.
+    ///
+    /// "Early data" is also known as "0-RTT data".
+    ///
+    /// This type implements [`io::Write`].
     pub struct WriteEarlyData<'a> {
         sess: &'a mut ClientConnection,
     }
@@ -673,9 +618,32 @@ mod connection {
             self.sess
                 .inner
                 .core
-                .data
+                .side
                 .early_data
                 .bytes_left()
+        }
+
+        /// Returns the "early" exporter that can derive key material for use in early data
+        ///
+        /// See [RFC5705][] for general details on what exporters are, and [RFC8446 S7.5][] for
+        /// specific details on the "early" exporter.
+        ///
+        /// **Beware** that the early exporter requires care, as it is subject to the same
+        /// potential for replay as early data itself.  See [RFC8446 appendix E.5.1][] for
+        /// more detail.
+        ///
+        /// This function can be called at most once per connection. This function will error:
+        /// if called more than once per connection.
+        ///
+        /// If you are looking for the normal exporter, this is available from
+        /// [`ConnectionCommon::exporter()`].
+        ///
+        /// [RFC5705]: https://datatracker.ietf.org/doc/html/rfc5705
+        /// [RFC8446 S7.5]: https://datatracker.ietf.org/doc/html/rfc8446#section-7.5
+        /// [RFC8446 appendix E.5.1]: https://datatracker.ietf.org/doc/html/rfc8446#appendix-E.5.1
+        /// [`ConnectionCommon::exporter()`]: crate::conn::ConnectionCommon::exporter()
+        pub fn exporter(&mut self) -> Result<KeyingMaterialExporter, Error> {
+            self.sess.core.early_exporter()
         }
     }
 
@@ -735,6 +703,7 @@ mod connection {
                 )?),
             })
         }
+
         /// Returns an `io::Write` implementer you can write bytes to
         /// to send TLS1.3 early data (a.k.a. "0-RTT data") to the server.
         ///
@@ -757,7 +726,7 @@ mod connection {
             if self
                 .inner
                 .core
-                .data
+                .side
                 .early_data
                 .is_enabled()
             {
@@ -784,7 +753,7 @@ mod connection {
 
         /// Return the connection's Encrypted Client Hello (ECH) status.
         pub fn ech_status(&self) -> EchStatus {
-            self.inner.core.data.ech_status
+            self.inner.core.side.ech_status
         }
 
         /// Returns the number of TLS1.3 tickets that have been received.
@@ -804,7 +773,7 @@ mod connection {
         fn write_early_data(&mut self, data: &[u8]) -> io::Result<usize> {
             self.inner
                 .core
-                .data
+                .side
                 .early_data
                 .check_write(data.len())
                 .map(|sz| {
@@ -867,18 +836,23 @@ impl ConnectionCore<ClientConnectionData> {
         let mut cx = hs::ClientContext {
             common: &mut common_state,
             data: &mut data,
+            // `start_handshake` won't read plaintext
+            plaintext_locator: &Locator::new(&[]),
+            received_plaintext: &mut None,
             // `start_handshake` won't produce plaintext
             sendable_plaintext: None,
         };
 
         let input = ClientHelloInput::new(name, &extra_exts, &mut cx, config)?;
         let state = input.start_handshake(extra_exts, &mut cx)?;
+        debug_assert!(cx.received_plaintext.is_none(), "read plaintext");
+
         Ok(Self::new(state, data, common_state))
     }
 
     #[cfg(feature = "std")]
     pub(crate) fn is_early_data_accepted(&self) -> bool {
-        self.data.early_data.is_accepted()
+        self.side.early_data.is_accepted()
     }
 }
 
@@ -982,7 +956,7 @@ impl TransmitTlsData<'_, ClientConnectionData> {
         if self
             .conn
             .core
-            .data
+            .side
             .early_data
             .is_enabled()
         {
@@ -1011,7 +985,7 @@ impl MayEncryptEarlyData<'_> {
         let Some(allowed) = self
             .conn
             .core
-            .data
+            .side
             .early_data
             .check_write_opt(early_data.len())
         else {
@@ -1027,6 +1001,7 @@ impl MayEncryptEarlyData<'_> {
 }
 
 /// Errors that may arise when encrypting early (RTT-0) data
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum EarlyDataError {
     /// Cannot encrypt more early data due to imposed limits
@@ -1051,7 +1026,7 @@ impl fmt::Display for EarlyDataError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for EarlyDataError {}
+impl core::error::Error for EarlyDataError {}
 
 /// State associated with a client connection.
 #[derive(Debug)]

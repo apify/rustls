@@ -58,10 +58,12 @@ use core::marker::PhantomData;
 
 use crate::client::ClientConnectionData;
 use crate::common_state::Protocol;
+use crate::crypto::Identity;
+use crate::enums::ProtocolVersion;
 use crate::msgs::codec::Codec;
-use crate::msgs::handshake::{CertificateChain, NewSessionTicketPayloadTls13};
+use crate::msgs::handshake::NewSessionTicketPayloadTls13;
 use crate::quic::Quic;
-use crate::{CommonState, ConnectionTrafficSecrets, Error, ProtocolVersion, SupportedCipherSuite};
+use crate::{CommonState, ConnectionTrafficSecrets, Error, SupportedCipherSuite};
 
 /// A kernel connection.
 ///
@@ -70,25 +72,25 @@ use crate::{CommonState, ConnectionTrafficSecrets, Error, ProtocolVersion, Suppo
 /// top of kTLS.
 ///
 /// See the [`crate::kernel`] module docs for more details.
-pub struct KernelConnection<Data> {
+pub struct KernelConnection<Side> {
     state: Box<dyn KernelState>,
 
-    peer_certificates: Option<CertificateChain<'static>>,
+    peer_identity: Option<Identity<'static>>,
     quic: Quic,
 
     negotiated_version: ProtocolVersion,
     protocol: Protocol,
     suite: SupportedCipherSuite,
 
-    _data: PhantomData<Data>,
+    _side: PhantomData<Side>,
 }
 
-impl<Data> KernelConnection<Data> {
+impl<Side> KernelConnection<Side> {
     pub(crate) fn new(state: Box<dyn KernelState>, common: CommonState) -> Result<Self, Error> {
         Ok(Self {
             state,
 
-            peer_certificates: common.peer_certificates,
+            peer_identity: common.peer_identity,
             quic: common.quic,
             negotiated_version: common
                 .negotiated_version
@@ -98,11 +100,11 @@ impl<Data> KernelConnection<Data> {
                 .suite
                 .ok_or(Error::HandshakeNotComplete)?,
 
-            _data: PhantomData,
+            _side: PhantomData,
         })
     }
 
-    /// Retrieves the ciphersuite agreed with the peer.
+    /// Retrieves the cipher suite agreed with the peer.
     pub fn negotiated_cipher_suite(&self) -> SupportedCipherSuite {
         self.suite
     }
@@ -165,7 +167,7 @@ impl KernelConnection<ClientConnectionData> {
     ///
     /// Code to parse out the payload should look something like this
     /// ```no_run
-    /// use rustls::{ContentType, HandshakeType};
+    /// use rustls::enums::{ContentType, HandshakeType};
     /// use rustls::kernel::KernelConnection;
     /// use rustls::client::ClientConnectionData;
     ///
@@ -225,7 +227,7 @@ impl KernelConnection<ClientConnectionData> {
 
         let nst = NewSessionTicketPayloadTls13::read_bytes(payload)?;
         let mut cx = KernelContext {
-            peer_certificates: self.peer_certificates.as_ref(),
+            peer_identity: self.peer_identity.as_ref(),
             protocol: self.protocol,
             quic: &self.quic,
         };
@@ -250,7 +252,7 @@ pub(crate) trait KernelState: Send + Sync {
 }
 
 pub(crate) struct KernelContext<'a> {
-    pub(crate) peer_certificates: Option<&'a CertificateChain<'static>>,
+    pub(crate) peer_identity: Option<&'a Identity<'static>>,
     pub(crate) protocol: Protocol,
     pub(crate) quic: &'a Quic,
 }

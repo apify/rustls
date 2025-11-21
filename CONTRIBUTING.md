@@ -59,7 +59,7 @@ If you're *looking* for security bugs, this crate is set up for
 ## Testing
 
 - Features involving additions to the public API should have (at least)
-  API-level tests (see [`rustls/tests/api.rs`](rustls/tests/api.rs)).
+  API-level tests (see [`rustls-test/tests/api/`](rustls-test/tests/api/)).
 - Protocol additions should have some coverage -- consider enabling
   corresponding tests in the bogo suite, or writing some ad hoc tests.
 
@@ -143,6 +143,22 @@ Here's a guide to how we like to order associated functions:
 Note that we usually also practice top-down ordering here; where these are in
 conflict, make a choice that you think makes sense. For getters and setters, the
 order should typically mirror the order of the fields in the type definition.
+
+#### Attribute ordering
+
+Order attributes so that documentation appears first, and the attributes with the
+most effect on the meaning and function of the type appear last.  For example:
+
+```rust
+/// Doc comment always first
+#[cfg(feature-gates)]
+#[allow(lint-configuration)]
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct Foo;
+```
+
+Prefer to write `derive`d traits in alphabetical order.
 
 ### Functions
 
@@ -360,6 +376,15 @@ We prefer to avoid type aliases as they obfuscate the underlying type and
 don't provide additional type safety. Using the
 [newtype idiom](https://doc.rust-lang.org/rust-by-example/generics/new_types.html)
 is one alternative when an abstraction boundary is worth the added complexity.
+
+#### Type exhaustiveness
+
+Public enums should be marked as _either_ `#[non_exhaustive]` or `#[allow(clippy::exhaustive_enums)]`.
+The latter is suitable for enums that are already complete by definition.  For example:
+`enum CoinFlip { Heads, Tails }` is complete.  Err on the side of marking something `#[non_exhaustive]`.
+
+The same applies to structs, with the detail that no manual marking is needed for
+structures with at least one private field.
 
 ## Design and Architecture
 

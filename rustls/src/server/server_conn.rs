@@ -1,3 +1,4 @@
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
@@ -10,32 +11,37 @@ use std::io;
 use pki_types::{DnsName, UnixTime};
 
 use super::hs;
-#[cfg(feature = "std")]
-use crate::WantsVerifier;
 use crate::builder::ConfigBuilder;
+#[cfg(feature = "std")]
+use crate::common_state::State;
 use crate::common_state::{CommonState, Side};
 #[cfg(feature = "std")]
-use crate::common_state::{Protocol, State};
-use crate::conn::{ConnectionCommon, ConnectionCore, UnbufferedConnectionCommon};
+use crate::conn::ConnectionCommon;
+use crate::conn::{ConnectionCore, UnbufferedConnectionCommon};
 #[cfg(doc)]
 use crate::crypto;
-use crate::crypto::CryptoProvider;
+use crate::crypto::cipher::Payload;
+use crate::crypto::{CryptoProvider, SelectedCredential, TicketProducer};
 use crate::enums::{CertificateType, CipherSuite, ProtocolVersion, SignatureScheme};
-use crate::error::Error;
+use crate::error::{Error, PeerMisbehaved};
 use crate::kernel::KernelConnection;
+#[cfg(feature = "std")]
 use crate::log::trace;
-use crate::msgs::base::Payload;
-use crate::msgs::handshake::{ClientHelloPayload, ProtocolName, ServerExtensionsInput};
+#[cfg(feature = "std")]
+use crate::msgs::deframer::buffers::Locator;
+#[cfg(feature = "std")]
+use crate::msgs::handshake::ClientHelloPayload;
+use crate::msgs::handshake::{ProtocolName, ServerExtensionsInput, ServerNamePayload};
+#[cfg(feature = "std")]
 use crate::msgs::message::Message;
+use crate::server::hs::ClientHelloInput;
 use crate::suites::ExtractedSecrets;
 use crate::sync::Arc;
 #[cfg(feature = "std")]
 use crate::time_provider::DefaultTimeProvider;
 use crate::time_provider::TimeProvider;
 use crate::vecbuf::ChunkVecBuffer;
-use crate::{
-    DistinguishedName, KeyLog, NamedGroup, WantsVersions, compress, sign, verify, versions,
-};
+use crate::{DistinguishedName, KeyLog, NamedGroup, WantsVerifier, compress, verify};
 
 /// A trait for the ability to store server session data.
 ///
@@ -79,39 +85,6 @@ pub trait StoresServerSessions: Debug + Send + Sync {
     fn can_cache(&self) -> bool;
 }
 
-/// A trait for the ability to encrypt and decrypt tickets.
-pub trait ProducesTickets: Debug + Send + Sync {
-    /// Returns true if this implementation will encrypt/decrypt
-    /// tickets.  Should return false if this is a dummy
-    /// implementation: the server will not send the SessionTicket
-    /// extension and will not call the other functions.
-    fn enabled(&self) -> bool;
-
-    /// Returns the lifetime in seconds of tickets produced now.
-    /// The lifetime is provided as a hint to clients that the
-    /// ticket will not be useful after the given time.
-    ///
-    /// This lifetime must be implemented by key rolling and
-    /// erasure, *not* by storing a lifetime in the ticket.
-    ///
-    /// The objective is to limit damage to forward secrecy caused
-    /// by tickets, not just limiting their lifetime.
-    fn lifetime(&self) -> u32;
-
-    /// Encrypt and authenticate `plain`, returning the resulting
-    /// ticket.  Return None if `plain` cannot be encrypted for
-    /// some reason: an empty ticket will be sent and the connection
-    /// will continue.
-    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>>;
-
-    /// Decrypt `cipher`, validating its authenticity protection
-    /// and recovering the plaintext.  `cipher` is fully attacker
-    /// controlled, so this decryption must be side-channel free,
-    /// panic-proof, and otherwise bullet-proof.  If the decryption
-    /// fails, return None.
-    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>>;
-}
-
 /// How to choose a certificate chain and signing key for use
 /// in server authentication.
 ///
@@ -121,23 +94,43 @@ pub trait ProducesTickets: Debug + Send + Sync {
 /// For applications that use async I/O and need to do I/O to choose
 /// a certificate (for instance, fetching a certificate from a data store),
 /// the [`Acceptor`] interface is more suitable.
-pub trait ResolvesServerCert: Debug + Send + Sync {
-    /// Choose a certificate chain and matching key given simplified
-    /// ClientHello information.
+pub trait ServerCredentialResolver: Debug + Send + Sync {
+    /// Choose a certificate chain and matching key given simplified ClientHello information.
     ///
-    /// Return `None` to abort the handshake.
-    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>>;
+    /// The `SelectedCredential` returned from this method contains an identity and a
+    /// one-time-use [`Signer`] wrapping the private key. This is usually obtained via a
+    /// [`Credentials`], on which an implementation can call [`Credentials::signer()`].
+    /// An implementation can either store long-lived [`Credentials`] values, or instantiate
+    /// them as needed using one of its constructors.
+    ///
+    /// Yielding an `Error` will abort the handshake. Some relevant error variants:
+    ///
+    /// * [`PeerIncompatible::NoSignatureSchemesInCommon`]
+    /// * [`PeerIncompatible::NoServerNameProvided`]
+    /// * [`Error::NoSuitableCertificate`]
+    ///
+    /// [`Credentials`]: crate::crypto::Credentials
+    /// [`Credentials::signer()`]: crate::crypto::Credentials::signer
+    /// [`Signer`]: crate::crypto::Signer
+    /// [`PeerIncompatible::NoSignatureSchemesInCommon`]: crate::error::PeerIncompatible::NoSignatureSchemesInCommon
+    /// [`PeerIncompatible::NoServerNameProvided`]: crate::error::PeerIncompatible::NoServerNameProvided
+    fn resolve(&self, client_hello: &ClientHello<'_>) -> Result<SelectedCredential, Error>;
 
-    /// Return true when the server only supports raw public keys.
-    fn only_raw_public_keys(&self) -> bool {
-        false
+    /// Returns which [`CertificateType`]s this resolver supports.
+    ///
+    /// Returning an empty slice will result in an error. The default implementation signals
+    /// support for X.509 certificates. Implementations should return the same value every time.
+    ///
+    /// See [RFC 7250](https://tools.ietf.org/html/rfc7250) for more information.
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        &[CertificateType::X509]
     }
 }
 
 /// A struct representing the received Client Hello
 #[derive(Debug)]
 pub struct ClientHello<'a> {
-    pub(super) server_name: &'a Option<DnsName<'a>>,
+    pub(super) server_name: Option<Cow<'a, DnsName<'a>>>,
     pub(super) signature_schemes: &'a [SignatureScheme],
     pub(super) alpn: Option<&'a Vec<ProtocolName>>,
     pub(super) server_cert_types: Option<&'a [CertificateType]>,
@@ -151,13 +144,44 @@ pub struct ClientHello<'a> {
 }
 
 impl<'a> ClientHello<'a> {
+    pub(super) fn new(
+        input: &'a ClientHelloInput<'a>,
+        sni: Option<&'a DnsName<'static>>,
+        version: ProtocolVersion,
+    ) -> Self {
+        Self {
+            server_name: sni.map(Cow::Borrowed),
+            signature_schemes: &input.sig_schemes,
+            alpn: input.client_hello.protocols.as_ref(),
+            client_cert_types: input
+                .client_hello
+                .client_certificate_types
+                .as_deref(),
+            server_cert_types: input
+                .client_hello
+                .server_certificate_types
+                .as_deref(),
+            cipher_suites: &input.client_hello.cipher_suites,
+            // We adhere to the TLS 1.2 RFC by not exposing this to the cert resolver if TLS version is 1.2
+            certificate_authorities: match version {
+                ProtocolVersion::TLSv1_2 => None,
+                _ => input
+                    .client_hello
+                    .certificate_authority_names
+                    .as_deref(),
+            },
+            named_groups: input
+                .client_hello
+                .named_groups
+                .as_deref(),
+        }
+    }
+
     /// Get the server name indicator.
     ///
     /// Returns `None` if the client did not supply a SNI.
-    pub fn server_name(&self) -> Option<&str> {
-        self.server_name
-            .as_ref()
-            .map(<DnsName<'_> as AsRef<str>>::as_ref)
+    pub fn server_name(&self) -> Option<&DnsName<'_>> {
+        self.server_name.as_deref()
     }
 
     /// Get the compatible signature schemes.
@@ -245,10 +269,10 @@ impl<'a> ClientHello<'a> {
 /// Common configuration for a set of server sessions.
 ///
 /// Making one of these is cheap, though one of the inputs may be expensive: gathering trust roots
-/// from the operating system to add to the [`RootCertStore`] passed to a `ClientCertVerifier`
+/// from the operating system to add to the [`RootCertStore`] passed to a `ClientVerifier`
 /// builder may take on the order of a few hundred milliseconds.
 ///
-/// These must be created via the [`ServerConfig::builder()`] or [`ServerConfig::builder_with_provider()`]
+/// These must be created via the [`ServerConfig::builder()`] or [`ServerConfig::builder()`]
 /// function.
 ///
 /// # Defaults
@@ -296,7 +320,7 @@ impl<'a> ClientHello<'a> {
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// Source of randomness and other crypto.
-    pub(super) provider: Arc<CryptoProvider>,
+    pub(crate) provider: Arc<CryptoProvider>,
 
     /// Ignore the client's ciphersuite order. Instead,
     /// choose the top ciphersuite in the server list
@@ -326,23 +350,19 @@ pub struct ServerConfig {
     ///
     /// See [ServerConfig#sharing-resumption-storage-between-serverconfigs]
     /// for a warning related to this field.
-    pub ticketer: Arc<dyn ProducesTickets>,
+    pub ticketer: Option<Arc<dyn TicketProducer>>,
 
     /// How to choose a server cert and key. This is usually set by
-    /// [ConfigBuilder::with_single_cert] or [ConfigBuilder::with_cert_resolver].
+    /// [ConfigBuilder::with_single_cert] or [ConfigBuilder::with_server_credential_resolver].
     /// For async applications, see also [Acceptor].
-    pub cert_resolver: Arc<dyn ResolvesServerCert>,
+    pub cert_resolver: Arc<dyn ServerCredentialResolver>,
 
     /// Protocol names we support, most preferred first.
     /// If empty we don't do ALPN at all.
     pub alpn_protocols: Vec<Vec<u8>>,
 
-    /// Supported protocol versions, in no particular order.
-    /// The default is all supported versions.
-    pub(super) versions: versions::EnabledVersions,
-
     /// How to verify client certificates.
-    pub(super) verifier: Arc<dyn verify::ClientCertVerifier>,
+    pub(super) verifier: Arc<dyn verify::ClientVerifier>,
 
     /// How to output key material for debugging.  The default
     /// does nothing.
@@ -410,7 +430,6 @@ pub struct ServerConfig {
     ///
     /// [RFC 7627]: https://datatracker.ietf.org/doc/html/rfc7627
     /// [FIPS 140-3 IG.pdf]: https://csrc.nist.gov/csrc/media/Projects/cryptographic-module-validation-program/documents/fips%20140-3/FIPS%20140-3%20IG.pdf
-    #[cfg(feature = "tls12")]
     pub require_ems: bool,
 
     /// Provides the current system time
@@ -446,63 +465,24 @@ pub struct ServerConfig {
     ///
     /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
+
+    /// Policy for how an invalid Server Name Indication (SNI) value from a client is handled.
+    pub invalid_sni_policy: InvalidSniPolicy,
 }
 
 impl ServerConfig {
-    /// Create a builder for a server configuration with
-    /// [the process-default `CryptoProvider`][CryptoProvider#using-the-per-process-default-cryptoprovider]
-    /// and safe protocol version defaults.
-    ///
-    /// For more information, see the [`ConfigBuilder`] documentation.
-    #[cfg(feature = "std")]
-    pub fn builder() -> ConfigBuilder<Self, WantsVerifier> {
-        Self::builder_with_protocol_versions(versions::DEFAULT_VERSIONS)
-    }
-
-    /// Create a builder for a server configuration with
-    /// [the process-default `CryptoProvider`][CryptoProvider#using-the-per-process-default-cryptoprovider]
-    /// and the provided protocol versions.
-    ///
-    /// Panics if
-    /// - the supported versions are not compatible with the provider (eg.
-    ///   the combination of ciphersuites supported by the provider and supported
-    ///   versions lead to zero cipher suites being usable),
-    /// - if a `CryptoProvider` cannot be resolved using a combination of
-    ///   the crate features and process default.
-    ///
-    /// For more information, see the [`ConfigBuilder`] documentation.
-    #[cfg(feature = "std")]
-    pub fn builder_with_protocol_versions(
-        versions: &[&'static versions::SupportedProtocolVersion],
-    ) -> ConfigBuilder<Self, WantsVerifier> {
-        // Safety assumptions:
-        // 1. that the provider has been installed (explicitly or implicitly)
-        // 2. that the process-level default provider is usable with the supplied protocol versions.
-        Self::builder_with_provider(
-            CryptoProvider::get_default_or_install_from_crate_features().clone(),
-        )
-        .with_protocol_versions(versions)
-        .unwrap()
-    }
-
     /// Create a builder for a server configuration with a specific [`CryptoProvider`].
     ///
-    /// This will use the provider's configured ciphersuites. You must additionally choose
-    /// which protocol versions to enable, using `with_protocol_versions` or
-    /// `with_safe_default_protocol_versions` and handling the `Result` in case a protocol
-    /// version is not supported by the provider's ciphersuites.
+    /// This will use the provider's configured ciphersuites.  This implies which TLS
+    /// protocol versions are enabled.
+    ///
+    /// This function always succeeds.  Any internal consistency problems with `provider`
+    /// are reported at the end of the builder process.
     ///
     /// For more information, see the [`ConfigBuilder`] documentation.
     #[cfg(feature = "std")]
-    pub fn builder_with_provider(
-        provider: Arc<CryptoProvider>,
-    ) -> ConfigBuilder<Self, WantsVersions> {
-        ConfigBuilder {
-            state: WantsVersions {},
-            provider,
-            time_provider: Arc::new(DefaultTimeProvider),
-            side: PhantomData,
-        }
+    pub fn builder(provider: Arc<CryptoProvider>) -> ConfigBuilder<Self, WantsVerifier> {
+        Self::builder_with_details(provider, Arc::new(DefaultTimeProvider))
     }
 
     /// Create a builder for a server configuration with no default implementation details.
@@ -513,18 +493,21 @@ impl ServerConfig {
     ///
     /// You must provide a specific [`CryptoProvider`].
     ///
-    /// This will use the provider's configured ciphersuites. You must additionally choose
-    /// which protocol versions to enable, using `with_protocol_versions` or
-    /// `with_safe_default_protocol_versions` and handling the `Result` in case a protocol
-    /// version is not supported by the provider's ciphersuites.
+    /// This will use the provider's configured ciphersuites.  This implies which TLS
+    /// protocol versions are enabled.
+    ///
+    /// This function always succeeds.  Any internal consistency problems with `provider`
+    /// are reported at the end of the builder process.
     ///
     /// For more information, see the [`ConfigBuilder`] documentation.
     pub fn builder_with_details(
         provider: Arc<CryptoProvider>,
         time_provider: Arc<dyn TimeProvider>,
-    ) -> ConfigBuilder<Self, WantsVersions> {
+    ) -> ConfigBuilder<Self, WantsVerifier> {
         ConfigBuilder {
-            state: WantsVersions {},
+            state: WantsVerifier {
+                client_ech_mode: None,
+            },
             provider,
             time_provider,
             side: PhantomData,
@@ -538,15 +521,7 @@ impl ServerConfig {
     /// is concerned only with cryptography, whereas this _also_ covers TLS-level
     /// configuration that NIST recommends.
     pub fn fips(&self) -> bool {
-        #[cfg(feature = "tls12")]
-        {
-            self.provider.fips() && self.require_ems
-        }
-
-        #[cfg(not(feature = "tls12"))]
-        {
-            self.provider.fips()
-        }
+        self.provider.fips() && self.require_ems
     }
 
     /// Return the crypto provider used to construct this client configuration.
@@ -554,30 +529,67 @@ impl ServerConfig {
         &self.provider
     }
 
-    /// We support a given TLS version if it's quoted in the configured
-    /// versions *and* at least one ciphersuite for this version is
-    /// also configured.
     pub(crate) fn supports_version(&self, v: ProtocolVersion) -> bool {
-        self.versions.contains(v)
-            && self
-                .provider
-                .cipher_suites
-                .iter()
-                .any(|cs| cs.version().version == v)
-    }
-
-    #[cfg(feature = "std")]
-    pub(crate) fn supports_protocol(&self, proto: Protocol) -> bool {
-        self.provider
-            .cipher_suites
-            .iter()
-            .any(|cs| cs.usable_for_protocol(proto))
+        self.provider.supports_version(v)
     }
 
     pub(super) fn current_time(&self) -> Result<UnixTime, Error> {
         self.time_provider
             .current_time()
             .ok_or(Error::FailedToGetCurrentTime)
+    }
+}
+
+/// A policy describing how an invalid Server Name Indication (SNI) value from a client is handled by the server.
+///
+/// The only valid form of SNI according to relevant RFCs ([RFC6066], [RFC1035]) is
+/// non-IP-address host name, however some misconfigured clients may send a bare IP address, or
+/// another invalid value. Some servers may wish to ignore these invalid values instead of producing
+/// an error.
+///
+/// By default, Rustls will ignore invalid values that are an IP address (the most common misconfiguration)
+/// and error for all other invalid values.
+///
+/// When an SNI value is ignored, Rustls treats the client as if it sent no SNI at all.
+///
+/// [RFC1035]: https://datatracker.ietf.org/doc/html/rfc1035#section-2.3.1
+/// [RFC6066]: https://datatracker.ietf.org/doc/html/rfc6066#section-3
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum InvalidSniPolicy {
+    /// Reject all ClientHello messages that contain an invalid SNI value.
+    RejectAll,
+    /// Ignore an invalid SNI value in ClientHello messages if the value is an IP address.
+    ///
+    /// "Ignoring SNI" means accepting the ClientHello message, but acting as if the client sent no SNI.
+    #[default]
+    IgnoreIpAddresses,
+    /// Ignore all invalid SNI in ClientHello messages.
+    ///
+    /// "Ignoring SNI" means accepting the ClientHello message, but acting as if the client sent no SNI.
+    IgnoreAll,
+}
+
+impl InvalidSniPolicy {
+    /// Returns the valid SNI value, or ignores the invalid SNI value if allowed by this policy; otherwise returns
+    /// an error.
+    pub(super) fn accept(
+        &self,
+        payload: Option<&ServerNamePayload<'_>>,
+    ) -> Result<Option<DnsName<'static>>, Error> {
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        if let Some(server_name) = payload.to_dns_name_normalized() {
+            return Ok(Some(server_name));
+        }
+        match (self, payload) {
+            (Self::IgnoreAll, _) => Ok(None),
+            (Self::IgnoreIpAddresses, ServerNamePayload::IpAddress) => Ok(None),
+            _ => Err(Error::PeerMisbehaved(
+                PeerMisbehaved::ServerNameMustContainOneHostName,
+            )),
+        }
     }
 }
 
@@ -589,14 +601,15 @@ mod connection {
     use core::ops::{Deref, DerefMut};
     use std::io;
 
-    use super::{
-        Accepted, Accepting, EarlyDataState, ServerConfig, ServerConnectionData,
-        ServerExtensionsInput,
-    };
-    use crate::common_state::{CommonState, Context, Side};
+    use pki_types::DnsName;
+
+    use super::{Accepted, Accepting, ServerConfig, ServerConnectionData, ServerExtensionsInput};
+    use crate::KeyingMaterialExporter;
+    use crate::common_state::{CommonState, Side};
     use crate::conn::{ConnectionCommon, ConnectionCore};
-    use crate::error::Error;
-    use crate::server::hs;
+    use crate::error::{ApiMisuse, Error};
+    use crate::msgs::deframer::buffers::Locator;
+    use crate::server::hs::{ClientHelloInput, ServerContext};
     use crate::suites::ExtractedSecrets;
     use crate::sync::Arc;
     use crate::vecbuf::ChunkVecBuffer;
@@ -605,25 +618,47 @@ mod connection {
     ///
     /// "Early data" is also known as "0-RTT data".
     ///
-    /// This structure implements [`std::io::Read`].
+    /// This type implements [`io::Read`].
     pub struct ReadEarlyData<'a> {
-        early_data: &'a mut EarlyDataState,
+        common: &'a mut ConnectionCommon<ServerConnectionData>,
     }
 
     impl<'a> ReadEarlyData<'a> {
-        fn new(early_data: &'a mut EarlyDataState) -> Self {
-            ReadEarlyData { early_data }
+        fn new(common: &'a mut ConnectionCommon<ServerConnectionData>) -> Self {
+            ReadEarlyData { common }
+        }
+
+        /// Returns the "early" exporter that can derive key material for use in early data
+        ///
+        /// See [RFC5705][] for general details on what exporters are, and [RFC8446 S7.5][] for
+        /// specific details on the "early" exporter.
+        ///
+        /// **Beware** that the early exporter requires care, as it is subject to the same
+        /// potential for replay as early data itself.  See [RFC8446 appendix E.5.1][] for
+        /// more detail.
+        ///
+        /// This function can be called at most once per connection. This function will error:
+        /// if called more than once per connection.
+        ///
+        /// If you are looking for the normal exporter, this is available from
+        /// [`ConnectionCommon::exporter()`].
+        ///
+        /// [RFC5705]: https://datatracker.ietf.org/doc/html/rfc5705
+        /// [RFC8446 S7.5]: https://datatracker.ietf.org/doc/html/rfc8446#section-7.5
+        /// [RFC8446 appendix E.5.1]: https://datatracker.ietf.org/doc/html/rfc8446#appendix-E.5.1
+        /// [`ConnectionCommon::exporter()`]: crate::conn::ConnectionCommon::exporter()
+        pub fn exporter(&mut self) -> Result<KeyingMaterialExporter, Error> {
+            self.common.core.early_exporter()
         }
     }
 
     impl io::Read for ReadEarlyData<'_> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.early_data.read(buf)
-        }
-
-        #[cfg(read_buf)]
-        fn read_buf(&mut self, cursor: core::io::BorrowedCursor<'_>) -> io::Result<()> {
-            self.early_data.read_buf(cursor)
+            self.common
+                .core
+                .side
+                .early_data
+                .read(buf)
         }
     }
 
@@ -662,8 +697,8 @@ mod connection {
         /// when the client provides the SNI extension.
         ///
         /// The server name is also used to match sessions during session resumption.
-        pub fn server_name(&self) -> Option<&str> {
-            self.inner.core.get_sni_str()
+        pub fn server_name(&self) -> Option<&DnsName<'_>> {
+            self.inner.core.side.sni.as_ref()
         }
 
         /// Application-controlled portion of the resumption ticket supplied by the client, if any.
@@ -674,7 +709,7 @@ mod connection {
         pub fn received_resumption_data(&self) -> Option<&[u8]> {
             self.inner
                 .core
-                .data
+                .side
                 .received_resumption_data
                 .as_ref()
                 .map(|x| &x[..])
@@ -690,7 +725,7 @@ mod connection {
         /// from the client is desired, encrypt the data separately.
         pub fn set_resumption_data(&mut self, data: &[u8]) {
             assert!(data.len() < 2usize.pow(15));
-            self.inner.core.data.resumption_data = data.into();
+            self.inner.core.side.resumption_data = data.into();
         }
 
         /// Explicitly discard early data, notifying the client
@@ -713,9 +748,14 @@ mod connection {
         /// - The connection doesn't resume an existing session.
         /// - The client hasn't sent a full ClientHello yet.
         pub fn early_data(&mut self) -> Option<ReadEarlyData<'_>> {
-            let data = &mut self.inner.core.data;
-            if data.early_data.was_accepted() {
-                Some(ReadEarlyData::new(&mut data.early_data))
+            if self
+                .inner
+                .core
+                .side
+                .early_data
+                .was_accepted()
+            {
+                Some(ReadEarlyData::new(&mut self.inner))
             } else {
                 None
             }
@@ -772,14 +812,14 @@ mod connection {
     /// characteristics of the `ClientHello`. In particular it is useful for
     /// servers that need to do some I/O to load a certificate and its private key
     /// and don't want to use the blocking interface provided by
-    /// [`super::ResolvesServerCert`].
+    /// [`super::ServerCredentialResolver`].
     ///
     /// Create an Acceptor with [`Acceptor::default()`].
     ///
     /// # Example
     ///
     /// ```no_run
-    /// # #[cfg(feature = "aws_lc_rs")] {
+    /// # #[cfg(feature = "aws-lc-rs")] {
     /// # fn choose_server_config(
     /// #     _: rustls::server::ClientHello,
     /// # ) -> std::sync::Arc<rustls::ServerConfig> {
@@ -840,8 +880,7 @@ mod connection {
         pub fn read_tls(&mut self, rd: &mut dyn io::Read) -> Result<usize, io::Error> {
             match &mut self.inner {
                 Some(conn) => conn.read_tls(rd),
-                None => Err(io::Error::new(
-                    io::ErrorKind::Other,
+                None => Err(io::Error::other(
                     "acceptor cannot read after successful acceptance",
                 )),
             }
@@ -861,7 +900,7 @@ mod connection {
         pub fn accept(&mut self) -> Result<Option<Accepted>, (Error, AcceptedAlert)> {
             let Some(mut connection) = self.inner.take() else {
                 return Err((
-                    Error::General("Acceptor polled after completion".into()),
+                    ApiMisuse::AcceptorPolledAfterCompletion.into(),
                     AcceptedAlert::empty(),
                 ));
             };
@@ -875,13 +914,22 @@ mod connection {
                 Err(err) => return Err((err, AcceptedAlert::from(connection))),
             };
 
-            let mut cx = Context::from(&mut connection);
-            let sig_schemes = match hs::process_client_hello(&message, false, &mut cx) {
-                Ok((_, sig_schemes)) => sig_schemes,
+            let mut cx = ServerContext {
+                common: &mut connection.core.common_state,
+                data: &mut connection.core.side,
+                // `ClientHelloInput::from_message` won't read borrowed plaintext
+                plaintext_locator: &Locator::new(&[]),
+                received_plaintext: &mut None,
+                sendable_plaintext: Some(&mut connection.sendable_plaintext),
+            };
+
+            let sig_schemes = match ClientHelloInput::from_message(&message, false, &mut cx) {
+                Ok(ClientHelloInput { sig_schemes, .. }) => sig_schemes,
                 Err(err) => {
                     return Err((err, AcceptedAlert::from(connection)));
                 }
             };
+            debug_assert!(cx.received_plaintext.is_none(), "read plaintext");
 
             Ok(Some(Accepted {
                 connection,
@@ -995,29 +1043,36 @@ impl DerefMut for UnbufferedServerConnection {
 
 impl UnbufferedConnectionCommon<ServerConnectionData> {
     pub(crate) fn pop_early_data(&mut self) -> Option<Vec<u8>> {
-        self.core.data.early_data.pop()
+        self.core.side.early_data.pop()
     }
 
     pub(crate) fn peek_early_data(&self) -> Option<&[u8]> {
-        self.core.data.early_data.peek()
+        self.core.side.early_data.peek()
     }
 }
 
 /// Represents a `ClientHello` message received through the [`Acceptor`].
 ///
 /// Contains the state required to resume the connection through [`Accepted::into_connection()`].
+#[cfg(feature = "std")]
 pub struct Accepted {
     connection: ConnectionCommon<ServerConnectionData>,
     message: Message<'static>,
     sig_schemes: Vec<SignatureScheme>,
 }
 
+#[cfg(feature = "std")]
 impl Accepted {
     /// Get the [`ClientHello`] for this connection.
     pub fn client_hello(&self) -> ClientHello<'_> {
         let payload = Self::client_hello_payload(&self.message);
+        let server_name = payload
+            .server_name
+            .as_ref()
+            .and_then(ServerNamePayload::to_dns_name_normalized)
+            .map(Cow::Owned);
         let ch = ClientHello {
-            server_name: &self.connection.core.data.sni,
+            server_name,
             signature_schemes: &self.sig_schemes,
             alpn: payload.protocols.as_ref(),
             server_cert_types: payload
@@ -1039,10 +1094,9 @@ impl Accepted {
 
     /// Convert the [`Accepted`] into a [`ServerConnection`].
     ///
-    /// Takes the state returned from [`Acceptor::accept()`] as well as the [`ServerConfig`] and
-    /// [`sign::CertifiedKey`] that should be used for the session. Returns an error if
-    /// configuration-dependent validation of the received `ClientHello` message fails.
-    #[cfg(feature = "std")]
+    /// Takes the state returned from [`Acceptor::accept()`] as well as the [`ServerConfig`] that
+    /// should be used for the session. Returns an error if configuration-dependent validation of
+    /// the received `ClientHello` message fails.
     pub fn into_connection(
         mut self,
         config: Arc<ServerConfig>,
@@ -1059,13 +1113,26 @@ impl Accepted {
         self.connection.enable_secret_extraction = config.enable_secret_extraction;
 
         let state = hs::ExpectClientHello::new(config, ServerExtensionsInput::default());
-        let mut cx = hs::ServerContext::from(&mut self.connection);
+        let mut cx = hs::ServerContext {
+            common: &mut self.connection.core.common_state,
+            data: &mut self.connection.core.side,
+            // `ExpectClientHello::with_input` won't read borrowed plaintext
+            plaintext_locator: &Locator::new(&[]),
+            received_plaintext: &mut None,
+            sendable_plaintext: Some(&mut self.connection.sendable_plaintext),
+        };
 
-        let ch = Self::client_hello_payload(&self.message);
-        let new = match state.with_certified_key(self.sig_schemes, ch, &self.message, &mut cx) {
+        let input = ClientHelloInput {
+            client_hello: Self::client_hello_payload(&self.message),
+            message: &self.message,
+            sig_schemes: self.sig_schemes,
+        };
+
+        let new = match state.with_input(input, &mut cx) {
             Ok(new) => new,
             Err(err) => return Err((err, AcceptedAlert::from(self.connection))),
         };
+        debug_assert!(cx.received_plaintext.is_none(), "read plaintext");
 
         self.connection.replace_state(new);
         Ok(ServerConnection {
@@ -1084,6 +1151,7 @@ impl Accepted {
     }
 }
 
+#[cfg(feature = "std")]
 impl Debug for Accepted {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Accepted").finish()
@@ -1095,35 +1163,25 @@ struct Accepting;
 
 #[cfg(feature = "std")]
 impl State<ServerConnectionData> for Accepting {
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn handle<'m>(
         self: Box<Self>,
         _cx: &mut hs::ServerContext<'_>,
         _m: Message<'m>,
-    ) -> Result<Box<dyn State<ServerConnectionData> + 'm>, Error>
-    where
-        Self: 'm,
-    {
-        Err(Error::General("unreachable state".into()))
-    }
-
-    fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
-        self
+    ) -> Result<Box<dyn State<ServerConnectionData>>, Error> {
+        Err(Error::Unreachable("unreachable state"))
     }
 }
 
+#[derive(Default)]
 pub(super) enum EarlyDataState {
+    #[default]
     New,
     Accepted {
         received: ChunkVecBuffer,
         left: usize,
     },
     Rejected,
-}
-
-impl Default for EarlyDataState {
-    fn default() -> Self {
-        Self::New
-    }
 }
 
 impl EarlyDataState {
@@ -1165,14 +1223,6 @@ impl EarlyDataState {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Accepted { received, .. } => received.read(buf),
-            _ => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
-        }
-    }
-
-    #[cfg(read_buf)]
-    fn read_buf(&mut self, cursor: core::io::BorrowedCursor<'_>) -> io::Result<()> {
-        match self {
-            Self::Accepted { received, .. } => received.read_buf(cursor),
             _ => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
         }
     }
@@ -1230,29 +1280,17 @@ impl ConnectionCore<ServerConnectionData> {
             self.common_state.is_handshaking(),
             "cannot retroactively reject early data"
         );
-        self.data.early_data.reject();
-    }
-
-    #[cfg(feature = "std")]
-    pub(crate) fn get_sni_str(&self) -> Option<&str> {
-        self.data.get_sni_str()
+        self.side.early_data.reject();
     }
 }
 
 /// State associated with a server connection.
 #[derive(Default, Debug)]
 pub struct ServerConnectionData {
-    pub(super) sni: Option<DnsName<'static>>,
-    pub(super) received_resumption_data: Option<Vec<u8>>,
-    pub(super) resumption_data: Vec<u8>,
+    pub(crate) sni: Option<DnsName<'static>>,
+    pub(crate) received_resumption_data: Option<Vec<u8>>,
+    pub(crate) resumption_data: Vec<u8>,
     pub(super) early_data: EarlyDataState,
-}
-
-impl ServerConnectionData {
-    #[cfg(feature = "std")]
-    pub(super) fn get_sni_str(&self) -> Option<&str> {
-        self.sni.as_ref().map(AsRef::as_ref)
-    }
 }
 
 impl crate::conn::SideData for ServerConnectionData {}
@@ -1269,19 +1307,6 @@ mod tests {
     fn test_read_in_new_state() {
         assert_eq!(
             format!("{:?}", EarlyDataState::default().read(&mut [0u8; 5])),
-            "Err(Kind(BrokenPipe))"
-        );
-    }
-
-    #[cfg(read_buf)]
-    #[test]
-    fn test_read_buf_in_new_state() {
-        use core::io::BorrowedBuf;
-
-        let mut buf = [0u8; 5];
-        let mut buf: BorrowedBuf<'_> = buf.as_mut_slice().into();
-        assert_eq!(
-            format!("{:?}", EarlyDataState::default().read_buf(buf.unfilled())),
             "Err(Kind(BrokenPipe))"
         );
     }

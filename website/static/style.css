@@ -100,6 +100,7 @@ section.perf h1 footer {
 section.perf h2 footer {
   font-size: 0.45em;
   font-weight: normal;
+  padding-top: 0.2em;
 }
 footer em {
   display: block;
@@ -174,4 +175,16 @@ th {
 div.content img {
   object-fit: contain;
   max-width: 100%;
+}
+span.tag {
+  padding-left: 1em;
+  padding-right: 1em;
+  text-transform: uppercase;
+  font-weight: bold;
+  font-size: 0.6em;
+  margin: 0.2em;
+  color: rgba(255, 255, 255, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.1);
 }

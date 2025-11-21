@@ -5,6 +5,7 @@ permissions:
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
     branches:
       - main
@@ -17,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
 
@@ -39,9 +40,9 @@ jobs:
 
       - name: cargo doc
         # keep features in sync with Cargo.toml `[package.metadata.docs.rs]` section
-        run: cargo doc --locked --features read_buf,ring --no-deps --package rustls
+        run: cargo doc --locked --features aws-lc-rs,brotli,custom-provider,hashbrown,log,std,zlib --no-deps --package rustls
         env:
-          RUSTDOCFLAGS: -Dwarnings --cfg=docsrs --html-after-content tag.html
+          RUSTDOCFLAGS: -Dwarnings --cfg=rustls_docsrs --html-after-content tag.html
 
       - name: Generate other pages
         run: |
@@ -75,14 +76,14 @@ jobs:
           mv target/website/rustls target/website/docs
 
       - name: Package and upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: ./target/website/
 
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
-    if: github.repository == 'rustls/rustls'
+    if: github.repository == 'rustls/rustls' && github.ref == 'refs/heads/main'
     needs: generate
     permissions:
       pages: write
