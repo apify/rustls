@@ -229,9 +229,6 @@ enum_builder! {
     #[repr(u16)]
     pub enum CipherSuite {
         TLS_NULL_WITH_NULL_NULL => 0x0000,
-        TLS_PSK_WITH_AES_128_GCM_SHA256 => 0x00a8,
-        TLS_PSK_WITH_AES_256_GCM_SHA384 => 0x00a9,
-        TLS_EMPTY_RENEGOTIATION_INFO_SCSV => 0x00ff,
         TLS_RESERVED_GREASE => 0x0a0a,
         /// The `TLS_DHE_RSA_WITH_AES_128_GCM_SHA256` cipher suite.  Recommended=Y.  Defined in
         /// <https://www.iana.org/go/rfc5288>
@@ -329,7 +326,6 @@ enum_builder! {
         /// <https://www.iana.org/go/rfc8442>
         TLS_ECDHE_PSK_WITH_AES_128_CCM_SHA256 => 0xd005,
 
-    !Debug:
         /// The `TLS_RSA_WITH_AES_128_CBC_SHA` cipher suite.  Recommended=N.  Defined in
         /// <https://www.iana.org/go/rfc5246>
         TLS_RSA_WITH_AES_128_CBC_SHA => 0x002f,
