@@ -17,14 +17,12 @@ use crate::tls13::Tls13CipherSuite;
 use crate::version::TLS13_VERSION;
 
 #[cfg(feature = "impit")]
-macro_rules! fake_cipher_suite {
-    ( $name:ident, $internal_name:ident, $suite:expr  ) => {
-        /// The TLS1.3 GREASE bogus ciphersuite
+macro_rules! fake_tls13_cipher_suite {
+    ( $name:ident, $suite:expr  ) => {
+        /// [impit!] The bogus TLS1.3 ciphersuite $name
         #[cfg(feature = "impit")]
-        pub static $name: SupportedCipherSuite = SupportedCipherSuite::Tls13($internal_name);
-
-        #[cfg(feature = "impit")]
-        pub(crate) static $internal_name: &Tls13CipherSuite = &Tls13CipherSuite {
+        pub static $name: &Tls13CipherSuite = &Tls13CipherSuite {
+            protocol_version: TLS13_VERSION,
             common: CipherSuiteCommon {
                 suite: $suite,
                 hash_provider: &super::hash::SHA256,
@@ -46,57 +44,49 @@ macro_rules! fake_cipher_suite {
 }
 
 #[cfg(feature = "impit")]
-fake_cipher_suite!(
+fake_tls13_cipher_suite!(
     TLS13_RESERVED_GREASE,
-    TLS13_RESERVED_GREASE_INTERNAL,
     CipherSuite::TLS_RESERVED_GREASE
 );
+
 #[cfg(feature = "impit")]
-fake_cipher_suite!(
+fake_tls13_cipher_suite!(
     TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-    TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA_INTERNAL,
     CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
 );
 #[cfg(feature = "impit")]
-fake_cipher_suite!(
+fake_tls13_cipher_suite!(
     TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-    TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA_INTERNAL,
     CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
 );
 #[cfg(feature = "impit")]
-fake_cipher_suite!(
+fake_tls13_cipher_suite!(
     TLS_RSA_WITH_AES_128_GCM_SHA256,
-    TLS_RSA_WITH_AES_128_GCM_SHA256_INTERNAL,
     CipherSuite::TLS_RSA_WITH_AES_128_GCM_SHA256
 );
 #[cfg(feature = "impit")]
-fake_cipher_suite!(
+fake_tls13_cipher_suite!(
     TLS_RSA_WITH_AES_256_GCM_SHA384,
-    TLS_RSA_WITH_AES_256_GCM_SHA384_INTERNAL,
     CipherSuite::TLS_RSA_WITH_AES_256_GCM_SHA384
 );
 #[cfg(feature = "impit")]
-fake_cipher_suite!(
+fake_tls13_cipher_suite!(
     TLS_RSA_WITH_AES_128_CBC_SHA,
-    TLS_RSA_WITH_AES_128_CBC_SHA_INTERNAL,
     CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA
 );
 #[cfg(feature = "impit")]
-fake_cipher_suite!(
+fake_tls13_cipher_suite!(
     TLS_RSA_WITH_AES_256_CBC_SHA,
-    TLS_RSA_WITH_AES_256_CBC_SHA_INTERNAL,
     CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA
 );
 #[cfg(feature = "impit")]
-fake_cipher_suite!(
+fake_tls13_cipher_suite!(
     TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-    TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA_INTERNAL,
     CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA
 );
 #[cfg(feature = "impit")]
-fake_cipher_suite!(
+fake_tls13_cipher_suite!(
     TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-    TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA_INTERNAL,
     CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA
 );
 

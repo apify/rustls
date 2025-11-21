@@ -45,20 +45,20 @@ impl NoVerifier {
 
 #[cfg(feature = "impit")]
 impl ServerVerifier for NoVerifier {
-    fn verify_identity(&self, identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
+    fn verify_identity(&self, _identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
         Ok(PeerVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        input: &SignatureVerificationInput<'_>,
+        _input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
 
     fn verify_tls13_signature(
         &self,
-        input: &SignatureVerificationInput<'_>,
+        _input: &SignatureVerificationInput<'_>,
     ) -> Result<HandshakeSignatureValid, Error> {
         Ok(HandshakeSignatureValid::assertion())
     }

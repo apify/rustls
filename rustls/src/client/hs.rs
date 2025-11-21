@@ -575,8 +575,7 @@ fn emit_client_hello_for_retry(
     assert!(supported_versions.any(|_| true));
 
     // offer groups which are usable for any offered version
-    #[cfg(not(feature = "impit"))]
-    let offered_groups: Vec<NamedGroup> = config
+    let mut offered_groups: Vec<NamedGroup> = config
                 .provider
                 .kx_groups
                 .iter()
@@ -589,24 +588,12 @@ fn emit_client_hello_for_retry(
                 .collect();
 
     #[cfg(feature = "impit")]
-    let mut offered_groups: Vec<NamedGroup> = config
-        .provider
-        .kx_groups
-        .iter()
-        .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
-        .map(|skxg| skxg.name())
-        .collect();
-
-    #[cfg(feature = "impit")]
-    match config.browser_emulation {
-        Some(BrowserEmulator {
+    if let Some(BrowserEmulator {
             browser_type: BrowserType::Chrome,
             version: _,
-        }) => {
-            offered_groups.push(NamedGroup::GREASE);
-            // offered_groups.push(NamedGroup::X25519Kyber768Draft00);
-        }
-        _ => {}
+        }) = config.browser_emulation {
+        offered_groups.push(NamedGroup::GREASE);
+        // offered_groups.push(NamedGroup::X25519Kyber768Draft00);
     }
 
     let mut exts = Box::new(ClientExtensions {

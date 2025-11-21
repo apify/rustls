@@ -5,9 +5,10 @@ use core::borrow::Borrow;
 use core::fmt::Debug;
 #[cfg(feature = "impit")]
 use emulation::{
-    CHROME_CIPHER_SUITES, CHROME_SIGNATURE_VERIFICATION_ALGOS, FIREFOX_CIPHER_SUITES,
+    CHROME_TLS13_CIPHER_SUITES, CHROME_TLS12_CIPHER_SUITES, CHROME_SIGNATURE_VERIFICATION_ALGOS, FIREFOX_TLS13_CIPHER_SUITES, FIREFOX_TLS12_CIPHER_SUITES,
     FIREFOX_SIGNATURE_VERIFICATION_ALGOS,
 };
+use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 use core::ops::Deref;
 use core::time::Duration;
 
@@ -261,9 +262,10 @@ impl CryptoProviderBuilder {
                 version: _,
             }) => {
                 let provider = CryptoProvider {
-                    cipher_suites: CHROME_CIPHER_SUITES.to_vec(),
+                    tls13_cipher_suites: Cow::Borrowed(&CHROME_TLS13_CIPHER_SUITES),
+                    tls12_cipher_suites: Cow::Borrowed(&CHROME_TLS12_CIPHER_SUITES),
                     signature_verification_algorithms: CHROME_SIGNATURE_VERIFICATION_ALGOS,
-                    ..aws_lc_rs::default_provider()
+                    ..DEFAULT_PROVIDER
                 };
 
                 provider
@@ -273,14 +275,15 @@ impl CryptoProviderBuilder {
                 version: _,
             }) => {
                 let provider = CryptoProvider {
-                    cipher_suites: FIREFOX_CIPHER_SUITES.to_vec(),
+                    tls13_cipher_suites: Cow::Borrowed(&FIREFOX_TLS13_CIPHER_SUITES),
+                    tls12_cipher_suites: Cow::Borrowed(&FIREFOX_TLS12_CIPHER_SUITES),
                     signature_verification_algorithms: FIREFOX_SIGNATURE_VERIFICATION_ALGOS,
-                    ..aws_lc_rs::default_provider()
+                    ..DEFAULT_PROVIDER
                 };
 
                 provider
             }
-            None => aws_lc_rs::default_provider(),
+            None => DEFAULT_PROVIDER,
         }
     }
 }

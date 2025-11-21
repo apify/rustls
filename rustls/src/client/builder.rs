@@ -11,7 +11,7 @@ use pki_types::PrivateKeyDer;
 
 use super::client_conn::Resumption;
 use crate::builder::{ConfigBuilder, WantsVerifier};
-use crate::client::{ClientConfig, ClientCredentialResolver, EchMode, handy};
+use crate::client::{ClientConfig, EchMode, ClientCredentialResolver, handy};
 use crate::crypto::{Credentials, Identity, SingleCredential};
 use crate::error::{ApiMisuse, Error};
 use crate::sync::Arc;
@@ -123,6 +123,7 @@ pub(super) mod danger {
 
 #[cfg(feature = "impit")]
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 /// Emulate a browser's behavior.
 pub enum BrowserType {
     /// Emulate Chrome's behavior.
@@ -134,6 +135,7 @@ pub enum BrowserType {
 #[cfg(feature = "impit")]
 /// Struct holding the browser emulator configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BrowserEmulator {
     /// Emulated browser, e.g. Chrome or Firefox
     pub browser_type: BrowserType,
@@ -160,7 +162,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
     ) -> ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
         ConfigBuilder {
             state: WantsClientCertWithBrowserEmulationEnabled {
-                versions: self.state.versions,
                 verifier: self.state.verifier,
                 client_ech_mode: self.state.client_ech_mode,
                 browser_emulator: browser_emulator.clone(),
@@ -248,7 +249,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
 #[cfg(feature = "impit")]
 #[derive(Clone)]
 pub struct WantsClientCertWithBrowserEmulationEnabled {
-    versions: versions::EnabledVersions,
     verifier: Arc<dyn verify::ServerVerifier>,
     client_ech_mode: Option<EchMode>,
     browser_emulator: BrowserEmulator,
@@ -267,23 +267,40 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
     /// This function fails if `key_der` is invalid.
     pub fn with_client_auth_cert(
         self,
-        cert_chain: Vec<CertificateDer<'static>>,
+        identity: Arc<Identity<'static>>,
         key_der: PrivateKeyDer<'static>,
     ) -> Result<ClientConfig, Error> {
-        let certified_key = CertifiedKey::from_der(cert_chain, key_der, &self.provider)?;
-        Ok(self.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+        let credentials = Credentials::from_der(identity, key_der, &self.provider)?;
+        self.with_client_credential_resolver(Arc::new(SingleCredential::from(credentials)))
     }
 
     /// Do not support client auth.
-    pub fn with_no_client_auth(self) -> ClientConfig {
-        self.with_client_cert_resolver(Arc::new(handy::FailResolveClientCert {}))
+    pub fn with_no_client_auth(self) -> Result<ClientConfig, Error> {
+        self.with_client_credential_resolver(Arc::new(handy::FailResolveClientCert {}))
     }
 
     /// Sets a custom [`ResolvesClientCert`].
-    pub fn with_client_cert_resolver(
+    pub fn with_client_credential_resolver(
         self,
-        client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
-    ) -> ClientConfig {
+        client_auth_cert_resolver: Arc<dyn ClientCredentialResolver>,
+    ) -> Result<ClientConfig, Error> {
+        self.provider.consistency_check()?;
+
+        if self.state.client_ech_mode.is_some() {
+            match (
+                self.provider
+                    .tls12_cipher_suites
+                    .is_empty(),
+                self.provider
+                    .tls13_cipher_suites
+                    .is_empty(),
+            ) {
+                (_, true) => return Err(ApiMisuse::EchRequiresTls13Support.into()),
+                (false, _) => return Err(ApiMisuse::EchForbidsTls12Support.into()),
+                (true, false) => {}
+            };
+        }
+
         let (alpn_protocols, cert_compressors, cert_decompressors) =
             match self.state.browser_emulator {
                 BrowserEmulator {
@@ -291,8 +308,8 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
                     version: _,
                 } => (
                     vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-                    vec![crate::compress::BROTLI_COMPRESSOR],
-                    vec![crate::compress::BROTLI_DECOMPRESSOR],
+                    vec![compress::BROTLI_COMPRESSOR],
+                    vec![compress::BROTLI_DECOMPRESSOR],
                 ),
                 BrowserEmulator {
                     browser_type: BrowserType::Firefox,
@@ -300,18 +317,16 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
                 } => (vec![b"h2".to_vec(), b"http/1.1".to_vec()], vec![], vec![]),
             };
 
-        ClientConfig {
+        Ok(ClientConfig {
             browser_emulation: Some(self.state.browser_emulator),
             provider: self.provider,
             resumption: Resumption::default(),
             max_fragment_size: None,
             client_auth_cert_resolver,
-            versions: self.state.versions,
             enable_sni: true,
             verifier: self.state.verifier,
             enable_secret_extraction: false,
             enable_early_data: false,
-            #[cfg(feature = "tls12")]
             require_ems: cfg!(feature = "fips"),
             time_provider: self.time_provider,
             alpn_protocols,
@@ -320,6 +335,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
             cert_decompressors,
             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
             ech_mode: self.state.client_ech_mode,
-        }
+        })
     }
 }
