@@ -62,7 +62,10 @@ impl ServerVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        use crate::{client::client_emulator::BrowserType, crypto::emulation::{CHROME_SIGNATURE_SCHEMES, FIREFOX_SIGNATURE_SCHEMES}};
+        use crate::{
+            client::client_emulator::BrowserType,
+            crypto::emulation::{CHROME_SIGNATURE_SCHEMES, FIREFOX_SIGNATURE_SCHEMES},
+        };
 
         match &self.0 {
             Some(browser_emulator) => match browser_emulator.browser_type {

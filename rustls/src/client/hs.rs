@@ -12,13 +12,12 @@ use super::config::{ClientConfig, ClientCredentialResolver, Tls12Resumption};
 use super::connection::ClientConnectionData;
 use super::ech::{EchMode, EchState, EchStatus};
 use super::{ClientHelloDetails, tls13};
+use crate::check::inappropriate_handshake_message;
 #[cfg(feature = "impit")]
 use crate::client::client_emulator::{BrowserEmulator, BrowserType};
-use crate::{SupportedCipherSuite, bs_debug};
-use crate::check::inappropriate_handshake_message;
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
 use crate::crypto::cipher::Payload;
-use crate::crypto::kx::{KeyExchangeAlgorithm, StartedKeyExchange, NamedGroup};
+use crate::crypto::kx::{KeyExchangeAlgorithm, NamedGroup, StartedKeyExchange};
 use crate::crypto::{CipherSuite, CryptoProvider, rand};
 use crate::enums::{CertificateType, ContentType, HandshakeType, ProtocolVersion};
 use crate::error::{AlertDescription, ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
@@ -43,6 +42,7 @@ use crate::tls12::Tls12CipherSuite;
 use crate::tls13::Tls13CipherSuite;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::verify::ServerVerifier;
+use crate::{SupportedCipherSuite, bs_debug};
 
 pub(super) type NextState = Box<dyn State<ClientConnectionData>>;
 pub(super) type NextStateOrError = Result<NextState, Error>;
@@ -570,22 +570,23 @@ fn emit_client_hello_for_retry(
 
     // offer groups which are usable for any offered version
     let mut offered_groups: Vec<NamedGroup> = config
-                .provider
-                .kx_groups
-                .iter()
-                .filter_map(|skxg| {
-                    let named_group = skxg.name();
-                    supported_versions
-                        .any(|v| named_group.usable_for_version(v))
-                        .then_some(named_group)
-                })
-                .collect();
+        .provider
+        .kx_groups
+        .iter()
+        .filter_map(|skxg| {
+            let named_group = skxg.name();
+            supported_versions
+                .any(|v| named_group.usable_for_version(v))
+                .then_some(named_group)
+        })
+        .collect();
 
     #[cfg(feature = "impit")]
     if let Some(BrowserEmulator {
-            browser_type: BrowserType::Chrome,
-            version: _,
-        }) = config.browser_emulation {
+        browser_type: BrowserType::Chrome,
+        version: _,
+    }) = config.browser_emulation
+    {
         offered_groups.push(NamedGroup::GREASE);
         // offered_groups.push(NamedGroup::X25519Kyber768Draft00);
     }
@@ -610,7 +611,7 @@ fn emit_client_hello_for_retry(
 
     #[cfg(feature = "impit")]
     match config.browser_emulation {
-        Some( BrowserEmulator {
+        Some(BrowserEmulator {
             browser_type: BrowserType::Chrome,
             version: _,
         }) => {

@@ -45,10 +45,7 @@ macro_rules! fake_tls13_cipher_suite {
 }
 
 #[cfg(feature = "impit")]
-fake_tls13_cipher_suite!(
-    TLS13_RESERVED_GREASE,
-    CipherSuite::TLS_RESERVED_GREASE
-);
+fake_tls13_cipher_suite!(TLS13_RESERVED_GREASE, CipherSuite::TLS_RESERVED_GREASE);
 
 #[cfg(feature = "impit")]
 fake_tls13_cipher_suite!(
