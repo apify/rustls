@@ -12,12 +12,13 @@ use super::config::{ClientConfig, ClientCredentialResolver, Tls12Resumption};
 use super::connection::ClientConnectionData;
 use super::ech::{EchMode, EchState, EchStatus};
 use super::{ClientHelloDetails, tls13};
-use crate::bs_debug;
-use super::{ClientCredentialResolver, Tls12Resumption};
+#[cfg(feature = "impit")]
+use crate::client::client_emulator::{BrowserEmulator, BrowserType};
+use crate::{SupportedCipherSuite, bs_debug};
 use crate::check::inappropriate_handshake_message;
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
 use crate::crypto::cipher::Payload;
-use crate::crypto::kx::{KeyExchangeAlgorithm, StartedKeyExchange};
+use crate::crypto::kx::{KeyExchangeAlgorithm, StartedKeyExchange, NamedGroup};
 use crate::crypto::{CipherSuite, CryptoProvider, rand};
 use crate::enums::{CertificateType, ContentType, HandshakeType, ProtocolVersion};
 use crate::error::{AlertDescription, ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
@@ -609,7 +610,7 @@ fn emit_client_hello_for_retry(
 
     #[cfg(feature = "impit")]
     match config.browser_emulation {
-        Some(BrowserEmulator {
+        Some( BrowserEmulator {
             browser_type: BrowserType::Chrome,
             version: _,
         }) => {

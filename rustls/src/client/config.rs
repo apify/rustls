@@ -9,6 +9,8 @@ use super::ech::EchMode;
 use super::handy::ClientSessionMemoryCache;
 use super::handy::{FailResolveClientCert, NoClientSessionStorage};
 use crate::builder::{ConfigBuilder, WantsVerifier};
+#[cfg(feature = "impit")]
+use crate::client::client_emulator::BrowserEmulator;
 #[cfg(doc)]
 use crate::crypto;
 use crate::crypto::kx::NamedGroup;
@@ -604,6 +606,8 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             provider: self.provider,
             alpn_protocols: Vec::new(),
             resumption: Resumption::default(),
+            #[cfg(feature = "impit")]
+            browser_emulation: None,
             max_fragment_size: None,
             client_auth_cert_resolver,
             enable_sni: true,

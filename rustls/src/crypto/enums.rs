@@ -7,6 +7,7 @@ enum_builder! {
     /// The `Unknown` item is used when processing unrecognized ordinals.
     #[repr(u16)]
     pub enum CipherSuite {
+        TLS_RESERVED_GREASE => 0x0a0a,
         /// The `TLS_DHE_RSA_WITH_AES_128_GCM_SHA256` cipher suite.  Recommended=Y.  Defined in
         /// <https://www.iana.org/go/rfc5288>
         TLS_DHE_RSA_WITH_AES_128_GCM_SHA256 => 0x009e,
