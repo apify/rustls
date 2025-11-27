@@ -490,7 +490,9 @@ pub use crate::suites::{
 pub use crate::ticketer::TicketRotator;
 pub use crate::tls12::Tls12CipherSuite;
 pub use crate::tls13::Tls13CipherSuite;
-pub use crate::verify::{DigitallySignedStruct, DistinguishedName, NoVerifier, SignerPublicKey};
+#[cfg(feature = "impit")]
+pub use crate::verify::NoVerifier;
+pub use crate::verify::{DigitallySignedStruct, DistinguishedName, SignerPublicKey};
 pub use crate::versions::{ALL_VERSIONS, DEFAULT_VERSIONS, SupportedProtocolVersion};
 pub use crate::webpki::RootCertStore;
 

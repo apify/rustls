@@ -13,6 +13,7 @@ use crate::msgs::codec::{Codec, ListLength, Reader, TlsListElement};
 use crate::sync::Arc;
 use crate::x509::wrap_in_sequence;
 
+#[cfg(feature = "impit")]
 use std::vec;
 
 // Marker types.  These are used to bind the fact some verification

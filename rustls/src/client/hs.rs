@@ -569,6 +569,7 @@ fn emit_client_hello_for_retry(
     assert!(supported_versions.any(|_| true));
 
     // offer groups which are usable for any offered version
+    #[allow(unused_mut)]
     let mut offered_groups: Vec<NamedGroup> = config
         .provider
         .kx_groups
