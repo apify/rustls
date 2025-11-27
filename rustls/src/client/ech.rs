@@ -5,24 +5,31 @@ use alloc::vec::Vec;
 use pki_types::{DnsName, EchConfigListBytes, ServerName};
 use subtle::ConstantTimeEq;
 
-use crate::client::tls13;
+use super::config::ClientConfig;
+use super::tls13;
+use crate::crypto::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
 use crate::crypto::SecureRandom;
 use crate::crypto::cipher::Payload;
 use crate::crypto::hash::Hash;
-use crate::crypto::hpke::{EncapsulatedSecret, Hpke, HpkePublicKey, HpkeSealer, HpkeSuite};
-use crate::enums::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
-use crate::enums::{AlertDescription, ProtocolVersion};
-use crate::error::{EncryptedClientHelloError, Error, PeerMisbehaved, RejectedEch};
+use crate::crypto::hpke::{
+    EncapsulatedSecret, Hpke, HpkeKem, HpkePublicKey, HpkeSealer, HpkeSuite,
+    HpkeSymmetricCipherSuite,
+};
+use crate::enums::ProtocolVersion;
+use crate::error::{
+    AlertDescription, EncryptedClientHelloError, Error, PeerMisbehaved, RejectedEch,
+};
 use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
 use crate::log::{debug, trace, warn};
 use crate::msgs::base::PayloadU16;
 use crate::msgs::codec::{Codec, Reader};
-use crate::msgs::enums::{ExtensionType, HpkeKem};
+use crate::msgs::deframer::HandshakeAlignedProof;
+use crate::msgs::enums::ExtensionType;
 use crate::msgs::handshake::{
     ClientExtensions, ClientHelloPayload, EchConfigContents, EchConfigPayload, Encoding,
     EncryptedClientHello, EncryptedClientHelloOuter, HandshakeMessagePayload, HandshakePayload,
-    HelloRetryRequest, HpkeKeyConfig, HpkeSymmetricCipherSuite, PresharedKeyBinder,
-    PresharedKeyOffer, Random, ServerHelloPayload, ServerNamePayload,
+    HelloRetryRequest, HpkeKeyConfig, PresharedKeyBinder, PresharedKeyOffer, Random,
+    ServerHelloPayload, ServerNamePayload,
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
@@ -30,7 +37,7 @@ use crate::msgs::persist::Retrieved;
 use crate::tls13::key_schedule::{
     KeyScheduleEarly, KeyScheduleHandshakeStart, server_ech_hrr_confirmation_secret,
 };
-use crate::{ClientConfig, CommonState, Tls13CipherSuite};
+use crate::{CommonState, Tls13CipherSuite};
 
 /// Controls how Encrypted Client Hello (ECH) is used in a client handshake.
 #[non_exhaustive]
@@ -561,7 +568,12 @@ impl EchState {
     ///
     /// This will start the in-progress transcript using the given `hash`, convert it into an HRR
     /// buffer, and then add the hello retry message `m`.
-    pub(crate) fn transcript_hrr_update(&mut self, hash: &'static dyn Hash, m: &Message<'_>) {
+    pub(crate) fn transcript_hrr_update(
+        &mut self,
+        hash: &'static dyn Hash,
+        m: &Message<'_>,
+        proof: &HandshakeAlignedProof,
+    ) {
         trace!("Updating ECH inner transcript for HRR");
 
         let inner_transcript = self
@@ -569,7 +581,7 @@ impl EchState {
             .clone()
             .start_hash(hash);
 
-        let mut inner_transcript_buffer = inner_transcript.into_hrr_buffer();
+        let mut inner_transcript_buffer = inner_transcript.into_hrr_buffer(proof);
         inner_transcript_buffer.add_message(m);
         self.inner_hello_transcript = inner_transcript_buffer;
     }
@@ -855,7 +867,7 @@ pub(crate) fn fatal_alert_required(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enums::CipherSuite;
+    use crate::crypto::CipherSuite;
     use crate::msgs::handshake::{Random, ServerExtensions, SessionId};
 
     #[test]

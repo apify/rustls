@@ -28,7 +28,8 @@ use std::{process, str};
 use clap::Parser;
 use mio::net::TcpStream;
 use rustls::RootCertStore;
-use rustls::crypto::{CryptoProvider, Identity, SupportedKxGroup, aws_lc_rs as provider};
+use rustls::crypto::kx::SupportedKxGroup;
+use rustls::crypto::{CryptoProvider, Identity, aws_lc_rs as provider};
 use rustls::enums::ProtocolVersion;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -76,7 +77,7 @@ impl TlsClient {
         }
     }
 
-    fn read_source_to_end(&mut self, rd: &mut dyn io::Read) -> io::Result<usize> {
+    fn read_source_to_end(&mut self, rd: &mut dyn Read) -> io::Result<usize> {
         let mut buf = Vec::new();
         let len = rd.read_to_end(&mut buf)?;
         self.tls_conn
@@ -187,7 +188,7 @@ impl TlsClient {
         self.closing
     }
 }
-impl io::Write for TlsClient {
+impl Write for TlsClient {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.tls_conn.writer().write(bytes)
     }
@@ -197,7 +198,7 @@ impl io::Write for TlsClient {
     }
 }
 
-impl io::Read for TlsClient {
+impl Read for TlsClient {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.tls_conn.reader().read(bytes)
     }
@@ -401,14 +402,15 @@ mod danger {
     use rustls::client::danger::{
         HandshakeSignatureValid, ServerIdentity, SignatureVerificationInput,
     };
-    use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
-    use rustls::enums::SignatureScheme;
+    use rustls::crypto::{
+        CryptoProvider, SignatureScheme, verify_tls12_signature, verify_tls13_signature,
+    };
 
     #[derive(Debug)]
-    pub struct NoCertificateVerification(CryptoProvider);
+    pub(super) struct NoCertificateVerification(CryptoProvider);
 
     impl NoCertificateVerification {
-        pub fn new(provider: CryptoProvider) -> Self {
+        pub(super) fn new(provider: CryptoProvider) -> Self {
             Self(provider)
         }
     }

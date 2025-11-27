@@ -1,17 +1,3 @@
-#![warn(
-    clippy::alloc_instead_of_core,
-    clippy::manual_let_else,
-    clippy::std_instead_of_core,
-    clippy::use_self,
-    clippy::upper_case_acronyms,
-    elided_lifetimes_in_paths,
-    trivial_numeric_casts,
-    unreachable_pub,
-    unused_import_braces,
-    unused_extern_crates,
-    unused_qualifications
-)]
-
 use core::time::Duration;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -23,21 +9,22 @@ use rustls::crypto::cipher::{
     MessageEncrypter, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload,
     Tls12AeadAlgorithm, Tls13AeadAlgorithm, UnsupportedOperationError,
 };
+use rustls::crypto::kx::{
+    KeyExchangeAlgorithm, NamedGroup, SharedSecret, StartedKeyExchange, SupportedKxGroup,
+};
 use rustls::crypto::{
-    self, CipherSuiteCommon, Credentials, GetRandomFailed, Identity, KeyExchangeAlgorithm,
-    SelectedCredential, StartedKeyExchange, TicketProducer, WebPkiSupportedAlgorithms, hash, tls12,
+    self, CipherSuite, CipherSuiteCommon, Credentials, GetRandomFailed, HashAlgorithm, Identity,
+    SelectedCredential, SignatureScheme, TicketProducer, WebPkiSupportedAlgorithms, hash, tls12,
     tls13,
 };
-use rustls::enums::{CipherSuite, ContentType, HashAlgorithm, ProtocolVersion, SignatureScheme};
+use rustls::enums::{ContentType, ProtocolVersion};
 use rustls::error::{PeerIncompatible, PeerMisbehaved};
 use rustls::pki_types::{
     AlgorithmIdentifier, CertificateDer, InvalidSignature, PrivateKeyDer,
     SignatureVerificationAlgorithm, SubjectPublicKeyInfoDer, alg_id,
 };
 use rustls::server::{ClientHello, ServerCredentialResolver};
-use rustls::{
-    ConnectionTrafficSecrets, Error, NamedGroup, RootCertStore, Tls12CipherSuite, Tls13CipherSuite,
-};
+use rustls::{ConnectionTrafficSecrets, Error, RootCertStore, Tls12CipherSuite, Tls13CipherSuite};
 
 /// This is a `CryptoProvider` that provides NO SECURITY and is for fuzzing only.
 pub const PROVIDER: crypto::CryptoProvider = crypto::CryptoProvider {
@@ -240,10 +227,10 @@ const HMAC_OUTPUT: &[u8] = b"HmacHmacHmacHmacHmacHmacHmacHmac";
 
 struct ActiveKeyExchange;
 
-impl crypto::ActiveKeyExchange for ActiveKeyExchange {
-    fn complete(self: Box<Self>, peer: &[u8]) -> Result<crypto::SharedSecret, Error> {
+impl crypto::kx::ActiveKeyExchange for ActiveKeyExchange {
+    fn complete(self: Box<Self>, peer: &[u8]) -> Result<SharedSecret, Error> {
         match peer {
-            KX_PEER_SHARE => Ok(crypto::SharedSecret::from(KX_SHARED_SECRET)),
+            KX_PEER_SHARE => Ok(SharedSecret::from(KX_SHARED_SECRET)),
             _ => Err(Error::from(PeerMisbehaved::InvalidKeyShare)),
         }
     }
@@ -257,12 +244,12 @@ impl crypto::ActiveKeyExchange for ActiveKeyExchange {
     }
 }
 
-const KEY_EXCHANGE_GROUP: &dyn crypto::SupportedKxGroup = &KeyExchangeGroup;
+const KEY_EXCHANGE_GROUP: &dyn SupportedKxGroup = &KeyExchangeGroup;
 
 #[derive(Debug)]
 struct KeyExchangeGroup;
 
-impl crypto::SupportedKxGroup for KeyExchangeGroup {
+impl SupportedKxGroup for KeyExchangeGroup {
     fn start(&self) -> Result<StartedKeyExchange, Error> {
         Ok(StartedKeyExchange::Single(Box::new(ActiveKeyExchange)))
     }

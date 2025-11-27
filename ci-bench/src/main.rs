@@ -1,17 +1,3 @@
-#![warn(
-    clippy::alloc_instead_of_core,
-    clippy::manual_let_else,
-    clippy::std_instead_of_core,
-    clippy::use_self,
-    clippy::upper_case_acronyms,
-    elided_lifetimes_in_paths,
-    trivial_numeric_casts,
-    unreachable_pub,
-    unused_import_braces,
-    unused_extern_crates,
-    unused_qualifications
-)]
-
 use core::hint::black_box;
 use core::mem;
 use std::collections::HashMap;
@@ -30,8 +16,10 @@ use rayon::iter::Either;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use rustls::client::Resumption;
-use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom, TicketProducer, aws_lc_rs};
-use rustls::enums::{CipherSuite, ProtocolVersion};
+use rustls::crypto::{
+    CipherSuite, CryptoProvider, GetRandomFailed, SecureRandom, TicketProducer, aws_lc_rs,
+};
+use rustls::enums::ProtocolVersion;
 use rustls::server::{NoServerSessionStorage, ServerSessionMemoryCache, WebPkiClientVerifier};
 use rustls::{
     ClientConfig, ClientConnection, HandshakeKind, RootCertStore, ServerConfig, ServerConnection,
@@ -199,7 +187,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             let bench = benchmarks
                 .get(index as usize)
-                .ok_or(anyhow::anyhow!("Benchmark not found: {index}"))?;
+                .ok_or_else(|| anyhow::anyhow!("Benchmark not found: {index}"))?;
 
             if let Some(warm_up) = bench.params.warm_up {
                 warm_up();
@@ -401,47 +389,40 @@ fn all_benchmarks_params() -> Vec<BenchmarkParams> {
             Some(warm_up_aws_lc_rs as fn()),
         ),
     ] {
-        for (key_type, suite_name, version, name) in [
+        for (key_type, suite_name, name) in [
             (
                 KeyType::Rsa2048,
                 CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                ProtocolVersion::TLSv1_2,
                 "1.2_rsa_aes",
             ),
             (
                 KeyType::Rsa2048,
                 CipherSuite::TLS13_AES_128_GCM_SHA256,
-                ProtocolVersion::TLSv1_3,
                 "1.3_rsa_aes",
             ),
             (
                 KeyType::EcdsaP256,
                 CipherSuite::TLS13_AES_128_GCM_SHA256,
-                ProtocolVersion::TLSv1_3,
                 "1.3_ecdsap256_aes",
             ),
             (
                 KeyType::EcdsaP384,
                 CipherSuite::TLS13_AES_128_GCM_SHA256,
-                ProtocolVersion::TLSv1_3,
                 "1.3_ecdsap384_aes",
             ),
             (
                 KeyType::Rsa2048,
                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-                ProtocolVersion::TLSv1_3,
                 "1.3_rsa_chacha",
             ),
             (
                 KeyType::EcdsaP256,
                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-                ProtocolVersion::TLSv1_3,
                 "1.3_ecdsap256_chacha",
             ),
             (
                 KeyType::EcdsaP384,
                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-                ProtocolVersion::TLSv1_3,
                 "1.3_ecdsap384_chacha",
             ),
         ] {
@@ -449,7 +430,6 @@ fn all_benchmarks_params() -> Vec<BenchmarkParams> {
                 select_suite(provider.clone(), suite_name),
                 ticketer,
                 AuthKeySource::KeyType(key_type),
-                version,
                 format!("{provider_name}_{name}"),
                 warm_up,
             ));
@@ -463,7 +443,6 @@ fn all_benchmarks_params() -> Vec<BenchmarkParams> {
         rustls_fuzzing_provider::PROVIDER_TLS13.into(),
         make_ticketer,
         AuthKeySource::FuzzingProvider,
-        ProtocolVersion::TLSv1_3,
         "1.3_no_crypto".to_string(),
         None,
     ));
@@ -472,7 +451,6 @@ fn all_benchmarks_params() -> Vec<BenchmarkParams> {
         rustls_fuzzing_provider::PROVIDER_TLS12.into(),
         make_ticketer,
         AuthKeySource::FuzzingProvider,
-        ProtocolVersion::TLSv1_2,
         "1.2_no_crypto".to_string(),
         None,
     ));
@@ -564,7 +542,7 @@ fn add_benchmark_group(benchmarks: &mut Vec<Benchmark>, params: BenchmarkParams)
 }
 
 /// Run all the provided benches under callgrind to retrieve their instruction count
-pub fn run_all(
+fn run_all(
     executable: String,
     output_dir: PathBuf,
     benches: &[Benchmark],
@@ -918,11 +896,11 @@ fn read_icount_results(path: &Path) -> anyhow::Result<HashMap<String, u64>> {
         measurements.insert(
             parts
                 .next()
-                .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
                 .to_string(),
             parts
                 .next()
-                .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
                 .parse()
                 .context("Unable to parse instruction count from CSV")?,
         );
@@ -946,27 +924,27 @@ fn read_memory_results(path: &Path) -> anyhow::Result<HashMap<String, MemoryDeta
         measurements.insert(
             parts
                 .next()
-                .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
                 .to_string(),
             MemoryDetails {
                 heap_total_bytes: parts
                     .next()
-                    .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
                     .parse()
                     .context("Unable to parse heap total bytes from CSV")?,
                 heap_total_blocks: parts
                     .next()
-                    .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
                     .parse()
                     .context("Unable to parse heap total blocks from CSV")?,
                 heap_peak_bytes: parts
                     .next()
-                    .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
                     .parse()
                     .context("Unable to parse heap peak bytes from CSV")?,
                 heap_peak_blocks: parts
                     .next()
-                    .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
                     .parse()
                     .context("Unable to parse heap peak blocks from CSV")?,
             },

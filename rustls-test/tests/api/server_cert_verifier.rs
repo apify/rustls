@@ -10,10 +10,10 @@ use rustls::client::danger::{
     SignatureVerificationInput,
 };
 use rustls::client::{WebPkiServerVerifier, verify_identity_signed_by_trust_anchor};
-use rustls::crypto::{Credentials, Identity, SelectedCredential};
-use rustls::enums::{AlertDescription, CertificateType, SignatureScheme};
+use rustls::crypto::{Credentials, Identity, SelectedCredential, SignatureScheme};
+use rustls::enums::CertificateType;
 use rustls::error::{
-    CertificateError, Error, ExtendedKeyPurpose, InvalidMessage, PeerIncompatible,
+    AlertDescription, CertificateError, Error, ExtendedKeyPurpose, InvalidMessage, PeerIncompatible,
 };
 use rustls::server::{ClientHello, ParsedCertificate, ServerCredentialResolver};
 use rustls::{
@@ -629,7 +629,7 @@ fn client_check_server_valid_purpose() {
 }
 
 #[derive(Debug)]
-pub struct ResolvesCertChainByCaName(Vec<(DistinguishedName, Credentials)>);
+struct ResolvesCertChainByCaName(Vec<(DistinguishedName, Credentials)>);
 
 impl ServerCredentialResolver for ResolvesCertChainByCaName {
     fn resolve(&self, client_hello: &ClientHello<'_>) -> Result<SelectedCredential, Error> {

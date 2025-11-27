@@ -8,11 +8,14 @@ use zeroize::Zeroizing;
 use crate::common_state::{CommonState, Protocol, Side};
 use crate::conn::{ConnectionRandoms, Exporter};
 use crate::crypto::cipher::{AeadKey, MessageDecrypter, MessageEncrypter, Tls12AeadAlgorithm};
-use crate::crypto::{self, hash};
-use crate::enums::{AlertDescription, ProtocolVersion, SignatureScheme};
-use crate::error::{ApiMisuse, Error, InvalidMessage};
+use crate::crypto::kx::{ActiveKeyExchange, KeyExchangeAlgorithm};
+use crate::crypto::tls12::PrfSecret;
+use crate::crypto::{self, SignatureScheme, hash};
+use crate::enums::ProtocolVersion;
+use crate::error::{AlertDescription, ApiMisuse, Error, InvalidMessage};
 use crate::msgs::codec::{Codec, Reader};
-use crate::msgs::handshake::{KeyExchangeAlgorithm, KxDecode};
+use crate::msgs::deframer::HandshakeAlignedProof;
+use crate::msgs::handshake::KxDecode;
 use crate::suites::{CipherSuiteCommon, PartiallyExtractedSecrets, Suite, SupportedCipherSuite};
 use crate::version::Tls12Version;
 
@@ -149,12 +152,12 @@ pub(crate) struct ConnectionSecrets {
     /// `master_secret` ready to be used as a TLS1.2 PRF secret.
     ///
     /// Zeroizing this on drop is left to the implementer of the trait.
-    master_secret_prf: Box<dyn crypto::tls12::PrfSecret>,
+    master_secret_prf: Box<dyn PrfSecret>,
 }
 
 impl ConnectionSecrets {
     pub(crate) fn from_key_exchange(
-        kx: Box<dyn crypto::ActiveKeyExchange>,
+        kx: Box<dyn ActiveKeyExchange>,
         peer_pub_key: &[u8],
         ems_seed: Option<hash::Output>,
         randoms: ConnectionRandoms,
@@ -271,19 +274,32 @@ impl ConnectionSecrets {
         &self.master_secret
     }
 
-    fn make_verify_data(&self, handshake_hash: &hash::Output, label: &[u8]) -> [u8; 12] {
+    fn make_verify_data(
+        &self,
+        handshake_hash: &hash::Output,
+        label: &[u8],
+        _proof: &HandshakeAlignedProof,
+    ) -> [u8; 12] {
         let mut out = [0u8; 12];
         self.master_secret_prf
             .prf(&mut out, label, handshake_hash.as_ref());
         out
     }
 
-    pub(crate) fn client_verify_data(&self, handshake_hash: &hash::Output) -> [u8; 12] {
-        self.make_verify_data(handshake_hash, b"client finished")
+    pub(crate) fn client_verify_data(
+        &self,
+        handshake_hash: &hash::Output,
+        proof: &HandshakeAlignedProof,
+    ) -> [u8; 12] {
+        self.make_verify_data(handshake_hash, b"client finished", proof)
     }
 
-    pub(crate) fn server_verify_data(&self, handshake_hash: &hash::Output) -> [u8; 12] {
-        self.make_verify_data(handshake_hash, b"server finished")
+    pub(crate) fn server_verify_data(
+        &self,
+        handshake_hash: &hash::Output,
+        proof: &HandshakeAlignedProof,
+    ) -> [u8; 12] {
+        self.make_verify_data(handshake_hash, b"server finished", proof)
     }
 
     pub(crate) fn into_exporter(self) -> Box<dyn Exporter> {
@@ -330,7 +346,7 @@ impl ConnectionSecrets {
 
 pub(crate) struct Tls12Exporter {
     randoms: ConnectionRandoms,
-    master_secret_prf: Box<dyn crypto::tls12::PrfSecret>,
+    master_secret_prf: Box<dyn PrfSecret>,
 }
 
 impl Exporter for Tls12Exporter {
@@ -405,9 +421,10 @@ pub(crate) const DOWNGRADE_SENTINEL: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TEST_PROVIDERS;
     use crate::common_state::{CommonState, Side};
+    use crate::crypto::kx::NamedGroup;
     use crate::msgs::handshake::{ServerEcdhParams, ServerKeyExchangeParams};
-    use crate::{NamedGroup, TEST_PROVIDERS};
 
     #[test]
     fn server_ecdhe_remaining_bytes() {

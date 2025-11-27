@@ -6,14 +6,15 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rustls::client::Resumption;
-use rustls::crypto::{
-    ActiveKeyExchange, CryptoProvider, HybridKeyExchange, SharedSecret, StartedKeyExchange,
+use rustls::crypto::CryptoProvider;
+use rustls::crypto::kx::{
+    ActiveKeyExchange, HybridKeyExchange, NamedGroup, SharedSecret, StartedKeyExchange,
     SupportedKxGroup,
 };
-use rustls::enums::{AlertDescription, ContentType, ProtocolVersion};
-use rustls::error::{Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
+use rustls::enums::{ContentType, ProtocolVersion};
+use rustls::error::{AlertDescription, Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
 use rustls::internal::msgs::enums::ExtensionType;
-use rustls::{ClientConfig, HandshakeKind, NamedGroup, ServerConfig};
+use rustls::{ClientConfig, HandshakeKind, ServerConfig};
 use rustls_test::{
     ClientConfigExt, ClientStorage, ClientStorageOp, KeyType, OtherSession, ServerConfigExt,
     do_handshake, do_handshake_until_error, encoding, make_client_config_with_kx_groups, make_pair,
@@ -185,7 +186,7 @@ fn test_client_sends_helloretryrequest() {
     ));
     assert!(matches!(
         storage.ops()[3],
-        ClientStorageOp::SetKxHint(_, rustls::NamedGroup::X25519)
+        ClientStorageOp::SetKxHint(_, NamedGroup::X25519)
     ));
     assert!(matches!(
         storage.ops()[4],
@@ -237,7 +238,7 @@ fn test_client_attempts_to_use_unsupported_kx_group() {
     assert_eq!(ops.len(), 7);
     assert!(matches!(
         ops[3],
-        ClientStorageOp::SetKxHint(_, rustls::NamedGroup::secp256r1)
+        ClientStorageOp::SetKxHint(_, NamedGroup::secp256r1)
     ));
 
     // second handshake
@@ -250,11 +251,11 @@ fn test_client_attempts_to_use_unsupported_kx_group() {
     assert!(matches!(ops[7], ClientStorageOp::TakeTls13Ticket(_, true)));
     assert!(matches!(
         ops[8],
-        ClientStorageOp::GetKxHint(_, Some(rustls::NamedGroup::secp256r1))
+        ClientStorageOp::GetKxHint(_, Some(NamedGroup::secp256r1))
     ));
     assert!(matches!(
         ops[9],
-        ClientStorageOp::SetKxHint(_, rustls::NamedGroup::secp384r1)
+        ClientStorageOp::SetKxHint(_, NamedGroup::secp384r1)
     ));
 }
 
@@ -307,7 +308,7 @@ fn test_client_sends_share_for_less_preferred_group() {
     assert_eq!(ops.len(), 7);
     assert!(matches!(
         ops[3],
-        ClientStorageOp::SetKxHint(_, rustls::NamedGroup::secp384r1)
+        ClientStorageOp::SetKxHint(_, NamedGroup::secp384r1)
     ));
 
     // second handshake; HRR'd from secp384r1 to X25519

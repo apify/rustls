@@ -4,41 +4,41 @@ use core::ops::Range;
 
 use crate::conn::Exporter;
 use crate::conn::kernel::KernelState;
+use crate::crypto::Identity;
 use crate::crypto::cipher::{
     InboundPlainMessage, OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage, Payload,
-    PlainMessage,
+    PlainMessage, PreEncryptAction, RecordLayer,
 };
-use crate::crypto::{Identity, SupportedKxGroup};
-use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
-use crate::error::{Error, InvalidMessage, PeerMisbehaved};
+use crate::crypto::kx::SupportedKxGroup;
+use crate::enums::{ContentType, HandshakeType, ProtocolVersion};
+use crate::error::{AlertDescription, Error, InvalidMessage, PeerMisbehaved};
 use crate::hash_hs::HandshakeHash;
 use crate::log::{debug, error, trace, warn};
 use crate::msgs::alert::AlertMessagePayload;
 use crate::msgs::codec::Codec;
-use crate::msgs::deframer::buffers::{Delocator, Locator};
+use crate::msgs::deframer::{Delocator, HandshakeAlignedProof, Locator};
 use crate::msgs::enums::{AlertLevel, KeyUpdateRequest};
 use crate::msgs::fragmenter::MessageFragmenter;
 use crate::msgs::handshake::{HandshakeMessagePayload, ProtocolName};
 use crate::msgs::message::{Message, MessagePayload};
-use crate::record_layer::PreEncryptAction;
+use crate::quic;
 use crate::suites::{PartiallyExtractedSecrets, SupportedCipherSuite};
 use crate::tls12::ConnectionSecrets;
 use crate::unbuffered::{EncryptError, InsufficientSizeError};
 use crate::vecbuf::ChunkVecBuffer;
-use crate::{quic, record_layer};
 
 /// Connection state common to both client and server connections.
 pub struct CommonState {
     pub(crate) negotiated_version: Option<ProtocolVersion>,
     pub(crate) handshake_kind: Option<HandshakeKind>,
     pub(crate) side: Side,
-    pub(crate) record_layer: record_layer::RecordLayer,
+    pub(crate) record_layer: RecordLayer,
     pub(crate) suite: Option<SupportedCipherSuite>,
     pub(crate) kx_state: KxState,
     pub(crate) alpn_protocol: Option<ProtocolName>,
     pub(crate) exporter: Option<Box<dyn Exporter>>,
     pub(crate) early_exporter: Option<Box<dyn Exporter>>,
-    pub(crate) aligned_handshake: bool,
+    pub(crate) aligned_handshake: Option<HandshakeAlignedProof>,
     pub(crate) may_send_application_data: bool,
     may_receive_application_data: bool,
     pub(crate) early_traffic: bool,
@@ -71,13 +71,13 @@ impl CommonState {
             negotiated_version: None,
             handshake_kind: None,
             side,
-            record_layer: record_layer::RecordLayer::new(),
+            record_layer: RecordLayer::new(),
             suite: None,
             kx_state: KxState::default(),
             alpn_protocol: None,
             exporter: None,
             early_exporter: None,
-            aligned_handshake: true,
+            aligned_handshake: None,
             may_send_application_data: false,
             may_receive_application_data: false,
             early_traffic: false,
@@ -137,7 +137,9 @@ impl CommonState {
     /// means no protocol was agreed (because no protocols
     /// were offered or accepted by the peer).
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
-        self.get_alpn_protocol()
+        self.alpn_protocol
+            .as_ref()
+            .map(AsRef::as_ref)
     }
 
     /// Retrieves the cipher suite agreed with the peer.
@@ -239,7 +241,9 @@ impl CommonState {
             if msg.handshake_type() == Some(reject_ty) {
                 self.temper_counters
                     .received_renegotiation_request()?;
-                self.send_warning_alert(AlertDescription::NoRenegotiation);
+                let desc = AlertDescription::NoRenegotiation;
+                warn!("sending warning alert {desc:?}");
+                self.send_warning_alert_no_log(desc);
                 return Ok(state);
             }
         }
@@ -322,15 +326,20 @@ impl CommonState {
     // messages.  Otherwise the defragmented messages will have
     // been protected with two different record layer protections,
     // which is illegal.  Not mentioned in RFC.
-    pub(crate) fn check_aligned_handshake(&mut self) -> Result<(), Error> {
-        if !self.aligned_handshake {
-            Err(self.send_fatal_alert(
+    pub(crate) fn check_aligned_handshake(&mut self) -> Result<HandshakeAlignedProof, Error> {
+        self.aligned_handshake.ok_or_else(|| {
+            self.send_fatal_alert(
                 AlertDescription::UnexpectedMessage,
                 PeerMisbehaved::KeyEpochWithPendingFragment,
-            ))
-        } else {
-            Ok(())
-        }
+            )
+        })
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn send_early_plaintext(&mut self, data: &[u8]) -> usize {
+        debug_assert!(self.early_traffic);
+        debug_assert!(self.record_layer.is_encrypting());
+        self.send_appdata_encrypt(data.into(), Limit::Yes)
     }
 
     /// Fragment `m`, encrypt the fragments, and then queue
@@ -346,6 +355,11 @@ impl CommonState {
 
     /// Like send_msg_encrypt, but operate on an appdata directly.
     fn send_appdata_encrypt(&mut self, payload: OutboundChunks<'_>, limit: Limit) -> usize {
+        if payload.is_empty() {
+            // Don't send empty fragments.
+            return 0;
+        }
+
         // Here, the limit on sendable_tls applies to encrypted data,
         // but we're respecting it for plaintext data -- so we'll
         // be out by whatever the cipher+record overhead is.  That's a
@@ -415,15 +429,30 @@ impl CommonState {
         self.queue_tls_message(em);
     }
 
+    /// Send plaintext application data, fragmenting and
+    /// encrypting it as it goes out.
+    ///
+    /// If internal buffers are too small, this function will not accept
+    /// all the data.
+    #[cfg(feature = "std")]
+    pub(crate) fn buffer_plaintext(
+        &mut self,
+        payload: OutboundChunks<'_>,
+        sendable_plaintext: &mut ChunkVecBuffer,
+    ) -> usize {
+        self.perhaps_write_key_update();
+        if !self.may_send_application_data {
+            // If we haven't completed handshaking, buffer
+            // plaintext to send once we do.
+            return sendable_plaintext.append_limited_copy(payload);
+        }
+
+        self.send_plain_non_buffering(payload, Limit::Yes)
+    }
+
     fn send_plain_non_buffering(&mut self, payload: OutboundChunks<'_>, limit: Limit) -> usize {
         debug_assert!(self.may_send_application_data);
         debug_assert!(self.record_layer.is_encrypting());
-
-        if payload.is_empty() {
-            // Don't send empty fragments.
-            return 0;
-        }
-
         self.send_appdata_encrypt(payload, limit)
     }
 
@@ -435,8 +464,12 @@ impl CommonState {
         sendable_plaintext: &mut Option<&mut ChunkVecBuffer>,
     ) {
         self.may_send_application_data = true;
-        if let Some(sendable_plaintext) = sendable_plaintext {
-            self.flush_plaintext(sendable_plaintext);
+        let Some(sendable_plaintext) = sendable_plaintext else {
+            return;
+        };
+
+        while let Some(buf) = sendable_plaintext.pop() {
+            self.send_plain_non_buffering(buf.as_slice().into(), Limit::No);
         }
     }
 
@@ -446,18 +479,6 @@ impl CommonState {
     pub(crate) fn start_traffic(&mut self, sendable_plaintext: &mut Option<&mut ChunkVecBuffer>) {
         self.may_receive_application_data = true;
         self.start_outgoing_traffic(sendable_plaintext);
-    }
-
-    /// Send any buffered plaintext.  Plaintext is buffered if
-    /// written during handshake.
-    fn flush_plaintext(&mut self, sendable_plaintext: &mut ChunkVecBuffer) {
-        if !self.may_send_application_data {
-            return;
-        }
-
-        while let Some(buf) = sendable_plaintext.pop() {
-            self.send_plain_non_buffering(buf.as_slice().into(), Limit::No);
-        }
     }
 
     // Put m into sendable_tls for writing.
@@ -524,11 +545,6 @@ impl CommonState {
 
     pub(crate) fn missing_extension(&mut self, why: PeerMisbehaved) -> Error {
         self.send_fatal_alert(AlertDescription::MissingExtension, why)
-    }
-
-    fn send_warning_alert(&mut self, desc: AlertDescription) {
-        warn!("Sending warning alert {desc:?}");
-        self.send_warning_alert_no_log(desc);
     }
 
     pub(crate) fn process_alert(&mut self, alert: &AlertMessagePayload) -> Result<(), Error> {
@@ -677,12 +693,6 @@ impl CommonState {
             .set_max_fragment_size(new)
     }
 
-    pub(crate) fn get_alpn_protocol(&self) -> Option<&[u8]> {
-        self.alpn_protocol
-            .as_ref()
-            .map(AsRef::as_ref)
-    }
-
     /// Returns true if the caller should call [`Connection::read_tls`] as soon
     /// as possible.
     ///
@@ -740,59 +750,6 @@ impl CommonState {
                 .encrypt_outgoing(message.borrow_outbound())
                 .encode(),
         );
-    }
-}
-
-#[cfg(feature = "std")]
-impl CommonState {
-    /// Send plaintext application data, fragmenting and
-    /// encrypting it as it goes out.
-    ///
-    /// If internal buffers are too small, this function will not accept
-    /// all the data.
-    pub(crate) fn buffer_plaintext(
-        &mut self,
-        payload: OutboundChunks<'_>,
-        sendable_plaintext: &mut ChunkVecBuffer,
-    ) -> usize {
-        self.perhaps_write_key_update();
-        self.send_plain(payload, Limit::Yes, sendable_plaintext)
-    }
-
-    pub(crate) fn send_early_plaintext(&mut self, data: &[u8]) -> usize {
-        debug_assert!(self.early_traffic);
-        debug_assert!(self.record_layer.is_encrypting());
-
-        if data.is_empty() {
-            // Don't send empty fragments.
-            return 0;
-        }
-
-        self.send_appdata_encrypt(data.into(), Limit::Yes)
-    }
-
-    /// Encrypt and send some plaintext `data`.  `limit` controls
-    /// whether the per-connection buffer limits apply.
-    ///
-    /// Returns the number of bytes written from `data`: this might
-    /// be less than `data.len()` if buffer limits were exceeded.
-    fn send_plain(
-        &mut self,
-        payload: OutboundChunks<'_>,
-        limit: Limit,
-        sendable_plaintext: &mut ChunkVecBuffer,
-    ) -> usize {
-        if !self.may_send_application_data {
-            // If we haven't completed handshaking, buffer
-            // plaintext to send once we do.
-            let len = match limit {
-                Limit::Yes => sendable_plaintext.append_limited_copy(payload),
-                Limit::No => sendable_plaintext.append(payload.to_vec()),
-            };
-            return len;
-        }
-
-        self.send_plain_non_buffering(payload, limit)
     }
 }
 

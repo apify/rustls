@@ -2,27 +2,27 @@
 
 #![allow(clippy::disallowed_types, clippy::duplicate_mod)]
 
+use core::fmt::Debug;
 use std::borrow::Cow;
-use std::fmt::Debug;
+use std::io;
 use std::sync::{Arc, Mutex};
-use std::{io, mem};
 
 use pki_types::{DnsName, SubjectPublicKeyInfoDer};
 use provider::cipher_suite;
 use rustls::client::Resumption;
 use rustls::crypto::cipher::{Payload, PlainMessage};
+use rustls::crypto::kx::NamedGroup;
 use rustls::crypto::{
-    Credentials, CryptoProvider, Identity, SelectedCredential, Signer, SigningKey,
+    CipherSuite, Credentials, CryptoProvider, Identity, InconsistentKeys, SelectedCredential,
+    SignatureScheme, Signer, SigningKey,
 };
-use rustls::enums::{
-    AlertDescription, CipherSuite, ContentType, HandshakeType, ProtocolVersion, SignatureScheme,
-};
-use rustls::error::{ApiMisuse, CertificateError, Error, InconsistentKeys, PeerMisbehaved};
+use rustls::enums::{ContentType, HandshakeType, ProtocolVersion};
+use rustls::error::{AlertDescription, ApiMisuse, CertificateError, Error, PeerMisbehaved};
 use rustls::internal::msgs::message::{Message, MessagePayload};
-use rustls::server::{ClientHello, ParsedCertificate, ServerCredentialResolver};
+use rustls::server::{Acceptor, ClientHello, ParsedCertificate, ServerCredentialResolver};
 use rustls::{
-    ClientConfig, ClientConnection, HandshakeKind, KeyingMaterialExporter, NamedGroup,
-    ServerConfig, ServerConnection, SupportedCipherSuite,
+    ClientConfig, ClientConnection, HandshakeKind, KeyingMaterialExporter, ServerConfig,
+    ServerConnection, SupportedCipherSuite,
 };
 #[cfg(feature = "aws-lc-rs")]
 use rustls::{
@@ -1017,21 +1017,21 @@ fn assert_lt(left: usize, right: usize) {
 #[test]
 fn connection_types_are_not_huge() {
     // Arbitrary sizes
-    assert_lt(mem::size_of::<ServerConnection>(), 1600);
-    assert_lt(mem::size_of::<ClientConnection>(), 1600);
+    assert_lt(size_of::<ServerConnection>(), 1600);
+    assert_lt(size_of::<ClientConnection>(), 1600);
     assert_lt(
-        mem::size_of::<rustls::server::UnbufferedServerConnection>(),
+        size_of::<rustls::server::UnbufferedServerConnection>(),
         1600,
     );
     assert_lt(
-        mem::size_of::<rustls::client::UnbufferedClientConnection>(),
+        size_of::<rustls::client::UnbufferedClientConnection>(),
         1600,
     );
 }
 
 #[test]
 fn test_client_rejects_illegal_tls13_ccs() {
-    fn corrupt_ccs(msg: &mut Message) -> Altered {
+    fn corrupt_ccs(msg: &mut Message<'_>) -> Altered {
         if let MessagePayload::ChangeCipherSpec(_) = &mut msg.payload {
             println!("seen CCS {msg:?}");
             return Altered::Raw(encoding::message_framing(
@@ -1097,12 +1097,11 @@ fn test_no_warning_logging_during_successful_sessions() {
 #[cfg(all(feature = "ring", feature = "aws-lc-rs"))]
 #[test]
 fn test_explicit_provider_selection() {
-    let client_config = rustls::ClientConfig::builder(rustls_ring::DEFAULT_PROVIDER.into())
-        .finish(KeyType::Rsa2048);
+    let client_config =
+        ClientConfig::builder(rustls_ring::DEFAULT_PROVIDER.into()).finish(KeyType::Rsa2048);
 
-    let server_config =
-        rustls::ServerConfig::builder(rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER.into())
-            .finish(KeyType::Rsa2048);
+    let server_config = ServerConfig::builder(rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER.into())
+        .finish(KeyType::Rsa2048);
 
     let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
     do_handshake(&mut client, &mut server);
@@ -1141,7 +1140,7 @@ fn test_client_construction_fails_if_random_source_fails_in_first_request() {
         rand_queue: Mutex::new(b""),
     };
 
-    let client_config = rustls::ClientConfig::builder(
+    let client_config = ClientConfig::builder(
         CryptoProvider {
             secure_random: &FAULTY_RANDOM,
             ..provider::DEFAULT_PROVIDER
@@ -1162,7 +1161,7 @@ fn test_client_construction_fails_if_random_source_fails_in_second_request() {
         rand_queue: Mutex::new(b"nice random number generator huh"),
     };
 
-    let client_config = rustls::ClientConfig::builder(
+    let client_config = ClientConfig::builder(
         CryptoProvider {
             secure_random: &FAULTY_RANDOM,
             ..provider::DEFAULT_PROVIDER
@@ -1186,7 +1185,7 @@ fn test_client_construction_requires_66_bytes_of_random_material() {
         ),
     };
 
-    let client_config = rustls::ClientConfig::builder(
+    let client_config = ClientConfig::builder(
         CryptoProvider {
             secure_random: &FAULTY_RANDOM,
             ..provider::DEFAULT_PROVIDER
@@ -1201,7 +1200,7 @@ fn test_client_construction_requires_66_bytes_of_random_material() {
 
 #[test]
 fn test_client_removes_tls12_session_if_server_sends_undecryptable_first_message() {
-    fn inject_corrupt_finished_message(msg: &mut Message) -> Altered {
+    fn inject_corrupt_finished_message(msg: &mut Message<'_>) -> Altered {
         if let MessagePayload::ChangeCipherSpec(_) = msg.payload {
             // interdict "real" ChangeCipherSpec with its encoding, plus a faulty encrypted Finished.
             let mut raw_change_cipher_spec = encoding::message_framing(
@@ -1543,7 +1542,7 @@ fn large_client_hello() {
 
 #[test]
 fn large_client_hello_acceptor() {
-    let mut acceptor = rustls::server::Acceptor::default();
+    let mut acceptor = Acceptor::default();
     let hello = include_bytes!("../data/bug2227-clienthello.bin");
     let mut cursor = io::Cursor::new(hello);
     loop {
@@ -1557,14 +1556,36 @@ fn large_client_hello_acceptor() {
 }
 
 #[test]
+fn excess_client_hello_acceptor() {
+    // this is a trivial ClientHello, followed by a fragment of a ClientHello
+    let mut hello = encoding::basic_client_hello(vec![]);
+    hello.extend(&hello[..10].to_vec());
+    let hello = encoding::message_framing(ContentType::Handshake, ProtocolVersion::TLSv1_2, hello);
+
+    let mut acceptor = Acceptor::default();
+    acceptor
+        .read_tls(&mut io::Cursor::new(hello))
+        .unwrap();
+    let (error, mut alert) = acceptor.accept().unwrap_err();
+    assert_eq!(error, PeerMisbehaved::KeyEpochWithPendingFragment.into());
+
+    let mut alert_buf = vec![];
+    alert.write(&mut alert_buf).unwrap();
+    assert_eq!(
+        alert_buf,
+        encoding::alert(AlertDescription::UnexpectedMessage, &[])
+    );
+}
+
+#[test]
 fn server_invalid_sni_policy() {
     const SERVER_NAME_GOOD: &str = "LXXXxxxXXXR";
     const SERVER_NAME_BAD: &str = "[XXXxxxXXX]";
     const SERVER_NAME_IPV4: &str = "10.11.12.13";
 
-    fn replace_sni(sni_replacement: &str) -> impl Fn(&mut Message) -> Altered + '_ {
+    fn replace_sni(sni_replacement: &str) -> impl Fn(&mut Message<'_>) -> Altered + '_ {
         assert_eq!(sni_replacement.len(), SERVER_NAME_GOOD.len());
-        move |m: &mut Message| match &mut m.payload {
+        move |m: &mut Message<'_>| match &mut m.payload {
             MessagePayload::Handshake { parsed: _, encoded } => {
                 let mut payload_bytes = encoded.bytes().to_vec();
                 if let Some(ind) = payload_bytes
@@ -1613,7 +1634,7 @@ fn server_invalid_sni_policy() {
         let mut server_config = make_server_config(KeyType::EcdsaP256, &provider);
 
         server_config.cert_resolver = Arc::new(ServerCheckSni {
-            expect_sni: matches!(expected_result, ExpectedResult::Accept),
+            expect_sni: matches!(expected_result, Accept),
         });
         server_config.invalid_sni_policy = policy;
 
@@ -1642,7 +1663,7 @@ struct ServerCheckSni {
 }
 
 impl ServerCredentialResolver for ServerCheckSni {
-    fn resolve(&self, client_hello: &ClientHello) -> Result<SelectedCredential, Error> {
+    fn resolve(&self, client_hello: &ClientHello<'_>) -> Result<SelectedCredential, Error> {
         assert_eq!(client_hello.server_name().is_some(), self.expect_sni);
         Err(Error::NoSuitableCertificate)
     }

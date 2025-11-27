@@ -5,8 +5,7 @@
 use std::sync::Arc;
 
 use rustls::client::Resumption;
-use rustls::enums::AlertDescription;
-use rustls::error::{ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
+use rustls::error::{AlertDescription, ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
 use rustls::quic::{self, ConnectionCommon};
 use rustls::{HandshakeKind, Side, SideData};
 use rustls_test::{
@@ -568,7 +567,7 @@ fn test_quic_resumption_data_0rtt() {
 
     // Verify server can parse and use the received 0-RTT parameters
     if let Some(received_params) = server2.received_resumption_data() {
-        let params_str = std::str::from_utf8(received_params).unwrap();
+        let params_str = core::str::from_utf8(received_params).unwrap();
         assert!(params_str.contains("active_connection_id_limit=2"));
         assert!(params_str.contains("initial_max_data=1048576"));
         assert!(params_str.contains("initial_max_stream_data_bidi_local=262144"));
@@ -628,7 +627,7 @@ fn packet_key_api() {
     let header_len = PLAIN_HEADER.len();
     let tag_len = client_keys.local.packet.tag_len();
     let padding_len = 1200 - header_len - PAYLOAD.len() - tag_len;
-    buf.extend(std::iter::repeat_n(0, padding_len));
+    buf.extend(core::iter::repeat_n(0, padding_len));
     let (header, payload) = buf.split_at_mut(header_len);
     let tag = client_keys
         .local
@@ -838,4 +837,29 @@ fn test_fragmented_append() {
     // an index out of range error:
     //   range end index 8192 out of range for slice of length 4096
     client.read_hs(&out).unwrap();
+}
+
+#[test]
+fn server_rejects_client_hello_with_trailing_fragment() {
+    let mut server = quic::ServerConnection::new(
+        Arc::new(make_server_config(
+            KeyType::EcdsaP256,
+            &provider::DEFAULT_TLS13_PROVIDER,
+        )),
+        quic::Version::V2,
+        b"server params".to_vec(),
+    )
+    .unwrap();
+
+    // this is a trivial ClientHello, followed by a fragment of a ClientHello
+    let mut hello =
+        encoding::basic_client_hello(vec![encoding::Extension::new_quic_transport_params(
+            b"client params",
+        )]);
+    hello.extend(&hello[..10].to_vec());
+
+    assert_eq!(
+        server.read_hs(&hello).unwrap_err(),
+        PeerMisbehaved::KeyEpochWithPendingFragment.into()
+    );
 }

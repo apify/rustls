@@ -8,16 +8,15 @@ use std::io;
 use kernel::KernelConnection;
 
 use crate::common_state::{CommonState, DEFAULT_BUFFER_LIMIT, IoState, State};
-use crate::crypto::cipher::InboundPlainMessage;
-use crate::enums::{AlertDescription, ContentType, ProtocolVersion};
-use crate::error::{ApiMisuse, Error, PeerMisbehaved};
-use crate::msgs::deframer::DeframerIter;
-use crate::msgs::deframer::buffers::{BufferProgress, DeframerVecBuffer, Delocator, Locator};
-use crate::msgs::deframer::handshake::HandshakeDeframer;
+use crate::crypto::cipher::{Decrypted, InboundPlainMessage};
+use crate::enums::{ContentType, ProtocolVersion};
+use crate::error::{AlertDescription, ApiMisuse, Error, PeerMisbehaved};
+use crate::msgs::deframer::{
+    BufferProgress, DeframerIter, DeframerVecBuffer, Delocator, HandshakeDeframer, Locator,
+};
 use crate::msgs::handshake::Random;
 #[cfg(feature = "std")]
 use crate::msgs::message::Message;
-use crate::record_layer::Decrypted;
 use crate::suites::ExtractedSecrets;
 use crate::vecbuf::ChunkVecBuffer;
 
@@ -770,6 +769,7 @@ impl<Side: SideData> ConnectionCommon<Side> {
             Some(Ok(msg)) => {
                 self.deframer_buffer
                     .discard(buffer_progress.take_discard());
+                self.core.common_state.aligned_handshake = self.core.hs_deframer.aligned();
                 Ok(Some(msg))
             }
             Some(Err(err)) => Err(self.send_fatal_alert(AlertDescription::DecodeError, err)),
@@ -1080,7 +1080,7 @@ impl<Side: SideData> ConnectionCore<Side> {
                 {
                     // failed decryption during trial decryption is not allowed to be
                     // interleaved with partial handshake data.
-                    Ok(None) if !self.hs_deframer.is_aligned() => {
+                    Ok(None) if self.hs_deframer.aligned().is_none() => {
                         return Err(
                             PeerMisbehaved::RejectedEarlyDataInterleavedWithHandshakeMessage.into(),
                         );
@@ -1106,7 +1106,7 @@ impl<Side: SideData> ConnectionCore<Side> {
                 break (plaintext, iter.bytes_consumed());
             };
 
-            if !self.hs_deframer.is_aligned() && message.typ != ContentType::Handshake {
+            if self.hs_deframer.aligned().is_none() && message.typ != ContentType::Handshake {
                 // "Handshake messages MUST NOT be interleaved with other record
                 // types.  That is, if a handshake message is split over two or more
                 // records, there MUST NOT be any other records between them."
@@ -1150,7 +1150,7 @@ impl<Side: SideData> ConnectionCore<Side> {
                 .input_message(message, &locator, buffer_progress.processed());
             self.hs_deframer.coalesce(buffer)?;
 
-            self.common_state.aligned_handshake = self.hs_deframer.is_aligned();
+            self.common_state.aligned_handshake = self.hs_deframer.aligned();
 
             if self.hs_deframer.has_message_ready() {
                 // trial decryption finishes with the first handshake message after it started.

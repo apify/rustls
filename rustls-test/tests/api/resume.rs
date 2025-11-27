@@ -2,18 +2,17 @@
 
 #![allow(clippy::disallowed_types, clippy::duplicate_mod)]
 
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::fmt;
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustls::client::Resumption;
+use rustls::crypto::kx::NamedGroup;
 use rustls::crypto::{CertificateIdentity, Identity};
 use rustls::enums::ProtocolVersion;
 use rustls::error::{ApiMisuse, Error, PeerMisbehaved};
-use rustls::{
-    ClientConfig, ClientConnection, HandshakeKind, NamedGroup, ServerConfig, ServerConnection,
-};
+use rustls::{ClientConfig, ClientConnection, HandshakeKind, ServerConfig, ServerConnection};
 use rustls_test::{
     ClientStorage, ClientStorageOp, ErrorFromPeer, KeyType, ServerConfigExt, do_handshake,
     do_handshake_until_error, make_client_config, make_client_config_with_auth, make_pair,

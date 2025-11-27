@@ -4,10 +4,11 @@ use alloc::vec::Vec;
 use aws_lc_rs::kem;
 
 use super::INVALID_KEY_SHARE;
-use crate::crypto::{
+use crate::Error;
+use crate::crypto::NamedGroup;
+use crate::crypto::kx::{
     ActiveKeyExchange, CompletedKeyExchange, SharedSecret, StartedKeyExchange, SupportedKxGroup,
 };
-use crate::{Error, NamedGroup};
 
 #[derive(Debug)]
 pub(crate) struct MlKem768;

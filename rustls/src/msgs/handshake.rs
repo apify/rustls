@@ -10,13 +10,17 @@ use core::{fmt, iter};
 use pki_types::{CertificateDer, DnsName};
 
 use crate::crypto::cipher::Payload;
-use crate::crypto::{ActiveKeyExchange, SecureRandom, SelectedCredential};
+use crate::crypto::hpke::{HpkeKem, HpkeSymmetricCipherSuite};
+use crate::crypto::kx::ffdhe::FfdheGroup;
+use crate::crypto::kx::{ActiveKeyExchange, KeyExchangeAlgorithm, NamedGroup};
+use crate::crypto::{
+    CipherSuite, GetRandomFailed, SecureRandom, SelectedCredential, SignatureScheme,
+};
 use crate::enums::{
-    CertificateCompressionAlgorithm, CertificateType, CipherSuite, EchClientHelloType,
-    HandshakeType, ProtocolVersion, SignatureScheme,
+    CertificateCompressionAlgorithm, CertificateType, EchClientHelloType, HandshakeType,
+    ProtocolVersion,
 };
 use crate::error::InvalidMessage;
-use crate::ffdhe_groups::FfdheGroup;
 use crate::log::warn;
 use crate::msgs::base::{MaybeEmpty, NonEmpty, PayloadU8, PayloadU16, PayloadU24};
 use crate::msgs::codec::{
@@ -25,13 +29,10 @@ use crate::msgs::codec::{
 };
 use crate::msgs::enums::{
     CertificateStatusType, ClientCertificateType, Compression, ECCurveType, ECPointFormat,
-    EchVersion, ExtensionType, HpkeAead, HpkeKdf, HpkeKem, KeyUpdateRequest, NamedGroup,
-    PskKeyExchangeMode, ServerNameType,
+    EchVersion, ExtensionType, KeyUpdateRequest, PskKeyExchangeMode, ServerNameType,
 };
-use crate::rand;
 use crate::sync::Arc;
-use crate::verify::DigitallySignedStruct;
-use crate::x509::wrap_in_sequence;
+use crate::verify::{DigitallySignedStruct, DistinguishedName};
 
 /// Create a newtype wrapper around a given type.
 ///
@@ -101,7 +102,7 @@ impl Codec<'_> for Random {
 }
 
 impl Random {
-    pub(crate) fn new(secure_random: &dyn SecureRandom) -> Result<Self, rand::GetRandomFailed> {
+    pub(crate) fn new(secure_random: &dyn SecureRandom) -> Result<Self, GetRandomFailed> {
         let mut data = [0u8; 32];
         secure_random.fill(&mut data)?;
         Ok(Self(data))
@@ -166,7 +167,7 @@ impl Codec<'_> for SessionId {
 }
 
 impl SessionId {
-    pub(crate) fn random(secure_random: &dyn SecureRandom) -> Result<Self, rand::GetRandomFailed> {
+    pub(crate) fn random(secure_random: &dyn SecureRandom) -> Result<Self, GetRandomFailed> {
         let mut data = [0u8; 32];
         secure_random.fill(&mut data)?;
         Ok(Self { data, len: 32 })
@@ -1863,18 +1864,6 @@ impl<'a> Codec<'a> for CertificatePayloadTls13<'a> {
     }
 }
 
-/// Describes supported key exchange mechanisms.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[non_exhaustive]
-pub enum KeyExchangeAlgorithm {
-    /// Diffie-Hellman Key exchange (with only known parameters as defined in [RFC 7919]).
-    ///
-    /// [RFC 7919]: https://datatracker.ietf.org/doc/html/rfc7919
-    DHE,
-    /// Key exchange performed via elliptic curve Diffie-Hellman.
-    ECDHE,
-}
-
 pub(crate) static ALL_KEY_EXCHANGE_ALGORITHMS: &[KeyExchangeAlgorithm] =
     &[KeyExchangeAlgorithm::ECDHE, KeyExchangeAlgorithm::DHE];
 
@@ -2163,51 +2152,6 @@ impl TlsListElement for ClientCertificateType {
     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
         empty_error: InvalidMessage::IllegalEmptyList("ClientCertificateTypes"),
     };
-}
-
-wrapped_payload!(
-    /// A `DistinguishedName` is a `Vec<u8>` wrapped in internal types.
-    ///
-    /// It contains the DER or BER encoded [`Subject` field from RFC 5280](https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.2.6)
-    /// for a single certificate. The Subject field is [encoded as an RFC 5280 `Name`](https://datatracker.ietf.org/doc/html/rfc5280#page-116).
-    /// It can be decoded using [x509-parser's FromDer trait](https://docs.rs/x509-parser/latest/x509_parser/prelude/trait.FromDer.html).
-    ///
-    /// ```ignore
-    /// for name in distinguished_names {
-    ///     use x509_parser::prelude::FromDer;
-    ///     println!("{}", x509_parser::x509::X509Name::from_der(&name.0)?.1);
-    /// }
-    /// ```
-    ///
-    /// The TLS encoding is defined in RFC5246: `opaque DistinguishedName<1..2^16-1>;`
-    pub struct DistinguishedName,
-    PayloadU16<NonEmpty>,
-);
-
-impl DistinguishedName {
-    /// Create a [`DistinguishedName`] after prepending its outer SEQUENCE encoding.
-    ///
-    /// This can be decoded using [x509-parser's FromDer trait](https://docs.rs/x509-parser/latest/x509_parser/prelude/trait.FromDer.html).
-    ///
-    /// ```ignore
-    /// use x509_parser::prelude::FromDer;
-    /// println!("{}", x509_parser::x509::X509Name::from_der(dn.as_ref())?.1);
-    /// ```
-    pub fn in_sequence(bytes: &[u8]) -> Self {
-        Self(PayloadU16::new(wrap_in_sequence(bytes)))
-    }
-}
-
-impl PartialEq for DistinguishedName {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.0 == other.0.0
-    }
-}
-
-/// RFC8446: `DistinguishedName authorities<3..2^16-1>;` however,
-/// RFC5246: `DistinguishedName certificate_authorities<0..2^16-1>;`
-impl TlsListElement for DistinguishedName {
-    const SIZE_LEN: ListLength = ListLength::U16;
 }
 
 #[derive(Debug)]
@@ -2804,34 +2748,6 @@ impl<'a> HandshakeMessagePayload<'a> {
     }
 }
 
-#[expect(clippy::exhaustive_structs)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct HpkeSymmetricCipherSuite {
-    pub kdf_id: HpkeKdf,
-    pub aead_id: HpkeAead,
-}
-
-impl Codec<'_> for HpkeSymmetricCipherSuite {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        self.kdf_id.encode(bytes);
-        self.aead_id.encode(bytes);
-    }
-
-    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
-        Ok(Self {
-            kdf_id: HpkeKdf::read(r)?,
-            aead_id: HpkeAead::read(r)?,
-        })
-    }
-}
-
-/// draft-ietf-tls-esni-24: `HpkeSymmetricCipherSuite cipher_suites<4..2^16-4>;`
-impl TlsListElement for HpkeSymmetricCipherSuite {
-    const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
-        empty_error: InvalidMessage::IllegalEmptyList("HpkeSymmetricCipherSuites"),
-    };
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct HpkeKeyConfig {
     pub config_id: u8,
@@ -3169,6 +3085,7 @@ fn low_quality_integer_hash(mut x: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::hpke::{HpkeAead, HpkeKdf};
 
     #[test]
     fn test_ech_config_dupe_exts() {

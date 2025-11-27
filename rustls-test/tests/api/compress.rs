@@ -1,16 +1,16 @@
 #![allow(clippy::disallowed_types, clippy::duplicate_mod)]
 
 #[cfg(feature = "zlib")]
-use std::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "zlib")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[cfg(feature = "zlib")]
 use rustls::client::Resumption;
 #[cfg(feature = "zlib")]
 use rustls::crypto::{Credentials, Identity, SingleCredential};
-use rustls::enums::{AlertDescription, CertificateCompressionAlgorithm};
-use rustls::error::{Error, InvalidMessage, PeerMisbehaved};
+use rustls::enums::CertificateCompressionAlgorithm;
+use rustls::error::{AlertDescription, Error, InvalidMessage, PeerMisbehaved};
 #[cfg(feature = "zlib")]
 use rustls::pki_types::CertificateDer;
 #[cfg(feature = "zlib")]

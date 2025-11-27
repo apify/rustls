@@ -6,11 +6,10 @@ use webpki::aws_lc_rs as webpki_algs;
 
 use super::signer::SigningKey;
 use crate::crypto::{
-    CryptoProvider, KeyProvider, SecureRandom, SupportedKxGroup, TicketProducer, TicketerFactory,
+    CryptoProvider, GetRandomFailed, KeyProvider, SecureRandom, SignatureScheme, SupportedKxGroup,
+    TicketProducer, TicketerFactory,
 };
-use crate::enums::SignatureScheme;
 use crate::error::{Error, OtherError};
-use crate::rand::GetRandomFailed;
 use crate::sync::Arc;
 #[cfg(feature = "std")]
 use crate::ticketer::TicketRotator;
@@ -325,7 +324,7 @@ pub static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
 mod ring_shim {
     use aws_lc_rs::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey};
 
-    use crate::crypto::SharedSecret;
+    use crate::crypto::kx::SharedSecret;
 
     pub(super) fn agree_ephemeral(
         priv_key: EphemeralPrivateKey,

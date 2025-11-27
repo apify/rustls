@@ -4,20 +4,6 @@
 // https://boringssl.googlesource.com/boringssl/+/master/ssl/test
 //
 
-#![warn(
-    clippy::alloc_instead_of_core,
-    clippy::manual_let_else,
-    clippy::std_instead_of_core,
-    clippy::use_self,
-    clippy::upper_case_acronyms,
-    elided_lifetimes_in_paths,
-    trivial_numeric_casts,
-    unreachable_pub,
-    unused_import_braces,
-    unused_extern_crates,
-    unused_qualifications
-)]
-
 use core::fmt::{Debug, Formatter};
 use std::borrow::Cow;
 use std::io::{self, Read, Write};
@@ -38,15 +24,15 @@ use rustls::client::{
 };
 use rustls::crypto::aws_lc_rs::hpke;
 use rustls::crypto::hpke::{Hpke, HpkePublicKey};
+use rustls::crypto::kx::NamedGroup;
 use rustls::crypto::{
-    Credentials, CryptoProvider, Identity, SelectedCredential, Signer, SigningKey,
+    Credentials, CryptoProvider, Identity, SelectedCredential, SignatureScheme, Signer, SigningKey,
     SingleCredential, aws_lc_rs,
 };
-use rustls::enums::{
-    AlertDescription, CertificateCompressionAlgorithm, CertificateType, ProtocolVersion,
-    SignatureScheme,
+use rustls::enums::{CertificateCompressionAlgorithm, CertificateType, ProtocolVersion};
+use rustls::error::{
+    AlertDescription, CertificateError, Error, InvalidMessage, PeerIncompatible, PeerMisbehaved,
 };
-use rustls::error::{CertificateError, Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
 use rustls::internal::msgs::codec::Codec;
 use rustls::internal::msgs::persist::ServerSessionValue;
 use rustls::pki_types::pem::PemObject;
@@ -55,9 +41,7 @@ use rustls::pki_types::{
 };
 use rustls::server::danger::{ClientIdentity, ClientVerifier, SignatureVerificationInput};
 use rustls::server::{self, ClientHello, ServerConfig, ServerConnection, WebPkiClientVerifier};
-use rustls::{
-    Connection, DistinguishedName, HandshakeKind, NamedGroup, RootCertStore, Side, compress,
-};
+use rustls::{Connection, DistinguishedName, HandshakeKind, RootCertStore, Side, compress};
 
 pub fn main() {
     let mut args: Vec<_> = env::args().collect();
