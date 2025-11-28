@@ -6,20 +6,25 @@ use std::vec;
 
 use super::ServerConnectionData;
 use super::hs::ClientHelloInput;
+use crate::TEST_PROVIDERS;
 use crate::common_state::{CommonState, Context, KxState, Side};
 use crate::crypto::cipher::FakeAead;
 use crate::crypto::hash::FakeHash;
+use crate::crypto::kx::ffdhe::{FFDHE2048, FfdheGroup};
+use crate::crypto::kx::{
+    ActiveKeyExchange, KeyExchangeAlgorithm, NamedGroup, SharedSecret, StartedKeyExchange,
+    SupportedKxGroup,
+};
 use crate::crypto::tls12::FakePrf;
 use crate::crypto::{
-    ActiveKeyExchange, Credentials, CryptoProvider, Identity, KeyExchangeAlgorithm, SharedSecret,
-    SingleCredential, StartedKeyExchange, SupportedKxGroup, tls12_only,
+    CipherSuite, Credentials, CryptoProvider, Identity, SignatureScheme, SingleCredential,
+    tls12_only,
 };
-use crate::enums::{CertificateType, CipherSuite, ProtocolVersion, SignatureScheme};
+use crate::enums::{CertificateType, ProtocolVersion};
 use crate::error::{Error, PeerIncompatible};
-use crate::ffdhe_groups::FfdheGroup;
 use crate::msgs::base::PayloadU16;
-use crate::msgs::deframer::buffers::Locator;
-use crate::msgs::enums::{Compression, NamedGroup};
+use crate::msgs::deframer::Locator;
+use crate::msgs::enums::Compression;
 use crate::msgs::handshake::{
     ClientExtensions, ClientHelloPayload, HandshakeMessagePayload, HandshakePayload, KeyShareEntry,
     Random, SessionId, SupportedProtocolVersions,
@@ -32,7 +37,6 @@ use crate::suites::CipherSuiteCommon;
 use crate::sync::Arc;
 use crate::tls12::Tls12CipherSuite;
 use crate::version::TLS12_VERSION;
-use crate::{TEST_PROVIDERS, ffdhe_groups};
 
 #[test]
 fn null_compression_required() {
@@ -315,7 +319,7 @@ struct FakeFfdheGroup;
 
 impl SupportedKxGroup for FakeFfdheGroup {
     fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
-        Some(ffdhe_groups::FFDHE2048)
+        Some(FFDHE2048)
     }
 
     fn name(&self) -> NamedGroup {
@@ -341,7 +345,7 @@ impl ActiveKeyExchange for ActiveFakeFfdhe {
     }
 
     fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
-        Some(ffdhe_groups::FFDHE2048)
+        Some(FFDHE2048)
     }
 
     fn group(&self) -> NamedGroup {

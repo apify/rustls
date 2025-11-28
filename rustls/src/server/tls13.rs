@@ -6,19 +6,18 @@ pub(crate) use client_hello::TLS13_HANDLER;
 use pki_types::UnixTime;
 use subtle::ConstantTimeEq;
 
+use super::connection::ServerConnectionData;
 use super::hs::{self, HandshakeHashOrBuffer, ServerContext};
-use super::server_conn::ServerConnectionData;
 use crate::check::{inappropriate_handshake_message, inappropriate_message};
 use crate::common_state::{
     CommonState, HandshakeFlightTls13, HandshakeKind, Protocol, Side, State,
 };
 use crate::conn::ConnectionRandoms;
 use crate::conn::kernel::{Direction, KernelContext, KernelState};
-use crate::crypto::Identity;
-use crate::enums::{
-    AlertDescription, CertificateType, ContentType, HandshakeType, ProtocolVersion,
-};
-use crate::error::{Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
+use crate::crypto::kx::NamedGroup;
+use crate::crypto::{Identity, rand};
+use crate::enums::{CertificateType, ContentType, HandshakeType, ProtocolVersion};
+use crate::error::{AlertDescription, Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHash;
 use crate::log::{debug, trace, warn};
 use crate::msgs::codec::{CERTIFICATE_MAX_SIZE_LIMIT, Codec, Reader};
@@ -39,16 +38,18 @@ use crate::tls13::{
     Tls13CipherSuite, construct_client_verify_message, construct_server_verify_message,
 };
 use crate::verify::ClientIdentity;
-use crate::{ConnectionTrafficSecrets, compress, rand, verify};
+use crate::{ConnectionTrafficSecrets, compress, verify};
 
 mod client_hello {
     use super::*;
     use crate::compress::CertCompressor;
     use crate::crypto::cipher::Payload;
-    use crate::crypto::{SelectedCredential, Signer, SupportedKxGroup};
+    use crate::crypto::kx::SupportedKxGroup;
+    use crate::crypto::{SelectedCredential, Signer};
     use crate::msgs::base::PayloadU8;
     use crate::msgs::ccs::ChangeCipherSpecPayload;
-    use crate::msgs::enums::{Compression, NamedGroup};
+    use crate::msgs::deframer::HandshakeAlignedProof;
+    use crate::msgs::enums::Compression;
     use crate::msgs::handshake::{
         CertificatePayloadTls13, CertificateRequestExtensions, CertificateRequestPayloadTls13,
         ClientHelloPayload, HelloRetryRequest, HelloRetryRequestExtensions, KeyShareEntry, Random,
@@ -361,9 +362,10 @@ mod client_hello {
 
             // If we're not doing early data, then the next messages we receive
             // are encrypted with the handshake keys.
+            let proof = cx.common.check_aligned_handshake()?;
             match doing_early_data {
                 EarlyDataDecision::Disabled => {
-                    key_schedule.set_handshake_decrypter(None, cx.common);
+                    key_schedule.set_handshake_decrypter(None, cx.common, &proof);
                     cx.data.early_data.reject();
                 }
                 EarlyDataDecision::RequestedButRejected => {
@@ -373,6 +375,7 @@ mod client_hello {
                     key_schedule.set_handshake_decrypter(
                         Some(max_early_data_size(st.config.max_early_data_size)),
                         cx.common,
+                        &proof,
                     );
                     cx.data.early_data.reject();
                 }
@@ -383,9 +386,8 @@ mod client_hello {
                 }
             }
 
-            cx.common.check_aligned_handshake()?;
             let key_schedule_traffic =
-                emit_finished_tls13(flight, &randoms, cx, key_schedule, &st.config);
+                emit_finished_tls13(flight, &randoms, cx, key_schedule, &st.config, &proof);
 
             if !doing_client_auth && st.config.send_half_rtt_data {
                 // Application data can be sent immediately after Finished, in one
@@ -544,7 +546,7 @@ mod client_hello {
             )),
         };
 
-        cx.common.check_aligned_handshake()?;
+        let proof = cx.common.check_aligned_handshake()?;
 
         let client_hello_hash = transcript.hash_given(&[]);
 
@@ -555,11 +557,12 @@ mod client_hello {
         // Start key schedule
         let key_schedule_pre_handshake = if let Some(psk) = resuming_psk {
             let early_key_schedule = KeyScheduleEarly::new(suite, psk);
-            early_key_schedule.client_early_traffic_secret(
+            early_key_schedule.client_early_traffic_secret_for_server(
                 &client_hello_hash,
                 &*config.key_log,
                 &randoms.client,
                 cx.common,
+                &proof,
             );
 
             if config.max_early_data_size > 0 {
@@ -820,9 +823,10 @@ mod client_hello {
         cx: &mut ServerContext<'_>,
         key_schedule: KeyScheduleHandshake,
         config: &ServerConfig,
+        proof: &HandshakeAlignedProof,
     ) -> KeyScheduleTrafficWithClientFinishedPending {
         let handshake_hash = flight.transcript.current_hash();
-        let verify_data = key_schedule.sign_server_finish(&handshake_hash);
+        let verify_data = key_schedule.sign_server_finish(&handshake_hash, proof);
         let verify_data_payload = Payload::new(verify_data.as_ref());
 
         let fin = HandshakeMessagePayload(HandshakePayload::Finished(verify_data_payload));
@@ -1185,8 +1189,9 @@ impl State<ServerConnectionData> for ExpectEarlyData {
                 parsed: HandshakeMessagePayload(HandshakePayload::EndOfEarlyData),
                 ..
             } => {
+                let proof = cx.common.check_aligned_handshake()?;
                 self.key_schedule
-                    .update_decrypter(cx.common);
+                    .update_decrypter(cx.common, &proof);
                 self.transcript.add_message(&m);
                 Ok(Box::new(ExpectFinished {
                     config: self.config,
@@ -1308,9 +1313,10 @@ impl State<ServerConnectionData> for ExpectFinished {
             require_handshake_msg!(m, HandshakeType::Finished, HandshakePayload::Finished)?;
 
         let handshake_hash = self.transcript.current_hash();
+        let proof = cx.common.check_aligned_handshake()?;
         let (key_schedule_before_finished, expect_verify_data) = self
             .key_schedule
-            .sign_client_finish(&handshake_hash, cx.common);
+            .sign_client_finish(&handshake_hash, cx.common, &proof);
 
         let fin = match ConstantTimeEq::ct_eq(expect_verify_data.as_ref(), finished.bytes()).into()
         {
@@ -1325,8 +1331,6 @@ impl State<ServerConnectionData> for ExpectFinished {
         // Note: future derivations include Client Finished, but not the
         // main application data keying.
         self.transcript.add_message(&m);
-
-        cx.common.check_aligned_handshake()?;
 
         let (key_schedule_traffic, exporter, resumption) =
             key_schedule_before_finished.into_traffic(self.transcript.current_hash());
@@ -1371,7 +1375,7 @@ impl ExpectTraffic {
             ));
         }
 
-        common.check_aligned_handshake()?;
+        let proof = common.check_aligned_handshake()?;
 
         if common.should_update_key(key_update_request)? {
             self.key_schedule
@@ -1380,7 +1384,7 @@ impl ExpectTraffic {
 
         // Update our read-side keys.
         self.key_schedule
-            .update_decrypter(common);
+            .update_decrypter(common, &proof);
         Ok(())
     }
 }

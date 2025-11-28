@@ -4,24 +4,23 @@ use alloc::vec::Vec;
 use core::borrow::Borrow;
 use core::fmt;
 
-use super::server_conn::ServerConnectionData;
+use super::connection::ServerConnectionData;
 use super::{ClientHello, ServerConfig};
 use crate::SupportedCipherSuite;
 use crate::common_state::{KxState, State};
 use crate::conn::ConnectionRandoms;
 use crate::crypto::hash::Hash;
-use crate::crypto::{CryptoProvider, SelectedCredential, SupportedKxGroup};
-use crate::enums::{
-    AlertDescription, CertificateType, CipherSuite, HandshakeType, ProtocolVersion, SignatureScheme,
-};
-use crate::error::{ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
+use crate::crypto::kx::{KeyExchangeAlgorithm, NamedGroup, SupportedKxGroup};
+use crate::crypto::{CipherSuite, CryptoProvider, SelectedCredential, SignatureScheme};
+use crate::enums::{CertificateType, HandshakeType, ProtocolVersion};
+use crate::error::{AlertDescription, ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
 use crate::log::{debug, trace};
-use crate::msgs::enums::{Compression, NamedGroup};
+use crate::msgs::deframer::HandshakeAlignedProof;
+use crate::msgs::enums::Compression;
 use crate::msgs::handshake::{
-    ClientHelloPayload, HandshakePayload, KeyExchangeAlgorithm, ProtocolName, Random,
-    ServerExtensions, ServerExtensionsInput, ServerNamePayload, SessionId, SingleProtocolName,
-    TransportParameters,
+    ClientHelloPayload, HandshakePayload, ProtocolName, Random, ServerExtensions,
+    ServerExtensionsInput, ServerNamePayload, SessionId, SingleProtocolName, TransportParameters,
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
@@ -574,6 +573,7 @@ pub(crate) struct ClientHelloInput<'a> {
     pub(super) message: &'a Message<'a>,
     pub(super) client_hello: &'a ClientHelloPayload,
     pub(super) sig_schemes: Vec<SignatureScheme>,
+    pub(super) proof: HandshakeAlignedProof,
 }
 
 impl<'a> ClientHelloInput<'a> {
@@ -607,7 +607,7 @@ impl<'a> ClientHelloInput<'a> {
         }
 
         // No handshake messages should follow this one in this flight.
-        cx.common.check_aligned_handshake()?;
+        let proof = cx.common.check_aligned_handshake()?;
 
         if done_retry {
             let ch_sni = client_hello
@@ -635,6 +635,7 @@ impl<'a> ClientHelloInput<'a> {
             message,
             client_hello,
             sig_schemes: sig_schemes.to_owned(),
+            proof,
         })
     }
 }

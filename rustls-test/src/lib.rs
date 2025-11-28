@@ -1,18 +1,3 @@
-#![warn(
-    clippy::alloc_instead_of_core,
-    clippy::manual_let_else,
-    clippy::std_instead_of_core,
-    clippy::use_self,
-    clippy::upper_case_acronyms,
-    elided_lifetimes_in_paths,
-    trivial_numeric_casts,
-    unreachable_pub,
-    unused_import_braces,
-    unused_extern_crates,
-    unused_qualifications
-)]
-#![allow(clippy::new_without_default)]
-
 use core::ops::{Deref, DerefMut};
 use core::{fmt, mem};
 use std::borrow::Cow;
@@ -26,12 +11,14 @@ use rustls::client::{ServerVerifierBuilder, UnbufferedClientConnection, WebPkiSe
 use rustls::crypto::cipher::{
     InboundOpaqueMessage, MessageDecrypter, MessageEncrypter, OutboundOpaqueMessage, PlainMessage,
 };
+use rustls::crypto::kx::{NamedGroup, SupportedKxGroup};
 use rustls::crypto::{
-    Credentials, CryptoProvider, Identity, SelectedCredential, SigningKey, SingleCredential,
-    WebPkiSupportedAlgorithms, verify_tls13_signature,
+    CipherSuite, Credentials, CryptoProvider, Identity, InconsistentKeys, SelectedCredential,
+    SignatureScheme, SigningKey, SingleCredential, WebPkiSupportedAlgorithms,
+    verify_tls13_signature,
 };
-use rustls::enums::{CertificateType, CipherSuite, ContentType, ProtocolVersion, SignatureScheme};
-use rustls::error::{CertificateError, Error, InconsistentKeys};
+use rustls::enums::{CertificateType, ContentType, ProtocolVersion};
+use rustls::error::{CertificateError, Error};
 use rustls::internal::msgs::codec::{Codec, Reader};
 use rustls::internal::msgs::message::Message;
 use rustls::pki_types::pem::PemObject;
@@ -48,8 +35,8 @@ use rustls::unbuffered::{
     ConnectionState, EncodeError, UnbufferedConnectionCommon, UnbufferedStatus,
 };
 use rustls::{
-    ClientConfig, ClientConnection, Connection, ConnectionCommon, DistinguishedName, NamedGroup,
-    RootCertStore, ServerConfig, ServerConnection, SideData, SupportedCipherSuite,
+    ClientConfig, ClientConnection, Connection, ConnectionCommon, DistinguishedName, RootCertStore,
+    ServerConfig, ServerConnection, SideData, SupportedCipherSuite,
 };
 
 macro_rules! embed_files {
@@ -524,7 +511,7 @@ pub fn make_server_config(kt: KeyType, provider: &CryptoProvider) -> ServerConfi
 
 pub fn make_server_config_with_kx_groups(
     kt: KeyType,
-    kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+    kx_groups: Vec<&'static dyn SupportedKxGroup>,
     provider: &CryptoProvider,
 ) -> ServerConfig {
     ServerConfig::builder(
@@ -656,7 +643,7 @@ pub fn make_client_config(kt: KeyType, provider: &CryptoProvider) -> ClientConfi
 
 pub fn make_client_config_with_kx_groups(
     kt: KeyType,
-    kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+    kx_groups: Vec<&'static dyn SupportedKxGroup>,
     provider: &CryptoProvider,
 ) -> ClientConfig {
     ClientConfig::builder(
@@ -729,7 +716,7 @@ pub fn make_disjoint_suite_configs(provider: CryptoProvider) -> (ClientConfig, S
         tls13_cipher_suites: provider
             .tls13_cipher_suites
             .iter()
-            .cloned()
+            .copied()
             .filter(|cs| cs.common.suite == CipherSuite::TLS13_AES_128_GCM_SHA256)
             .collect(),
         ..provider.clone()
@@ -740,7 +727,7 @@ pub fn make_disjoint_suite_configs(provider: CryptoProvider) -> (ClientConfig, S
         tls13_cipher_suites: provider
             .tls13_cipher_suites
             .iter()
-            .cloned()
+            .copied()
             .filter(|cs| cs.common.suite == CipherSuite::TLS13_AES_256_GCM_SHA384)
             .collect(),
         ..provider
@@ -2098,10 +2085,10 @@ pub mod macros {
 
 /// Deeply inefficient, test-only TLS encoding helpers
 pub mod encoding {
-    use rustls::NamedGroup;
-    use rustls::enums::{
-        AlertDescription, CipherSuite, ContentType, HandshakeType, ProtocolVersion, SignatureScheme,
-    };
+    use rustls::crypto::kx::NamedGroup;
+    use rustls::crypto::{CipherSuite, SignatureScheme};
+    use rustls::enums::{ContentType, HandshakeType, ProtocolVersion};
+    use rustls::error::AlertDescription;
     use rustls::internal::msgs::codec::Codec;
     use rustls::internal::msgs::enums::{AlertLevel, ExtensionType};
 
@@ -2225,6 +2212,13 @@ pub mod encoding {
             Self {
                 typ: ExtensionType::KeyShare,
                 body: len_u16(share),
+            }
+        }
+
+        pub fn new_quic_transport_params(body: &[u8]) -> Self {
+            Self {
+                typ: ExtensionType::TransportParameters,
+                body: len_u16(body.to_vec()),
             }
         }
     }

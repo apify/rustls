@@ -6,22 +6,23 @@ pub(crate) use client_hello::TLS12_HANDLER;
 use pki_types::UnixTime;
 use subtle::ConstantTimeEq;
 
+use super::config::ServerConfig;
+use super::connection::ServerConnectionData;
 use super::hs::{self, ServerContext};
-use super::server_conn::{ServerConfig, ServerConnectionData};
 use crate::check::inappropriate_message;
 use crate::common_state::{CommonState, HandshakeFlightTls12, HandshakeKind, Side, State};
 use crate::conn::ConnectionRandoms;
 use crate::conn::kernel::{Direction, KernelContext, KernelState};
 use crate::crypto::cipher::Payload;
-use crate::crypto::{ActiveKeyExchange, Identity, TicketProducer};
-use crate::enums::{
-    AlertDescription, CertificateType, ContentType, HandshakeType, ProtocolVersion,
-};
-use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
+use crate::crypto::kx::ActiveKeyExchange;
+use crate::crypto::{Identity, TicketProducer};
+use crate::enums::{CertificateType, ContentType, HandshakeType, ProtocolVersion};
+use crate::error::{AlertDescription, Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHash;
 use crate::log::{debug, trace};
 use crate::msgs::ccs::ChangeCipherSpecPayload;
 use crate::msgs::codec::Codec;
+use crate::msgs::deframer::HandshakeAlignedProof;
 use crate::msgs::handshake::{
     CertificateChain, ClientKeyExchangeParams, HandshakeMessagePayload, HandshakePayload,
     NewSessionTicketPayload, NewSessionTicketPayloadTls13, SessionId,
@@ -37,7 +38,8 @@ use crate::{ConnectionTrafficSecrets, verify};
 mod client_hello {
     use super::*;
     use crate::common_state::KxState;
-    use crate::crypto::{ActiveKeyExchange, SelectedCredential, Signer, SupportedKxGroup};
+    use crate::crypto::kx::SupportedKxGroup;
+    use crate::crypto::{SelectedCredential, Signer};
     use crate::msgs::enums::{ClientCertificateType, Compression};
     use crate::msgs::handshake::{
         CertificateRequestPayload, CertificateStatus, ClientHelloPayload, ClientSessionTicket,
@@ -171,6 +173,7 @@ mod client_hello {
                 });
 
             if let Some(data) = resume_data {
+                let proof = input.proof;
                 return start_resumption(
                     suite,
                     st.using_ems,
@@ -181,6 +184,7 @@ mod client_hello {
                     st.extra_exts,
                     st.config,
                     data,
+                    proof,
                 );
             }
 
@@ -261,6 +265,7 @@ mod client_hello {
         extra_exts: ServerExtensionsInput<'static>,
         config: Arc<ServerConfig>,
         resumedata: persist::Tls12ServerSessionValue,
+        proof: HandshakeAlignedProof,
     ) -> hs::NextStateOrError {
         debug!("Resuming connection");
 
@@ -310,7 +315,7 @@ mod client_hello {
         cx.common
             .record_layer
             .start_encrypting();
-        emit_finished(&secrets, &mut transcript, cx.common);
+        emit_finished(&secrets, &mut transcript, cx.common, &proof);
 
         Ok(Box::new(ExpectCcs {
             config,
@@ -687,11 +692,11 @@ impl State<ServerConnectionData> for ExpectCcs {
 
         // CCS should not be received interleaved with fragmented handshake-level
         // message.
-        cx.common.check_aligned_handshake()?;
+        let proof = cx.common.check_aligned_handshake()?;
 
         cx.common
             .record_layer
-            .start_decrypting();
+            .start_decrypting(&proof);
         Ok(Box::new(ExpectFinished {
             config: self.config,
             secrets: self.secrets,
@@ -771,9 +776,10 @@ fn emit_finished(
     secrets: &ConnectionSecrets,
     transcript: &mut HandshakeHash,
     common: &mut CommonState,
+    proof: &HandshakeAlignedProof,
 ) {
     let vh = transcript.current_hash();
-    let verify_data = secrets.server_verify_data(&vh);
+    let verify_data = secrets.server_verify_data(&vh, proof);
     let verify_data_payload = Payload::Borrowed(&verify_data);
 
     let f = Message {
@@ -806,10 +812,12 @@ impl State<ServerConnectionData> for ExpectFinished {
         let finished =
             require_handshake_msg!(m, HandshakeType::Finished, HandshakePayload::Finished)?;
 
-        cx.common.check_aligned_handshake()?;
+        let proof = cx.common.check_aligned_handshake()?;
 
         let vh = self.transcript.current_hash();
-        let expect_verify_data = self.secrets.client_verify_data(&vh);
+        let expect_verify_data = self
+            .secrets
+            .client_verify_data(&vh, &proof);
 
         let fin_verified =
             match ConstantTimeEq::ct_eq(&expect_verify_data[..], finished.bytes()).into() {
@@ -858,7 +866,7 @@ impl State<ServerConnectionData> for ExpectFinished {
             cx.common
                 .record_layer
                 .start_encrypting();
-            emit_finished(&self.secrets, &mut self.transcript, cx.common);
+            emit_finished(&self.secrets, &mut self.transcript, cx.common, &proof);
         }
 
         cx.common

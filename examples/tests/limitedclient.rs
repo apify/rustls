@@ -11,70 +11,45 @@
 use std::process::Command;
 
 #[test]
-fn simpleclient_contains_aes_symbols() {
-    assert!(count_aes_symbols_in_executable(env!("CARGO_BIN_EXE_simpleclient")) > 0);
-}
+fn limited_no_aes_symbols() {
+    let aws_aes =
+        |sym: &str| sym.starts_with("aws_lc_") && sym.ends_with("_EVP_aead_aes_128_gcm_tls13");
+    let expected = find_symbols_in_executable(aws_aes, env!("CARGO_BIN_EXE_simpleclient"));
+    assert!(!expected.is_empty());
 
-#[test]
-fn simpleclient_contains_tls12_code() {
-    assert!(count_tls12_client_symbols_in_executable(env!("CARGO_BIN_EXE_simpleclient")) > 0);
-}
-
-#[test]
-fn limitedclient_does_not_contain_aes_symbols() {
-    let limitedclient = env!("CARGO_BIN_EXE_limitedclient");
-    if fips_mode(limitedclient) {
-        println!("FIPS mode includes the entirety of the fipsmodule due to dynamic linking");
-        return;
-    }
-    assert_eq!(count_aes_symbols_in_executable(limitedclient), 0);
-}
-
-#[test]
-fn limitedclient_does_not_contain_tls12_code() {
-    assert_eq!(
-        count_tls12_client_symbols_in_executable(env!("CARGO_BIN_EXE_limitedclient")),
-        0
+    let limited = env!("CARGO_BIN_EXE_limitedclient");
+    let mut unexpected = find_symbols_in_executable(aws_aes, limited);
+    unexpected.retain(|sym| !sym.starts_with("aws_lc_fips_"));
+    assert!(
+        unexpected.is_empty(),
+        "found unexpected symbols in {limited}: {unexpected:#?}",
     );
 }
 
-fn fips_mode(exe: &str) -> bool {
-    symbols_in_executable(exe)
-        .lines()
-        .any(|sym| sym.starts_with("aws_lc_fips_"))
+#[test]
+fn limited_no_tls12_symbols() {
+    let expected = find_symbols_in_executable(tls12, env!("CARGO_BIN_EXE_simpleclient"));
+    assert!(!expected.is_empty());
+
+    let limited = env!("CARGO_BIN_EXE_limitedclient");
+    let unexpected = find_symbols_in_executable(tls12, limited);
+    assert!(
+        unexpected.is_empty(),
+        "found unexpected symbols in {limited}: {unexpected:#?}",
+    );
 }
 
-fn count_aes_symbols_in_executable(exe: &str) -> usize {
-    let mut count = 0;
-
-    for sym in symbols_in_executable(exe).lines() {
-        println!("candidate symbol {sym:?}");
-
-        if sym.starts_with("aws_lc_") && sym.ends_with("_EVP_aead_aes_128_gcm_tls13") {
-            println!("found aes symbol {sym:?}");
-            count += 1;
-        }
-    }
-
-    count
+fn tls12(sym: &str) -> bool {
+    sym.contains("rustls::client::tls12")
+        && !sym.contains("core::fmt::Debug")
+        // Exclude some trivial `State` default method implementations that
+        // appear to sometimes get inlined even if no TLS 1.2 code is used.
+        && !sym.ends_with("::send_key_update_request")
+        && !sym.ends_with("::handle_decrypt_error")
+        && !sym.ends_with("::into_external_state")
 }
 
-fn count_tls12_client_symbols_in_executable(exe: &str) -> usize {
-    let mut count = 0;
-
-    for sym in symbols_in_executable(exe).lines() {
-        println!("candidate symbol {sym:?}");
-
-        if sym.contains("rustls::client::tls12") && !sym.contains("core::fmt::Debug") {
-            println!("found tls12 symbol {sym:?}");
-            count += 1;
-        }
-    }
-
-    count
-}
-
-fn symbols_in_executable(exe: &str) -> String {
+fn find_symbols_in_executable(f: impl Fn(&str) -> bool, exe: &str) -> Vec<String> {
     let nm_output = dbg!(
         Command::new("nm")
             .arg("--defined-only")
@@ -85,5 +60,14 @@ fn symbols_in_executable(exe: &str) -> String {
     .output()
     .expect("nm failed");
 
-    String::from_utf8(nm_output.stdout).expect("nm output not valid utf8")
+    let mut matching = Vec::new();
+    let symbols = String::from_utf8(nm_output.stdout).expect("nm output not valid utf8");
+    for sym in symbols.lines() {
+        //println!("candidate symbol {sym:?}");
+        if f(sym) {
+            matching.push(sym.trim().to_owned());
+        }
+    }
+
+    matching
 }

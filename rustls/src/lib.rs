@@ -317,33 +317,9 @@
 //! [x25519mlkem768-manual]: manual::_05_defaults#about-the-post-quantum-secure-key-exchange-x25519mlkem768
 
 // Require docs for public APIs, deny unsafe code, etc.
+#![warn(missing_docs, clippy::exhaustive_enums, clippy::exhaustive_structs)]
 #![forbid(unsafe_code, unused_must_use)]
 #![cfg_attr(not(any(bench, coverage_nightly)), forbid(unstable_features))]
-#![warn(
-    clippy::alloc_instead_of_core,
-    clippy::cloned_instead_of_copied,
-    clippy::exhaustive_enums,
-    clippy::exhaustive_structs,
-    clippy::manual_let_else,
-    clippy::or_fun_call,
-    clippy::std_instead_of_core,
-    clippy::use_self,
-    clippy::upper_case_acronyms,
-    elided_lifetimes_in_paths,
-    missing_docs,
-    trivial_numeric_casts,
-    unnameable_types,
-    unreachable_pub,
-    unused_import_braces,
-    unused_extern_crates,
-    unused_qualifications
-)]
-// Relax these clippy lints:
-// - too_many_arguments: some things just need a lot of state, wrapping it
-//   doesn't necessarily make it easier to follow what's going on
-// - new_without_default: for internal constructors, the indirection is not
-//   helpful
-#![expect(clippy::too_many_arguments, clippy::new_without_default)]
 // Enable documentation for all features on docs.rs
 #![cfg_attr(rustls_docsrs, feature(doc_cfg))]
 // Enable coverage() attr for nightly coverage builds, see
@@ -411,8 +387,6 @@ pub mod error;
 mod hash_hs;
 #[cfg(any(feature = "std", feature = "hashbrown"))]
 mod limited_cache;
-mod rand;
-mod record_layer;
 #[cfg(feature = "std")]
 mod stream;
 mod tls12;
@@ -507,9 +481,6 @@ pub use crate::error::Error;
 pub use crate::key_log::{KeyLog, NoKeyLog};
 #[cfg(feature = "std")]
 pub use crate::key_log_file::KeyLogFile;
-pub use crate::msgs::enums::NamedGroup;
-pub use crate::msgs::ffdhe_groups;
-pub use crate::msgs::handshake::DistinguishedName;
 #[cfg(feature = "std")]
 pub use crate::stream::{Stream, StreamOwned};
 pub use crate::suites::{
@@ -519,107 +490,20 @@ pub use crate::suites::{
 pub use crate::ticketer::TicketRotator;
 pub use crate::tls12::Tls12CipherSuite;
 pub use crate::tls13::Tls13CipherSuite;
-pub use crate::verify::{DigitallySignedStruct, SignerPublicKey};
+#[cfg(feature = "impit")]
+pub use crate::verify::NoVerifier;
+pub use crate::verify::{DigitallySignedStruct, DistinguishedName, SignerPublicKey};
 pub use crate::versions::{ALL_VERSIONS, DEFAULT_VERSIONS, SupportedProtocolVersion};
 pub use crate::webpki::RootCertStore;
 
 /// Items for use in a client.
-pub mod client {
-    pub(super) mod builder;
-    mod client_conn;
-    mod common;
-    mod ech;
-    pub(super) mod handy;
-    mod hs;
-    #[cfg(test)]
-    mod test;
-    mod tls12;
-    mod tls13;
-
-    pub use builder::WantsClientCert;
-    #[cfg(feature = "impit")]
-    pub use builder::WantsClientCertWithBrowserEmulationEnabled;
-    #[cfg(feature = "impit")]
-    pub use builder::{BrowserEmulator, BrowserType};
-    pub use client_conn::{
-        ClientConfig, ClientConnectionData, ClientCredentialResolver, ClientSessionStore,
-        CredentialRequest, EarlyDataError, MayEncryptEarlyData, Resumption, Tls12Resumption,
-        UnbufferedClientConnection,
-    };
-    #[cfg(feature = "std")]
-    pub use client_conn::{ClientConnection, WriteEarlyData};
-    pub use ech::{EchConfig, EchGreaseConfig, EchMode, EchStatus};
-    #[cfg(any(feature = "std", feature = "hashbrown"))]
-    pub use handy::ClientSessionMemoryCache;
-
-    /// Dangerous configuration that should be audited and used with extreme care.
-    pub mod danger {
-        pub use super::builder::danger::DangerousClientConfigBuilder;
-        pub use super::client_conn::danger::DangerousClientConfig;
-        #[cfg(feature = "impit")]
-        pub use crate::verify::NoVerifier;
-        pub use crate::verify::{
-            HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
-            SignatureVerificationInput,
-        };
-    }
-
-    pub(crate) use hs::ClientHandler;
-    pub(crate) use tls12::TLS12_HANDLER;
-    pub(crate) use tls13::TLS13_HANDLER;
-
-    pub use crate::msgs::persist::{Tls12ClientSessionValue, Tls13ClientSessionValue};
-    pub use crate::webpki::{
-        ServerVerifierBuilder, VerifierBuilderError, WebPkiServerVerifier,
-        verify_identity_signed_by_trust_anchor, verify_server_name,
-    };
-}
-
+pub mod client;
 pub use client::ClientConfig;
 #[cfg(feature = "std")]
 pub use client::ClientConnection;
 
 /// Items for use in a server.
-pub mod server {
-    pub(crate) mod builder;
-    pub(crate) mod handy;
-    mod hs;
-    mod server_conn;
-    #[cfg(test)]
-    mod test;
-    mod tls12;
-    mod tls13;
-
-    pub use builder::WantsServerCert;
-    pub use handy::NoServerSessionStorage;
-    #[cfg(any(feature = "std", feature = "hashbrown"))]
-    pub use handy::ServerNameResolver;
-    #[cfg(any(feature = "std", feature = "hashbrown"))]
-    pub use handy::ServerSessionMemoryCache;
-    #[cfg(feature = "std")]
-    pub use server_conn::{Accepted, AcceptedAlert, Acceptor, ReadEarlyData, ServerConnection};
-    pub use server_conn::{
-        ClientHello, InvalidSniPolicy, ServerConfig, ServerConnectionData,
-        ServerCredentialResolver, StoresServerSessions, UnbufferedServerConnection,
-    };
-
-    pub use crate::verify::NoClientAuth;
-    pub use crate::webpki::{
-        ClientVerifierBuilder, ParsedCertificate, VerifierBuilderError, WebPkiClientVerifier,
-    };
-
-    /// Dangerous configuration that should be audited and used with extreme care.
-    pub mod danger {
-        pub use crate::verify::{
-            ClientIdentity, ClientVerifier, PeerVerified, SignatureVerificationInput,
-        };
-    }
-
-    pub(crate) use hs::ServerHandler;
-    pub(crate) use tls12::TLS12_HANDLER;
-    pub(crate) use tls13::TLS13_HANDLER;
-}
-
+pub mod server;
 pub use server::ServerConfig;
 #[cfg(feature = "std")]
 pub use server::ServerConnection;

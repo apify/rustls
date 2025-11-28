@@ -5,8 +5,13 @@ use crate::error::{Error, InvalidMessage};
 use crate::msgs::codec::Reader;
 use crate::msgs::message::{HEADER_SIZE, MessageError, read_opaque_message_header};
 
-pub(crate) mod buffers;
-pub(crate) mod handshake;
+mod buffers;
+pub(crate) use buffers::{
+    BufferProgress, DeframerSliceBuffer, DeframerVecBuffer, Delocator, Locator,
+};
+
+mod handshake;
+pub(crate) use handshake::{HandshakeAlignedProof, HandshakeDeframer};
 
 /// A deframer of TLS wire messages.
 ///

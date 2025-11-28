@@ -5,8 +5,8 @@ use core::fmt::Debug;
 use zeroize::Zeroize;
 
 use crate::Error;
-pub use crate::msgs::enums::{HpkeAead, HpkeKdf, HpkeKem};
-pub use crate::msgs::handshake::HpkeSymmetricCipherSuite;
+use crate::error::InvalidMessage;
+use crate::msgs::codec::{Codec, ListLength, Reader, TlsListElement};
 
 /// An HPKE suite, specifying a key encapsulation mechanism and a symmetric cipher suite.
 #[expect(clippy::exhaustive_structs)]
@@ -131,6 +131,101 @@ impl From<Vec<u8>> for HpkePrivateKey {
 impl Drop for HpkePrivateKey {
     fn drop(&mut self) {
         self.0.zeroize();
+    }
+}
+
+/// An HPKE symmetric cipher suite, combining a KDF and an AEAD algorithm.
+#[expect(clippy::exhaustive_structs)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HpkeSymmetricCipherSuite {
+    /// The KDF to use for this cipher suite.
+    pub kdf_id: HpkeKdf,
+    /// The AEAD to use for this cipher suite.
+    pub aead_id: HpkeAead,
+}
+
+impl Codec<'_> for HpkeSymmetricCipherSuite {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        self.kdf_id.encode(bytes);
+        self.aead_id.encode(bytes);
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        Ok(Self {
+            kdf_id: HpkeKdf::read(r)?,
+            aead_id: HpkeAead::read(r)?,
+        })
+    }
+}
+
+/// draft-ietf-tls-esni-24: `HpkeSymmetricCipherSuite cipher_suites<4..2^16-4>;`
+impl TlsListElement for HpkeSymmetricCipherSuite {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
+        empty_error: InvalidMessage::IllegalEmptyList("HpkeSymmetricCipherSuites"),
+    };
+}
+
+enum_builder! {
+    /// The Key Encapsulation Mechanism (`Kem`) type for HPKE operations.
+    /// Listed by IANA, as specified in [RFC 9180 Section 7.1]
+    ///
+    /// [RFC 9180 Section 7.1]: <https://datatracker.ietf.org/doc/html/rfc9180#kemid-values>
+    #[repr(u16)]
+    #[allow(non_camel_case_types)]
+    pub enum HpkeKem {
+        DHKEM_P256_HKDF_SHA256 => 0x0010,
+        DHKEM_P384_HKDF_SHA384 => 0x0011,
+        DHKEM_P521_HKDF_SHA512 => 0x0012,
+        DHKEM_X25519_HKDF_SHA256 => 0x0020,
+        DHKEM_X448_HKDF_SHA512 => 0x0021,
+    }
+}
+
+enum_builder! {
+    /// The Key Derivation Function (`Kdf`) type for HPKE operations.
+    /// Listed by IANA, as specified in [RFC 9180 Section 7.2]
+    ///
+    /// [RFC 9180 Section 7.2]: <https://datatracker.ietf.org/doc/html/rfc9180#name-key-derivation-functions-kd>
+    #[repr(u16)]
+    #[allow(non_camel_case_types)]
+    #[derive(Default)]
+    pub enum HpkeKdf {
+        // TODO(XXX): revisit the default configuration. This is just what Cloudflare ships right now.
+        #[default]
+        HKDF_SHA256 => 0x0001,
+        HKDF_SHA384 => 0x0002,
+        HKDF_SHA512 => 0x0003,
+    }
+}
+
+enum_builder! {
+    /// The Authenticated Encryption with Associated Data (`Aead`) type for HPKE operations.
+    /// Listed by IANA, as specified in [RFC 9180 Section 7.3]
+    ///
+    /// [RFC 9180 Section 7.3]: <https://datatracker.ietf.org/doc/html/rfc9180#name-authenticated-encryption-wi>
+    #[repr(u16)]
+    #[allow(non_camel_case_types)]
+    #[derive(Default)]
+    pub enum HpkeAead {
+        // TODO(XXX): revisit the default configuration. This is just what Cloudflare ships right now.
+        #[default]
+        AES_128_GCM => 0x0001,
+        AES_256_GCM => 0x0002,
+        CHACHA20_POLY_1305 => 0x0003,
+        EXPORT_ONLY => 0xFFFF,
+    }
+}
+
+impl HpkeAead {
+    /// Returns the length of the tag for the AEAD algorithm, or none if the AEAD is EXPORT_ONLY.
+    pub(crate) fn tag_len(&self) -> Option<usize> {
+        match self {
+            // See RFC 9180 Section 7.3, column `Nt`, the length in bytes of the authentication tag
+            // for the algorithm.
+            // https://www.rfc-editor.org/rfc/rfc9180.html#section-7.3
+            Self::AES_128_GCM | Self::AES_256_GCM | Self::CHACHA20_POLY_1305 => Some(16),
+            _ => None,
+        }
     }
 }
 

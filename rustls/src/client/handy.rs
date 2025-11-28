@@ -1,10 +1,11 @@
 use pki_types::ServerName;
 
 use super::CredentialRequest;
+use crate::client;
 use crate::crypto::SelectedCredential;
+use crate::crypto::kx::NamedGroup;
 use crate::enums::CertificateType;
 use crate::msgs::persist;
-use crate::{NamedGroup, client};
 
 /// An implementer of `ClientSessionStore` which does nothing.
 #[derive(Debug)]
@@ -39,9 +40,10 @@ mod cache {
 
     use pki_types::ServerName;
 
+    use crate::crypto::kx::NamedGroup;
+    use crate::limited_cache;
     use crate::lock::Mutex;
     use crate::msgs::persist;
-    use crate::{NamedGroup, limited_cache};
 
     const MAX_TLS13_TICKETS_PER_SERVER: usize = 8;
 
@@ -209,13 +211,14 @@ mod tests {
     use crate::TEST_PROVIDERS;
     use crate::client::danger::{HandshakeSignatureValid, PeerVerified, ServerVerifier};
     use crate::client::{ClientCredentialResolver, ClientSessionStore, CredentialRequest};
+    use crate::crypto::kx::NamedGroup;
     use crate::crypto::{
-        CertificateIdentity, Identity, SelectedCredential, tls12_suite, tls13_suite,
+        CertificateIdentity, CipherSuite, Identity, SelectedCredential, SignatureScheme,
+        tls12_suite, tls13_suite,
     };
-    use crate::enums::{CertificateType, CipherSuite, SignatureScheme};
+    use crate::enums::CertificateType;
     use crate::error::Error;
     use crate::msgs::base::PayloadU16;
-    use crate::msgs::enums::NamedGroup;
     use crate::msgs::handshake::SessionId;
     use crate::msgs::persist::{Tls12ClientSessionValue, Tls13ClientSessionValue};
     use crate::sync::Arc;

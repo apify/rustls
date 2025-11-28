@@ -9,8 +9,9 @@ use crate::crypto::cipher::{
     Nonce, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload, Tls13AeadAlgorithm,
     UnsupportedOperationError, make_tls13_aad,
 };
+use crate::crypto::enums::CipherSuite;
 use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
-use crate::enums::{CipherSuite, ContentType, ProtocolVersion};
+use crate::enums::{ContentType, ProtocolVersion};
 use crate::error::Error;
 use crate::suites::{CipherSuiteCommon, ConnectionTrafficSecrets};
 use crate::tls13::Tls13CipherSuite;
@@ -19,7 +20,7 @@ use crate::version::TLS13_VERSION;
 #[cfg(feature = "impit")]
 macro_rules! fake_tls13_cipher_suite {
     ( $name:ident, $suite:expr  ) => {
-        /// [impit!] The bogus TLS1.3 ciphersuite $name
+        /// (impit) The bogus TLS1.3 ciphersuite $name
         #[cfg(feature = "impit")]
         pub static $name: &Tls13CipherSuite = &Tls13CipherSuite {
             protocol_version: TLS13_VERSION,
@@ -44,10 +45,7 @@ macro_rules! fake_tls13_cipher_suite {
 }
 
 #[cfg(feature = "impit")]
-fake_tls13_cipher_suite!(
-    TLS13_RESERVED_GREASE,
-    CipherSuite::TLS_RESERVED_GREASE
-);
+fake_tls13_cipher_suite!(TLS13_RESERVED_GREASE, CipherSuite::TLS_RESERVED_GREASE);
 
 #[cfg(feature = "impit")]
 fake_tls13_cipher_suite!(

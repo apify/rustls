@@ -1,17 +1,4 @@
 #![no_std]
-#![warn(
-    clippy::alloc_instead_of_core,
-    clippy::manual_let_else,
-    clippy::std_instead_of_core,
-    clippy::use_self,
-    clippy::upper_case_acronyms,
-    elided_lifetimes_in_paths,
-    trivial_numeric_casts,
-    unreachable_pub,
-    unused_import_braces,
-    unused_extern_crates,
-    unused_qualifications
-)]
 
 extern crate alloc;
 #[cfg(feature = "std")]
@@ -32,13 +19,13 @@ use core::time::Duration;
 
 #[cfg(feature = "std")]
 use rustls::TicketRotator;
+use rustls::crypto::kx::KeyExchangeAlgorithm;
 use rustls::crypto::tls12::PrfUsingHmac;
 use rustls::crypto::tls13::HkdfUsingHmac;
 use rustls::crypto::{
-    CipherSuiteCommon, CryptoProvider, GetRandomFailed, KeyExchangeAlgorithm, KeyProvider,
-    SecureRandom, SigningKey, TicketProducer, TicketerFactory,
+    CipherSuite, CipherSuiteCommon, CryptoProvider, GetRandomFailed, KeyProvider, SecureRandom,
+    SignatureScheme, SigningKey, TicketProducer, TicketerFactory,
 };
-use rustls::enums::{CipherSuite, SignatureScheme};
 use rustls::error::{Error, OtherError};
 use rustls::pki_types::PrivateKeyDer;
 use rustls::version::{TLS12_VERSION, TLS13_VERSION};

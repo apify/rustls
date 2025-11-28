@@ -8,25 +8,25 @@ use pki_types::ServerName;
 pub(crate) use server_hello::TLS12_HANDLER;
 use subtle::ConstantTimeEq;
 
-use super::client_conn::ClientConnectionData;
-use super::hs::ClientContext;
+use super::config::ClientConfig;
+use super::connection::ClientConnectionData;
+use super::hs::{self, ClientContext};
+use super::{ClientAuthDetails, ServerCertDetails};
 use crate::ConnectionTrafficSecrets;
 use crate::check::{inappropriate_handshake_message, inappropriate_message};
-use crate::client::common::{ClientAuthDetails, ServerCertDetails};
-use crate::client::{ClientConfig, hs};
 use crate::common_state::{CommonState, HandshakeKind, KxState, Side, State};
 use crate::conn::ConnectionRandoms;
 use crate::conn::kernel::{Direction, KernelContext, KernelState};
 use crate::crypto::cipher::Payload;
-use crate::crypto::{Identity, KeyExchangeAlgorithm, Signer};
-use crate::enums::{
-    AlertDescription, CertificateType, ContentType, HandshakeType, ProtocolVersion,
-};
-use crate::error::{Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
+use crate::crypto::kx::KeyExchangeAlgorithm;
+use crate::crypto::{Identity, Signer};
+use crate::enums::{CertificateType, ContentType, HandshakeType, ProtocolVersion};
+use crate::error::{AlertDescription, Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHash;
 use crate::log::{debug, trace, warn};
 use crate::msgs::base::{PayloadU8, PayloadU16};
 use crate::msgs::ccs::ChangeCipherSpecPayload;
+use crate::msgs::deframer::HandshakeAlignedProof;
 use crate::msgs::handshake::{
     CertificateChain, ClientDhParams, ClientEcdhParams, ClientKeyExchangeParams,
     HandshakeMessagePayload, HandshakePayload, NewSessionTicketPayload,
@@ -560,9 +560,10 @@ fn emit_finished(
     secrets: &ConnectionSecrets,
     transcript: &mut HandshakeHash,
     common: &mut CommonState,
+    proof: &HandshakeAlignedProof,
 ) {
     let vh = transcript.current_hash();
-    let verify_data = secrets.client_verify_data(&vh);
+    let verify_data = secrets.client_verify_data(&vh, proof);
     let verify_data_payload = Payload::Borrowed(&verify_data);
 
     let f = Message {
@@ -758,7 +759,7 @@ impl State<ClientConnectionData> for ExpectServerDone {
         let mut st = *self;
         st.transcript.add_message(&m);
 
-        cx.common.check_aligned_handshake()?;
+        let proof = cx.common.check_aligned_handshake()?;
 
         trace!("Server cert is {:?}", st.server_cert.cert_chain);
         debug!("Server DNS name is {:?}", st.server_name);
@@ -925,7 +926,7 @@ impl State<ClientConnectionData> for ExpectServerDone {
             .start_encrypting();
 
         // 5.
-        emit_finished(&secrets, &mut transcript, cx.common);
+        emit_finished(&secrets, &mut transcript, cx.common, &proof);
 
         if st.must_issue_new_ticket {
             Ok(Box::new(ExpectNewTicket {
@@ -1029,12 +1030,12 @@ impl State<ClientConnectionData> for ExpectCcs {
         }
         // CCS should not be received interleaved with fragmented handshake-level
         // message.
-        cx.common.check_aligned_handshake()?;
+        let proof = cx.common.check_aligned_handshake()?;
 
         // Note: msgs layer validates trivial contents of CCS.
         cx.common
             .record_layer
-            .start_decrypting();
+            .start_decrypting(&proof);
 
         Ok(Box::new(ExpectFinished {
             config: self.config,
@@ -1122,11 +1123,13 @@ impl State<ClientConnectionData> for ExpectFinished {
         let finished =
             require_handshake_msg!(m, HandshakeType::Finished, HandshakePayload::Finished)?;
 
-        cx.common.check_aligned_handshake()?;
+        let proof = cx.common.check_aligned_handshake()?;
 
         // Work out what verify_data we expect.
         let vh = st.transcript.current_hash();
-        let expect_verify_data = st.secrets.server_verify_data(&vh);
+        let expect_verify_data = st
+            .secrets
+            .server_verify_data(&vh, &proof);
 
         // Constant-time verification of this is relatively unimportant: they only
         // get one chance.  But it can't hurt.
@@ -1150,7 +1153,7 @@ impl State<ClientConnectionData> for ExpectFinished {
             cx.common
                 .record_layer
                 .start_encrypting();
-            emit_finished(&st.secrets, &mut st.transcript, cx.common);
+            emit_finished(&st.secrets, &mut st.transcript, cx.common, &proof);
         }
 
         cx.common

@@ -6,11 +6,10 @@ use webpki::aws_lc_rs as webpki_algs;
 
 use super::signer::SigningKey;
 use crate::crypto::{
-    CryptoProvider, KeyProvider, SecureRandom, SupportedKxGroup, TicketProducer, TicketerFactory,
+    CryptoProvider, GetRandomFailed, KeyProvider, SecureRandom, SignatureScheme, SupportedKxGroup,
+    TicketProducer, TicketerFactory,
 };
-use crate::enums::SignatureScheme;
 use crate::error::{Error, OtherError};
-use crate::rand::GetRandomFailed;
 use crate::sync::Arc;
 #[cfg(feature = "std")]
 use crate::ticketer::TicketRotator;
@@ -198,12 +197,6 @@ pub mod cipher_suite {
         TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
     };
-
-    #[cfg(not(feature = "impit"))]
-    pub use super::tls13::{
-        TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
-    };
-
     #[cfg(feature = "impit")]
     pub use super::tls13::{
         TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
@@ -211,6 +204,10 @@ pub mod cipher_suite {
         TLS_RSA_WITH_AES_128_CBC_SHA, TLS_RSA_WITH_AES_128_GCM_SHA256,
         TLS_RSA_WITH_AES_256_CBC_SHA, TLS_RSA_WITH_AES_256_GCM_SHA384, TLS13_AES_128_GCM_SHA256,
         TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256, TLS13_RESERVED_GREASE,
+    };
+    #[cfg(not(feature = "impit"))]
+    pub use super::tls13::{
+        TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
     };
 }
 
@@ -325,7 +322,7 @@ pub static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
 mod ring_shim {
     use aws_lc_rs::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey};
 
-    use crate::crypto::SharedSecret;
+    use crate::crypto::kx::SharedSecret;
 
     pub(super) fn agree_ephemeral(
         priv_key: EphemeralPrivateKey,

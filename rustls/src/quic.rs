@@ -8,8 +8,7 @@ use core::fmt::Debug;
 use crate::common_state::Side;
 use crate::crypto::cipher::{AeadKey, Iv};
 use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock};
-use crate::enums::AlertDescription;
-use crate::error::Error;
+use crate::error::{AlertDescription, Error};
 use crate::tls13::Tls13CipherSuite;
 use crate::tls13::key_schedule::{
     hkdf_expand_label, hkdf_expand_label_aead_key, hkdf_expand_label_block,
@@ -28,9 +27,9 @@ mod connection {
     use crate::common_state::{CommonState, DEFAULT_BUFFER_LIMIT, Protocol};
     use crate::conn::{ConnectionCore, KeyingMaterialExporter, SideData};
     use crate::crypto::cipher::{InboundPlainMessage, Payload};
-    use crate::enums::{AlertDescription, ContentType, ProtocolVersion};
-    use crate::error::{ApiMisuse, Error};
-    use crate::msgs::deframer::buffers::{DeframerVecBuffer, Locator};
+    use crate::enums::{ContentType, ProtocolVersion};
+    use crate::error::{AlertDescription, ApiMisuse, Error};
+    use crate::msgs::deframer::{DeframerVecBuffer, Locator};
     use crate::msgs::handshake::{
         ClientExtensionsInput, ServerExtensionsInput, TransportParameters,
     };
@@ -444,6 +443,7 @@ mod connection {
                 .hs_deframer
                 .coalesce(self.deframer_buffer.filled_mut())?;
 
+            self.core.common_state.aligned_handshake = self.core.hs_deframer.aligned();
             self.core
                 .process_new_packets(&mut self.deframer_buffer, &mut self.sendable_plaintext)?;
 
@@ -1040,8 +1040,8 @@ mod tests {
     use std::prelude::v1::*;
 
     use super::PacketKey;
+    use crate::crypto::CipherSuite;
     use crate::crypto::tls13::OkmBlock;
-    use crate::enums::CipherSuite;
     use crate::quic::{HeaderProtectionKey, Secrets, Version};
     use crate::{Side, TEST_PROVIDERS};
 

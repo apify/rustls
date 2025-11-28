@@ -6,13 +6,14 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use num_bigint::BigUint;
-use rustls::crypto::{
-    ActiveKeyExchange, CipherSuiteCommon, CryptoProvider, KeyExchangeAlgorithm, SharedSecret,
-    StartedKeyExchange, SupportedKxGroup,
+use rustls::crypto::kx::ffdhe::{FFDHE2048, FFDHE3072, FFDHE4096, FfdheGroup};
+use rustls::crypto::kx::{
+    ActiveKeyExchange, KeyExchangeAlgorithm, NamedGroup, SharedSecret, StartedKeyExchange,
+    SupportedKxGroup,
 };
-use rustls::enums::{CipherSuite, ProtocolVersion};
-use rustls::ffdhe_groups::FfdheGroup;
-use rustls::{ClientConfig, NamedGroup, SupportedCipherSuite, Tls12CipherSuite, ffdhe_groups};
+use rustls::crypto::{CipherSuite, CipherSuiteCommon, CryptoProvider};
+use rustls::enums::ProtocolVersion;
+use rustls::{ClientConfig, ServerConfig, SupportedCipherSuite, Tls12CipherSuite};
 use rustls_test::{
     ClientConfigExt, KeyType, ServerConfigExt, do_handshake, do_suite_and_kx_test,
     make_pair_for_arc_configs, make_pair_for_configs, provider_with_one_suite,
@@ -65,9 +66,8 @@ fn ffdhe_ciphersuite() {
             &ffdhe_provider(),
             expected_cipher_suite,
         ));
-        let client_config =
-            rustls::ClientConfig::builder(provider.clone()).finish(KeyType::Rsa2048);
-        let server_config = rustls::ServerConfig::builder(provider).finish(KeyType::Rsa2048);
+        let client_config = ClientConfig::builder(provider.clone()).finish(KeyType::Rsa2048);
+        let server_config = ServerConfig::builder(provider).finish(KeyType::Rsa2048);
         do_suite_and_kx_test(
             client_config,
             server_config,
@@ -80,7 +80,7 @@ fn ffdhe_ciphersuite() {
 
 #[test]
 fn server_avoids_dhe_cipher_suites_when_client_has_no_known_dhe_in_groups_ext() {
-    let client_config = rustls::ClientConfig::builder(
+    let client_config = ClientConfig::builder(
         CryptoProvider {
             tls12_cipher_suites: Cow::Owned(vec![
                 &TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -94,7 +94,7 @@ fn server_avoids_dhe_cipher_suites_when_client_has_no_known_dhe_in_groups_ext() 
     )
     .finish(KeyType::Rsa2048);
 
-    let server_config = rustls::ServerConfig::builder(
+    let server_config = ServerConfig::builder(
         CryptoProvider {
             tls12_cipher_suites: Cow::Owned(vec![
                 &TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -127,7 +127,7 @@ fn server_avoids_dhe_cipher_suites_when_client_has_no_known_dhe_in_groups_ext() 
 
 #[test]
 fn server_avoids_cipher_suite_with_no_common_kx_groups() {
-    let server_config = rustls::ServerConfig::builder(
+    let server_config = ServerConfig::builder(
         CryptoProvider {
             tls12_cipher_suites: Cow::Owned(vec![
                 provider::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -228,7 +228,7 @@ fn server_avoids_cipher_suite_with_no_common_kx_groups() {
             },
             _ => unreachable!(),
         };
-        let client_config = rustls::ClientConfig::builder(provider.into())
+        let client_config = ClientConfig::builder(provider.into())
             .finish(KeyType::Rsa2048)
             .into();
 
@@ -260,7 +260,7 @@ fn non_ffdhe_kx_does_not_have_ffdhe_group() {
 }
 
 /// A test-only `CryptoProvider`, only supporting FFDHE key exchange
-pub fn ffdhe_provider() -> CryptoProvider {
+fn ffdhe_provider() -> CryptoProvider {
     CryptoProvider {
         tls12_cipher_suites: Cow::Owned(vec![&TLS_DHE_RSA_WITH_AES_128_GCM_SHA256]),
         tls13_cipher_suites: Cow::Owned(vec![
@@ -273,15 +273,12 @@ pub fn ffdhe_provider() -> CryptoProvider {
 
 static FFDHE_KX_GROUPS: &[&dyn SupportedKxGroup] = &[&FFDHE2048_KX_GROUP, &FFDHE3072_KX_GROUP];
 
-pub const FFDHE2048_KX_GROUP: FfdheKxGroup =
-    FfdheKxGroup(NamedGroup::FFDHE2048, ffdhe_groups::FFDHE2048);
-pub const FFDHE3072_KX_GROUP: FfdheKxGroup =
-    FfdheKxGroup(NamedGroup::FFDHE3072, ffdhe_groups::FFDHE3072);
-pub const FFDHE4096_KX_GROUP: FfdheKxGroup =
-    FfdheKxGroup(NamedGroup::FFDHE4096, ffdhe_groups::FFDHE4096);
+const FFDHE2048_KX_GROUP: FfdheKxGroup = FfdheKxGroup(NamedGroup::FFDHE2048, FFDHE2048);
+const FFDHE3072_KX_GROUP: FfdheKxGroup = FfdheKxGroup(NamedGroup::FFDHE3072, FFDHE3072);
+const FFDHE4096_KX_GROUP: FfdheKxGroup = FfdheKxGroup(NamedGroup::FFDHE4096, FFDHE4096);
 
 /// The (test-only) TLS1.2 ciphersuite TLS_DHE_RSA_WITH_AES_128_GCM_SHA256
-pub static TLS_DHE_RSA_WITH_AES_128_GCM_SHA256: Tls12CipherSuite = Tls12CipherSuite {
+static TLS_DHE_RSA_WITH_AES_128_GCM_SHA256: Tls12CipherSuite = Tls12CipherSuite {
     common: CipherSuiteCommon {
         suite: CipherSuite::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
         ..provider::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256.common
@@ -291,7 +288,7 @@ pub static TLS_DHE_RSA_WITH_AES_128_GCM_SHA256: Tls12CipherSuite = Tls12CipherSu
 };
 
 #[derive(Debug)]
-pub struct FfdheKxGroup(pub NamedGroup, pub FfdheGroup<'static>);
+struct FfdheKxGroup(pub NamedGroup, pub FfdheGroup<'static>);
 
 impl SupportedKxGroup for FfdheKxGroup {
     fn start(&self) -> Result<StartedKeyExchange, rustls::Error> {

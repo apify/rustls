@@ -23,6 +23,7 @@ macro_rules! enum_builder {
     ) => {
         $(#[doc = $comment])*
         $(#[$metas])*
+        #[allow(missing_docs)]
         #[non_exhaustive]
         #[derive(PartialEq, Eq, Clone, Copy)]
         $enum_vis enum $enum_name {
@@ -40,6 +41,7 @@ macro_rules! enum_builder {
             ,Unknown($uint)
         }
 
+        #[allow(missing_docs)]
         impl $enum_name {
             // NOTE(allow) generated irrespective if there are callers
             #[allow(dead_code)]
@@ -58,12 +60,12 @@ macro_rules! enum_builder {
             }
         }
 
-        impl Codec<'_> for $enum_name {
+        impl crate::msgs::codec::Codec<'_> for $enum_name {
             fn encode(&self, bytes: &mut alloc::vec::Vec<u8>) {
                 <$uint>::from(*self).encode(bytes);
             }
 
-            fn read(r: &mut Reader<'_>) -> Result<Self, crate::error::InvalidMessage> {
+            fn read(r: &mut crate::msgs::codec::Reader<'_>) -> Result<Self, crate::error::InvalidMessage> {
                 match <$uint>::read(r) {
                     Ok(x) => Ok($enum_name::from(x)),
                     Err(_) => Err(crate::error::InvalidMessage::MissingData(stringify!($enum_name))),

@@ -10,9 +10,14 @@ use std::time::SystemTimeError;
 use pki_types::{AlgorithmIdentifier, EchConfigListBytes, ServerName, UnixTime};
 use webpki::ExtendedKeyUsage;
 
-use crate::enums::{AlertDescription, ContentType, HandshakeType};
-use crate::msgs::handshake::{EchConfigPayload, KeyExchangeAlgorithm};
-use crate::rand;
+use crate::crypto::kx::KeyExchangeAlgorithm;
+use crate::crypto::{GetRandomFailed, InconsistentKeys};
+use crate::enums::{ContentType, HandshakeType};
+use crate::msgs::codec::Codec;
+use crate::msgs::handshake::EchConfigPayload;
+
+#[cfg(test)]
+mod tests;
 
 /// rustls reports protocol errors using this type.
 #[non_exhaustive]
@@ -149,92 +154,80 @@ pub enum Error {
     Other(OtherError),
 }
 
-/// Specific failure cases from [`Credentials::new()`] or a [`crate::crypto::SigningKey`] that cannot produce a corresponding public key.
-///
-/// [`Credentials::new()`]: crate::crypto::Credentials::new()
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InconsistentKeys {
-    /// The public key returned by the [`SigningKey`] does not match the public key information in the certificate.
-    ///
-    /// [`SigningKey`]: crate::crypto::SigningKey
-    KeyMismatch,
-
-    /// The [`SigningKey`] cannot produce its corresponding public key.
-    ///
-    /// [`SigningKey`]: crate::crypto::SigningKey
-    Unknown,
-}
-
-impl From<InconsistentKeys> for Error {
-    #[inline]
-    fn from(e: InconsistentKeys) -> Self {
-        Self::InconsistentKeys(e)
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InappropriateMessage {
+                expect_types,
+                got_type,
+            } => write!(
+                f,
+                "received unexpected message: got {:?} when expecting {}",
+                got_type,
+                join::<ContentType>(expect_types)
+            ),
+            Self::InappropriateHandshakeMessage {
+                expect_types,
+                got_type,
+            } => write!(
+                f,
+                "received unexpected handshake message: got {:?} when expecting {}",
+                got_type,
+                join::<HandshakeType>(expect_types)
+            ),
+            Self::InvalidMessage(typ) => {
+                write!(f, "received corrupt message of type {typ:?}")
+            }
+            Self::PeerIncompatible(why) => write!(f, "peer is incompatible: {why:?}"),
+            Self::PeerMisbehaved(why) => write!(f, "peer misbehaved: {why:?}"),
+            Self::AlertReceived(alert) => write!(f, "received fatal alert: the peer {alert}"),
+            Self::InvalidCertificate(err) => {
+                write!(f, "invalid peer certificate: {err}")
+            }
+            Self::InvalidCertRevocationList(err) => {
+                write!(f, "invalid certificate revocation list: {err:?}")
+            }
+            Self::UnsupportedNameType => write!(f, "presented server name type wasn't supported"),
+            Self::DecryptError => write!(f, "cannot decrypt peer's message"),
+            Self::InvalidEncryptedClientHello(err) => {
+                write!(f, "encrypted client hello failure: {err:?}")
+            }
+            Self::EncryptError => write!(f, "cannot encrypt message"),
+            Self::PeerSentOversizedRecord => write!(f, "peer sent excess record size"),
+            Self::HandshakeNotComplete => write!(f, "handshake not complete"),
+            Self::NoApplicationProtocol => write!(f, "peer doesn't support any known protocol"),
+            Self::NoSuitableCertificate => write!(f, "no suitable certificate found"),
+            Self::FailedToGetCurrentTime => write!(f, "failed to get current time"),
+            Self::FailedToGetRandomBytes => write!(f, "failed to get random bytes"),
+            Self::BadMaxFragmentSize => {
+                write!(f, "the supplied max_fragment_size was too small or large")
+            }
+            Self::InconsistentKeys(why) => {
+                write!(f, "keys may not be consistent: {why:?}")
+            }
+            Self::RejectedEch(why) => {
+                write!(
+                    f,
+                    "server rejected encrypted client hello (ECH) {} retry configs",
+                    if why.can_retry() { "with" } else { "without" }
+                )
+            }
+            Self::General(err) => write!(f, "unexpected error: {err}"),
+            Self::Unreachable(err) => write!(
+                f,
+                "unreachable condition: {err} (please file a bug in rustls)"
+            ),
+            Self::ApiMisuse(why) => write!(f, "API misuse: {why:?}"),
+            Self::Other(err) => write!(f, "other error: {err}"),
+        }
     }
 }
 
-/// A corrupt TLS message payload that resulted in an error.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum InvalidMessage {
-    /// A certificate payload exceeded rustls's 64KB limit
-    CertificatePayloadTooLarge,
-    /// An advertised message was larger then expected.
-    HandshakePayloadTooLarge,
-    /// The peer sent us a syntactically incorrect ChangeCipherSpec payload.
-    InvalidCcs,
-    /// An unknown content type was encountered during message decoding.
-    InvalidContentType,
-    /// A peer sent an invalid certificate status type
-    InvalidCertificateStatusType,
-    /// Context was incorrectly attached to a certificate request during a handshake.
-    InvalidCertRequest,
-    /// A peer's DH params could not be decoded
-    InvalidDhParams,
-    /// A message was zero-length when its record kind forbids it.
-    InvalidEmptyPayload,
-    /// A peer sent an unexpected key update request.
-    InvalidKeyUpdate,
-    /// A peer's server name could not be decoded
-    InvalidServerName,
-    /// A TLS message payload was larger then allowed by the specification.
-    MessageTooLarge,
-    /// Message is shorter than the expected length
-    MessageTooShort,
-    /// Missing data for the named handshake payload value
-    MissingData(&'static str),
-    /// A peer did not advertise its supported key exchange groups.
-    MissingKeyExchange,
-    /// A peer sent an empty list of signature schemes
-    NoSignatureSchemes,
-    /// Trailing data found for the named handshake payload value
-    TrailingData(&'static str),
-    /// A peer sent an unexpected message type.
-    UnexpectedMessage(&'static str),
-    /// An unknown TLS protocol was encountered during message decoding.
-    UnknownProtocolVersion,
-    /// A peer sent a non-null compression method.
-    UnsupportedCompression,
-    /// A peer sent an unknown elliptic curve type.
-    UnsupportedCurveType,
-    /// A peer sent an unsupported key exchange algorithm.
-    UnsupportedKeyExchangeAlgorithm(KeyExchangeAlgorithm),
-    /// A server sent an empty ticket
-    EmptyTicketValue,
-    /// A peer sent an empty list of items, but a non-empty list is required.
-    ///
-    /// The argument names the context.
-    IllegalEmptyList(&'static str),
-    /// A peer sent an empty value, but a non-empty value is required.
-    IllegalEmptyValue,
-    /// A peer sent a message where a given extension type was repeated
-    DuplicateExtension(u16),
-    /// A peer sent a message with a PSK offer extension in wrong position
-    PreSharedKeyIsNotFinalExtension,
-    /// A server sent a HelloRetryRequest with an unknown extension
-    UnknownHelloRetryRequestExtension,
-    /// The peer sent a TLS1.3 Certificate with an unknown extension
-    UnknownCertificateExtension,
+impl From<CertificateError> for Error {
+    #[inline]
+    fn from(e: CertificateError) -> Self {
+        Self::InvalidCertificate(e)
+    }
 }
 
 impl From<InvalidMessage> for Error {
@@ -244,148 +237,11 @@ impl From<InvalidMessage> for Error {
     }
 }
 
-impl From<InvalidMessage> for AlertDescription {
-    fn from(e: InvalidMessage) -> Self {
-        match e {
-            InvalidMessage::PreSharedKeyIsNotFinalExtension => Self::IllegalParameter,
-            InvalidMessage::DuplicateExtension(_) => Self::IllegalParameter,
-            InvalidMessage::UnknownHelloRetryRequestExtension => Self::UnsupportedExtension,
-            _ => Self::DecodeError,
-        }
-    }
-}
-
-/// The set of cases where we failed to make a connection because we thought
-/// the peer was misbehaving.
-///
-/// This is `non_exhaustive`: we might add or stop using items here in minor
-/// versions.  We also don't document what they mean.  Generally a user of
-/// rustls shouldn't vary its behaviour on these error codes, and there is
-/// nothing it can do to improve matters.
-///
-/// Please file a bug against rustls if you see `Error::PeerMisbehaved` in
-/// the wild.
-#[expect(missing_docs)]
-#[non_exhaustive]
-#[derive(Debug, PartialEq, Clone)]
-pub enum PeerMisbehaved {
-    AttemptedDowngradeToTls12WhenTls13IsSupported,
-    BadCertChainExtensions,
-    DisallowedEncryptedExtension,
-    DuplicateClientHelloExtensions,
-    DuplicateEncryptedExtensions,
-    DuplicateHelloRetryRequestExtensions,
-    DuplicateNewSessionTicketExtensions,
-    DuplicateServerHelloExtensions,
-    DuplicateServerNameTypes,
-    EarlyDataAttemptedInSecondClientHello,
-    EarlyDataExtensionWithoutResumption,
-    EarlyDataOfferedWithVariedCipherSuite,
-    HandshakeHashVariedAfterRetry,
-    IllegalHelloRetryRequestWithEmptyCookie,
-    IllegalHelloRetryRequestWithNoChanges,
-    IllegalHelloRetryRequestWithOfferedGroup,
-    IllegalHelloRetryRequestWithUnofferedCipherSuite,
-    IllegalHelloRetryRequestWithUnofferedNamedGroup,
-    IllegalHelloRetryRequestWithUnsupportedVersion,
-    IllegalHelloRetryRequestWithWrongSessionId,
-    IllegalHelloRetryRequestWithInvalidEch,
-    IllegalMiddleboxChangeCipherSpec,
-    IllegalTlsInnerPlaintext,
-    IncorrectBinder,
-    InvalidCertCompression,
-    InvalidMaxEarlyDataSize,
-    InvalidKeyShare,
-    KeyEpochWithPendingFragment,
-    KeyUpdateReceivedInQuicConnection,
-    MessageInterleavedWithHandshakeMessage,
-    MissingBinderInPskExtension,
-    MissingKeyShare,
-    MissingPskModesExtension,
-    MissingQuicTransportParameters,
-    NoCertificatesPresented,
-    OfferedDuplicateCertificateCompressions,
-    OfferedDuplicateKeyShares,
-    OfferedEarlyDataWithOldProtocolVersion,
-    OfferedEmptyApplicationProtocol,
-    OfferedIncorrectCompressions,
-    PskExtensionMustBeLast,
-    PskExtensionWithMismatchedIdsAndBinders,
-    RefusedToFollowHelloRetryRequest,
-    RejectedEarlyDataInterleavedWithHandshakeMessage,
-    ResumptionAttemptedWithVariedEms,
-    ResumptionOfferedWithVariedCipherSuite,
-    ResumptionOfferedWithVariedEms,
-    ResumptionOfferedWithIncompatibleCipherSuite,
-    SelectedDifferentCipherSuiteAfterRetry,
-    SelectedInvalidPsk,
-    SelectedTls12UsingTls13VersionExtension,
-    SelectedUnofferedApplicationProtocol,
-    SelectedUnofferedCertCompression,
-    SelectedUnofferedCipherSuite,
-    SelectedUnofferedCompression,
-    SelectedUnofferedKxGroup,
-    SelectedUnofferedPsk,
-    ServerEchoedCompatibilitySessionId,
-    ServerHelloMustOfferUncompressedEcPoints,
-    ServerNameDifferedOnRetry,
-    ServerNameMustContainOneHostName,
-    SignedKxWithWrongAlgorithm,
-    SignedHandshakeWithUnadvertisedSigScheme,
-    TooManyEmptyFragments,
-    TooManyKeyUpdateRequests,
-    TooManyRenegotiationRequests,
-    TooManyWarningAlertsReceived,
-    TooMuchEarlyDataReceived,
-    UnexpectedCleartextExtension,
-    UnsolicitedCertExtension,
-    UnsolicitedEncryptedExtension,
-    UnsolicitedSctList,
-    UnsolicitedServerHelloExtension,
-    WrongGroupForKeyShare,
-    UnsolicitedEchExtension,
-}
-
 impl From<PeerMisbehaved> for Error {
     #[inline]
     fn from(e: PeerMisbehaved) -> Self {
         Self::PeerMisbehaved(e)
     }
-}
-
-/// The set of cases where we failed to make a connection because a peer
-/// doesn't support a TLS version/feature we require.
-///
-/// This is `non_exhaustive`: we might add or stop using items here in minor
-/// versions.
-#[expect(missing_docs)]
-#[non_exhaustive]
-#[derive(Debug, PartialEq, Clone)]
-pub enum PeerIncompatible {
-    EcPointsExtensionRequired,
-    ExtendedMasterSecretExtensionRequired,
-    IncorrectCertificateTypeExtension,
-    KeyShareExtensionRequired,
-    MultipleRawKeys,
-    NamedGroupsExtensionRequired,
-    NoCertificateRequestSignatureSchemesInCommon,
-    NoCipherSuitesInCommon,
-    NoEcPointFormatsInCommon,
-    NoKxGroupsInCommon,
-    NoSignatureSchemesInCommon,
-    NoServerNameProvided,
-    NullCompressionRequired,
-    ServerDoesNotSupportTls12Or13,
-    ServerSentHelloRetryRequestWithUnknownExtension,
-    ServerTlsVersionIsDisabledByOurConfig,
-    SignatureAlgorithmsExtensionRequired,
-    SupportedVersionsExtensionRequired,
-    Tls12NotOffered,
-    Tls12NotOfferedOrEnabled,
-    Tls13RequiredForQuic,
-    UncompressedEcPointsRequired,
-    UnknownCertificateType(u8),
-    UnsolicitedCertificateTypeExtension,
 }
 
 impl From<PeerIncompatible> for Error {
@@ -394,6 +250,61 @@ impl From<PeerIncompatible> for Error {
         Self::PeerIncompatible(e)
     }
 }
+
+impl From<CertRevocationListError> for Error {
+    #[inline]
+    fn from(e: CertRevocationListError) -> Self {
+        Self::InvalidCertRevocationList(e)
+    }
+}
+
+impl From<EncryptedClientHelloError> for Error {
+    #[inline]
+    fn from(e: EncryptedClientHelloError) -> Self {
+        Self::InvalidEncryptedClientHello(e)
+    }
+}
+
+impl From<RejectedEch> for Error {
+    fn from(rejected_error: RejectedEch) -> Self {
+        Self::RejectedEch(rejected_error)
+    }
+}
+
+impl From<ApiMisuse> for Error {
+    fn from(e: ApiMisuse) -> Self {
+        Self::ApiMisuse(e)
+    }
+}
+
+impl From<OtherError> for Error {
+    fn from(value: OtherError) -> Self {
+        Self::Other(value)
+    }
+}
+
+impl From<InconsistentKeys> for Error {
+    #[inline]
+    fn from(e: InconsistentKeys) -> Self {
+        Self::InconsistentKeys(e)
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<SystemTimeError> for Error {
+    #[inline]
+    fn from(_: SystemTimeError) -> Self {
+        Self::FailedToGetCurrentTime
+    }
+}
+
+impl From<GetRandomFailed> for Error {
+    fn from(_: GetRandomFailed) -> Self {
+        Self::FailedToGetRandomBytes
+    }
+}
+
+impl core::error::Error for Error {}
 
 /// The ways in which certificate validators can express errors.
 ///
@@ -778,11 +689,363 @@ impl fmt::Display for CertificateError {
     }
 }
 
-impl From<CertificateError> for Error {
-    #[inline]
-    fn from(e: CertificateError) -> Self {
-        Self::InvalidCertificate(e)
+enum_builder! {
+    /// The `AlertDescription` TLS protocol enum.  Values in this enum are taken
+    /// from the various RFCs covering TLS, and are listed by IANA.
+    /// The `Unknown` item is used when processing unrecognized ordinals.
+    #[repr(u8)]
+    pub enum AlertDescription {
+        CloseNotify => 0x00,
+        UnexpectedMessage => 0x0a,
+        BadRecordMac => 0x14,
+        DecryptionFailed => 0x15,
+        RecordOverflow => 0x16,
+        DecompressionFailure => 0x1e,
+        HandshakeFailure => 0x28,
+        NoCertificate => 0x29,
+        BadCertificate => 0x2a,
+        UnsupportedCertificate => 0x2b,
+        CertificateRevoked => 0x2c,
+        CertificateExpired => 0x2d,
+        CertificateUnknown => 0x2e,
+        IllegalParameter => 0x2f,
+        UnknownCa => 0x30,
+        AccessDenied => 0x31,
+        DecodeError => 0x32,
+        DecryptError => 0x33,
+        ExportRestriction => 0x3c,
+        ProtocolVersion => 0x46,
+        InsufficientSecurity => 0x47,
+        InternalError => 0x50,
+        InappropriateFallback => 0x56,
+        UserCanceled => 0x5a,
+        NoRenegotiation => 0x64,
+        MissingExtension => 0x6d,
+        UnsupportedExtension => 0x6e,
+        CertificateUnobtainable => 0x6f,
+        UnrecognizedName => 0x70,
+        BadCertificateStatusResponse => 0x71,
+        BadCertificateHashValue => 0x72,
+        UnknownPskIdentity => 0x73,
+        CertificateRequired => 0x74,
+        NoApplicationProtocol => 0x78,
+        EncryptedClientHelloRequired => 0x79, // https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#section-11.2
     }
+}
+
+impl fmt::Display for AlertDescription {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // these should be:
+        // - in past tense
+        // - be syntactically correct if prefaced with 'the peer' to describe
+        //   received alerts
+        match self {
+            // this is normal.
+            Self::CloseNotify => write!(f, "cleanly closed the connection"),
+
+            // these are abnormal.  they are usually symptomatic of an interop failure.
+            // please file a bug report.
+            Self::UnexpectedMessage => write!(f, "received an unexpected message"),
+            Self::BadRecordMac => write!(f, "failed to verify a message"),
+            Self::RecordOverflow => write!(f, "rejected an over-length message"),
+            Self::IllegalParameter => write!(
+                f,
+                "rejected a message because a field was incorrect or inconsistent"
+            ),
+            Self::DecodeError => write!(f, "failed to decode a message"),
+            Self::DecryptError => {
+                write!(f, "failed to perform a handshake cryptographic operation")
+            }
+            Self::InappropriateFallback => {
+                write!(f, "detected an attempted version downgrade")
+            }
+            Self::MissingExtension => {
+                write!(f, "required a specific extension that was not provided")
+            }
+            Self::UnsupportedExtension => write!(f, "rejected an unsolicited extension"),
+
+            // these are deprecated by TLS1.3 and should be very rare (but possible
+            // with TLS1.2 or earlier peers)
+            Self::DecryptionFailed => write!(f, "failed to decrypt a message"),
+            Self::DecompressionFailure => write!(f, "failed to decompress a message"),
+            Self::NoCertificate => write!(f, "found no certificate"),
+            Self::ExportRestriction => write!(f, "refused due to export restrictions"),
+            Self::NoRenegotiation => write!(f, "rejected an attempt at renegotiation"),
+            Self::CertificateUnobtainable => {
+                write!(f, "failed to retrieve its certificate")
+            }
+            Self::BadCertificateHashValue => {
+                write!(f, "rejected the `certificate_hash` extension")
+            }
+
+            // this is fairly normal. it means a server cannot choose compatible parameters
+            // given our offer.  please use ssllabs.com or similar to investigate what parameters
+            // the server supports.
+            Self::HandshakeFailure => write!(
+                f,
+                "failed to negotiate an acceptable set of security parameters"
+            ),
+            Self::ProtocolVersion => write!(f, "did not support a suitable TLS version"),
+            Self::InsufficientSecurity => {
+                write!(f, "required a higher security level than was offered")
+            }
+
+            // these usually indicate a local misconfiguration, either in certificate selection
+            // or issuance.
+            Self::BadCertificate => {
+                write!(
+                    f,
+                    "rejected the certificate as corrupt or incorrectly signed"
+                )
+            }
+            Self::UnsupportedCertificate => {
+                write!(f, "did not support the certificate")
+            }
+            Self::CertificateRevoked => write!(f, "found the certificate to be revoked"),
+            Self::CertificateExpired => write!(f, "found the certificate to be expired"),
+            Self::CertificateUnknown => {
+                write!(f, "rejected the certificate for an unspecified reason")
+            }
+            Self::UnknownCa => write!(f, "found the certificate was not issued by a trusted CA"),
+            Self::BadCertificateStatusResponse => {
+                write!(f, "rejected the certificate status response")
+            }
+            // typically this means client authentication is required, in TLS1.2...
+            Self::AccessDenied => write!(f, "denied access"),
+            // and in TLS1.3...
+            Self::CertificateRequired => write!(f, "required a client certificate"),
+
+            Self::InternalError => write!(f, "encountered an internal error"),
+            Self::UserCanceled => write!(f, "canceled the handshake"),
+
+            // rejection of SNI (uncommon; usually servers behave as if it was not sent)
+            Self::UnrecognizedName => {
+                write!(f, "did not recognize a name in the `server_name` extension")
+            }
+
+            // rejection of PSK connections (NYI in this library); indicates a local
+            // misconfiguration.
+            Self::UnknownPskIdentity => {
+                write!(f, "did not recognize any offered PSK identity")
+            }
+
+            // rejection of ALPN (varying levels of support, but missing support is
+            // often dangerous if the peers fail to agree on the same protocol)
+            Self::NoApplicationProtocol => write!(
+                f,
+                "did not support any of the offered application protocols"
+            ),
+
+            // ECH requirement by clients, see
+            // <https://datatracker.ietf.org/doc/draft-ietf-tls-esni/25/>
+            Self::EncryptedClientHelloRequired => {
+                write!(f, "required use of encrypted client hello")
+            }
+
+            Self::Unknown(n) => write!(f, "sent an unknown alert (0x{n:02x?})"),
+        }
+    }
+}
+
+/// A corrupt TLS message payload that resulted in an error.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InvalidMessage {
+    /// A certificate payload exceeded rustls's 64KB limit
+    CertificatePayloadTooLarge,
+    /// An advertised message was larger then expected.
+    HandshakePayloadTooLarge,
+    /// The peer sent us a syntactically incorrect ChangeCipherSpec payload.
+    InvalidCcs,
+    /// An unknown content type was encountered during message decoding.
+    InvalidContentType,
+    /// A peer sent an invalid certificate status type
+    InvalidCertificateStatusType,
+    /// Context was incorrectly attached to a certificate request during a handshake.
+    InvalidCertRequest,
+    /// A peer's DH params could not be decoded
+    InvalidDhParams,
+    /// A message was zero-length when its record kind forbids it.
+    InvalidEmptyPayload,
+    /// A peer sent an unexpected key update request.
+    InvalidKeyUpdate,
+    /// A peer's server name could not be decoded
+    InvalidServerName,
+    /// A TLS message payload was larger then allowed by the specification.
+    MessageTooLarge,
+    /// Message is shorter than the expected length
+    MessageTooShort,
+    /// Missing data for the named handshake payload value
+    MissingData(&'static str),
+    /// A peer did not advertise its supported key exchange groups.
+    MissingKeyExchange,
+    /// A peer sent an empty list of signature schemes
+    NoSignatureSchemes,
+    /// Trailing data found for the named handshake payload value
+    TrailingData(&'static str),
+    /// A peer sent an unexpected message type.
+    UnexpectedMessage(&'static str),
+    /// An unknown TLS protocol was encountered during message decoding.
+    UnknownProtocolVersion,
+    /// A peer sent a non-null compression method.
+    UnsupportedCompression,
+    /// A peer sent an unknown elliptic curve type.
+    UnsupportedCurveType,
+    /// A peer sent an unsupported key exchange algorithm.
+    UnsupportedKeyExchangeAlgorithm(KeyExchangeAlgorithm),
+    /// A server sent an empty ticket
+    EmptyTicketValue,
+    /// A peer sent an empty list of items, but a non-empty list is required.
+    ///
+    /// The argument names the context.
+    IllegalEmptyList(&'static str),
+    /// A peer sent an empty value, but a non-empty value is required.
+    IllegalEmptyValue,
+    /// A peer sent a message where a given extension type was repeated
+    DuplicateExtension(u16),
+    /// A peer sent a message with a PSK offer extension in wrong position
+    PreSharedKeyIsNotFinalExtension,
+    /// A server sent a HelloRetryRequest with an unknown extension
+    UnknownHelloRetryRequestExtension,
+    /// The peer sent a TLS1.3 Certificate with an unknown extension
+    UnknownCertificateExtension,
+}
+
+impl From<InvalidMessage> for AlertDescription {
+    fn from(e: InvalidMessage) -> Self {
+        match e {
+            InvalidMessage::PreSharedKeyIsNotFinalExtension => Self::IllegalParameter,
+            InvalidMessage::DuplicateExtension(_) => Self::IllegalParameter,
+            InvalidMessage::UnknownHelloRetryRequestExtension => Self::UnsupportedExtension,
+            _ => Self::DecodeError,
+        }
+    }
+}
+
+/// The set of cases where we failed to make a connection because we thought
+/// the peer was misbehaving.
+///
+/// This is `non_exhaustive`: we might add or stop using items here in minor
+/// versions.  We also don't document what they mean.  Generally a user of
+/// rustls shouldn't vary its behaviour on these error codes, and there is
+/// nothing it can do to improve matters.
+///
+/// Please file a bug against rustls if you see `Error::PeerMisbehaved` in
+/// the wild.
+#[expect(missing_docs)]
+#[non_exhaustive]
+#[derive(Debug, PartialEq, Clone)]
+pub enum PeerMisbehaved {
+    AttemptedDowngradeToTls12WhenTls13IsSupported,
+    BadCertChainExtensions,
+    DisallowedEncryptedExtension,
+    DuplicateClientHelloExtensions,
+    DuplicateEncryptedExtensions,
+    DuplicateHelloRetryRequestExtensions,
+    DuplicateNewSessionTicketExtensions,
+    DuplicateServerHelloExtensions,
+    DuplicateServerNameTypes,
+    EarlyDataAttemptedInSecondClientHello,
+    EarlyDataExtensionWithoutResumption,
+    EarlyDataOfferedWithVariedCipherSuite,
+    HandshakeHashVariedAfterRetry,
+    IllegalHelloRetryRequestWithEmptyCookie,
+    IllegalHelloRetryRequestWithNoChanges,
+    IllegalHelloRetryRequestWithOfferedGroup,
+    IllegalHelloRetryRequestWithUnofferedCipherSuite,
+    IllegalHelloRetryRequestWithUnofferedNamedGroup,
+    IllegalHelloRetryRequestWithUnsupportedVersion,
+    IllegalHelloRetryRequestWithWrongSessionId,
+    IllegalHelloRetryRequestWithInvalidEch,
+    IllegalMiddleboxChangeCipherSpec,
+    IllegalTlsInnerPlaintext,
+    IncorrectBinder,
+    InvalidCertCompression,
+    InvalidMaxEarlyDataSize,
+    InvalidKeyShare,
+    KeyEpochWithPendingFragment,
+    KeyUpdateReceivedInQuicConnection,
+    MessageInterleavedWithHandshakeMessage,
+    MissingBinderInPskExtension,
+    MissingKeyShare,
+    MissingPskModesExtension,
+    MissingQuicTransportParameters,
+    NoCertificatesPresented,
+    OfferedDuplicateCertificateCompressions,
+    OfferedDuplicateKeyShares,
+    OfferedEarlyDataWithOldProtocolVersion,
+    OfferedEmptyApplicationProtocol,
+    OfferedIncorrectCompressions,
+    PskExtensionMustBeLast,
+    PskExtensionWithMismatchedIdsAndBinders,
+    RefusedToFollowHelloRetryRequest,
+    RejectedEarlyDataInterleavedWithHandshakeMessage,
+    ResumptionAttemptedWithVariedEms,
+    ResumptionOfferedWithVariedCipherSuite,
+    ResumptionOfferedWithVariedEms,
+    ResumptionOfferedWithIncompatibleCipherSuite,
+    SelectedDifferentCipherSuiteAfterRetry,
+    SelectedInvalidPsk,
+    SelectedTls12UsingTls13VersionExtension,
+    SelectedUnofferedApplicationProtocol,
+    SelectedUnofferedCertCompression,
+    SelectedUnofferedCipherSuite,
+    SelectedUnofferedCompression,
+    SelectedUnofferedKxGroup,
+    SelectedUnofferedPsk,
+    ServerEchoedCompatibilitySessionId,
+    ServerHelloMustOfferUncompressedEcPoints,
+    ServerNameDifferedOnRetry,
+    ServerNameMustContainOneHostName,
+    SignedKxWithWrongAlgorithm,
+    SignedHandshakeWithUnadvertisedSigScheme,
+    TooManyEmptyFragments,
+    TooManyKeyUpdateRequests,
+    TooManyRenegotiationRequests,
+    TooManyWarningAlertsReceived,
+    TooMuchEarlyDataReceived,
+    UnexpectedCleartextExtension,
+    UnsolicitedCertExtension,
+    UnsolicitedEncryptedExtension,
+    UnsolicitedSctList,
+    UnsolicitedServerHelloExtension,
+    WrongGroupForKeyShare,
+    UnsolicitedEchExtension,
+}
+
+/// The set of cases where we failed to make a connection because a peer
+/// doesn't support a TLS version/feature we require.
+///
+/// This is `non_exhaustive`: we might add or stop using items here in minor
+/// versions.
+#[expect(missing_docs)]
+#[non_exhaustive]
+#[derive(Debug, PartialEq, Clone)]
+pub enum PeerIncompatible {
+    EcPointsExtensionRequired,
+    ExtendedMasterSecretExtensionRequired,
+    IncorrectCertificateTypeExtension,
+    KeyShareExtensionRequired,
+    MultipleRawKeys,
+    NamedGroupsExtensionRequired,
+    NoCertificateRequestSignatureSchemesInCommon,
+    NoCipherSuitesInCommon,
+    NoEcPointFormatsInCommon,
+    NoKxGroupsInCommon,
+    NoSignatureSchemesInCommon,
+    NoServerNameProvided,
+    NullCompressionRequired,
+    ServerDoesNotSupportTls12Or13,
+    ServerSentHelloRetryRequestWithUnknownExtension,
+    ServerTlsVersionIsDisabledByOurConfig,
+    SignatureAlgorithmsExtensionRequired,
+    SupportedVersionsExtensionRequired,
+    Tls12NotOffered,
+    Tls12NotOfferedOrEnabled,
+    Tls13RequiredForQuic,
+    UncompressedEcPointsRequired,
+    UnknownCertificateType(u8),
+    UnsolicitedCertificateTypeExtension,
 }
 
 /// Extended Key Usage (EKU) purpose values.
@@ -936,13 +1199,6 @@ impl PartialEq<Self> for CertRevocationListError {
     }
 }
 
-impl From<CertRevocationListError> for Error {
-    #[inline]
-    fn from(e: CertRevocationListError) -> Self {
-        Self::InvalidCertRevocationList(e)
-    }
-}
-
 /// An error that occurred while handling Encrypted Client Hello (ECH).
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -953,13 +1209,6 @@ pub enum EncryptedClientHelloError {
     NoCompatibleConfig,
     /// The client configuration has server name indication (SNI) disabled.
     SniRequired,
-}
-
-impl From<EncryptedClientHelloError> for Error {
-    #[inline]
-    fn from(e: EncryptedClientHelloError) -> Self {
-        Self::InvalidEncryptedClientHello(e)
-    }
 }
 
 /// The server rejected the request to enable Encrypted Client Hello (ECH)
@@ -996,103 +1245,12 @@ impl RejectedEch {
     }
 }
 
-impl From<RejectedEch> for Error {
-    fn from(rejected_error: RejectedEch) -> Self {
-        Self::RejectedEch(rejected_error)
-    }
-}
-
 fn join<T: fmt::Debug>(items: &[T]) -> String {
     items
         .iter()
         .map(|x| format!("{x:?}"))
         .collect::<Vec<String>>()
         .join(" or ")
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InappropriateMessage {
-                expect_types,
-                got_type,
-            } => write!(
-                f,
-                "received unexpected message: got {:?} when expecting {}",
-                got_type,
-                join::<ContentType>(expect_types)
-            ),
-            Self::InappropriateHandshakeMessage {
-                expect_types,
-                got_type,
-            } => write!(
-                f,
-                "received unexpected handshake message: got {:?} when expecting {}",
-                got_type,
-                join::<HandshakeType>(expect_types)
-            ),
-            Self::InvalidMessage(typ) => {
-                write!(f, "received corrupt message of type {typ:?}")
-            }
-            Self::PeerIncompatible(why) => write!(f, "peer is incompatible: {why:?}"),
-            Self::PeerMisbehaved(why) => write!(f, "peer misbehaved: {why:?}"),
-            Self::AlertReceived(alert) => write!(f, "received fatal alert: the peer {alert}"),
-            Self::InvalidCertificate(err) => {
-                write!(f, "invalid peer certificate: {err}")
-            }
-            Self::InvalidCertRevocationList(err) => {
-                write!(f, "invalid certificate revocation list: {err:?}")
-            }
-            Self::UnsupportedNameType => write!(f, "presented server name type wasn't supported"),
-            Self::DecryptError => write!(f, "cannot decrypt peer's message"),
-            Self::InvalidEncryptedClientHello(err) => {
-                write!(f, "encrypted client hello failure: {err:?}")
-            }
-            Self::EncryptError => write!(f, "cannot encrypt message"),
-            Self::PeerSentOversizedRecord => write!(f, "peer sent excess record size"),
-            Self::HandshakeNotComplete => write!(f, "handshake not complete"),
-            Self::NoApplicationProtocol => write!(f, "peer doesn't support any known protocol"),
-            Self::NoSuitableCertificate => write!(f, "no suitable certificate found"),
-            Self::FailedToGetCurrentTime => write!(f, "failed to get current time"),
-            Self::FailedToGetRandomBytes => write!(f, "failed to get random bytes"),
-            Self::BadMaxFragmentSize => {
-                write!(f, "the supplied max_fragment_size was too small or large")
-            }
-            Self::InconsistentKeys(why) => {
-                write!(f, "keys may not be consistent: {why:?}")
-            }
-            Self::RejectedEch(why) => {
-                write!(
-                    f,
-                    "server rejected encrypted client hello (ECH) {} retry configs",
-                    if why.can_retry() { "with" } else { "without" }
-                )
-            }
-            Self::General(err) => write!(f, "unexpected error: {err}"),
-            Self::Unreachable(err) => write!(
-                f,
-                "unreachable condition: {err} (please file a bug in rustls)"
-            ),
-            Self::ApiMisuse(why) => write!(f, "API misuse: {why:?}"),
-            Self::Other(err) => write!(f, "other error: {err}"),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl From<SystemTimeError> for Error {
-    #[inline]
-    fn from(_: SystemTimeError) -> Self {
-        Self::FailedToGetCurrentTime
-    }
-}
-
-impl core::error::Error for Error {}
-
-impl From<rand::GetRandomFailed> for Error {
-    fn from(_: rand::GetRandomFailed) -> Self {
-        Self::FailedToGetRandomBytes
-    }
 }
 
 /// Describes cases of API misuse
@@ -1247,20 +1405,14 @@ impl fmt::Display for ApiMisuse {
 
 impl core::error::Error for ApiMisuse {}
 
-impl From<ApiMisuse> for Error {
-    fn from(e: ApiMisuse) -> Self {
-        Self::ApiMisuse(e)
-    }
-}
-
 mod other_error {
     use core::error::Error as StdError;
     use core::fmt;
 
-    use super::Error;
     use crate::sync::Arc;
 
-    /// Any other error that cannot be expressed by a more specific [`Error`] variant.
+    /// Any other error that cannot be expressed by a more specific [`Error`][super::Error]
+    /// variant.
     ///
     /// For example, an `OtherError` could be produced by a custom crypto provider
     /// exposing a provider specific error.
@@ -1279,12 +1431,6 @@ mod other_error {
     impl PartialEq<Self> for OtherError {
         fn eq(&self, _other: &Self) -> bool {
             false
-        }
-    }
-
-    impl From<OtherError> for Error {
-        fn from(value: OtherError) -> Self {
-            Self::Other(value)
         }
     }
 
@@ -1309,316 +1455,3 @@ mod other_error {
 }
 
 pub use other_error::OtherError;
-
-use crate::msgs::codec::Codec;
-
-#[cfg(test)]
-mod tests {
-    use core::time::Duration;
-    use std::prelude::v1::*;
-    use std::{println, vec};
-
-    use pki_types::ServerName;
-
-    use super::{
-        AlertDescription, CertRevocationListError, Error, InconsistentKeys, InvalidMessage,
-        OtherError, UnixTime,
-    };
-
-    #[test]
-    fn certificate_error_equality() {
-        use super::CertificateError::*;
-        assert_eq!(BadEncoding, BadEncoding);
-        assert_eq!(Expired, Expired);
-        let context = ExpiredContext {
-            time: UnixTime::since_unix_epoch(Duration::from_secs(1234)),
-            not_after: UnixTime::since_unix_epoch(Duration::from_secs(123)),
-        };
-        assert_eq!(context, context);
-        assert_ne!(
-            context,
-            ExpiredContext {
-                time: UnixTime::since_unix_epoch(Duration::from_secs(12345)),
-                not_after: UnixTime::since_unix_epoch(Duration::from_secs(123)),
-            }
-        );
-        assert_ne!(
-            context,
-            ExpiredContext {
-                time: UnixTime::since_unix_epoch(Duration::from_secs(1234)),
-                not_after: UnixTime::since_unix_epoch(Duration::from_secs(1234)),
-            }
-        );
-        assert_eq!(NotValidYet, NotValidYet);
-        let context = NotValidYetContext {
-            time: UnixTime::since_unix_epoch(Duration::from_secs(123)),
-            not_before: UnixTime::since_unix_epoch(Duration::from_secs(1234)),
-        };
-        assert_eq!(context, context);
-        assert_ne!(
-            context,
-            NotValidYetContext {
-                time: UnixTime::since_unix_epoch(Duration::from_secs(1234)),
-                not_before: UnixTime::since_unix_epoch(Duration::from_secs(1234)),
-            }
-        );
-        assert_ne!(
-            context,
-            NotValidYetContext {
-                time: UnixTime::since_unix_epoch(Duration::from_secs(123)),
-                not_before: UnixTime::since_unix_epoch(Duration::from_secs(12345)),
-            }
-        );
-        assert_eq!(Revoked, Revoked);
-        assert_eq!(UnhandledCriticalExtension, UnhandledCriticalExtension);
-        assert_eq!(UnknownIssuer, UnknownIssuer);
-        assert_eq!(ExpiredRevocationList, ExpiredRevocationList);
-        assert_eq!(UnknownRevocationStatus, UnknownRevocationStatus);
-        let context = ExpiredRevocationListContext {
-            time: UnixTime::since_unix_epoch(Duration::from_secs(1234)),
-            next_update: UnixTime::since_unix_epoch(Duration::from_secs(123)),
-        };
-        assert_eq!(context, context);
-        assert_ne!(
-            context,
-            ExpiredRevocationListContext {
-                time: UnixTime::since_unix_epoch(Duration::from_secs(12345)),
-                next_update: UnixTime::since_unix_epoch(Duration::from_secs(123)),
-            }
-        );
-        assert_ne!(
-            context,
-            ExpiredRevocationListContext {
-                time: UnixTime::since_unix_epoch(Duration::from_secs(1234)),
-                next_update: UnixTime::since_unix_epoch(Duration::from_secs(1234)),
-            }
-        );
-        assert_eq!(BadSignature, BadSignature);
-        assert_eq!(
-            UnsupportedSignatureAlgorithm {
-                signature_algorithm_id: vec![1, 2, 3],
-                supported_algorithms: vec![]
-            },
-            UnsupportedSignatureAlgorithm {
-                signature_algorithm_id: vec![1, 2, 3],
-                supported_algorithms: vec![]
-            }
-        );
-        assert_eq!(
-            UnsupportedSignatureAlgorithmForPublicKey {
-                signature_algorithm_id: vec![1, 2, 3],
-                public_key_algorithm_id: vec![4, 5, 6]
-            },
-            UnsupportedSignatureAlgorithmForPublicKey {
-                signature_algorithm_id: vec![1, 2, 3],
-                public_key_algorithm_id: vec![4, 5, 6]
-            }
-        );
-        assert_eq!(NotValidForName, NotValidForName);
-        let context = NotValidForNameContext {
-            expected: ServerName::try_from("example.com")
-                .unwrap()
-                .to_owned(),
-            presented: vec!["other.com".into()],
-        };
-        assert_eq!(context, context);
-        assert_ne!(
-            context,
-            NotValidForNameContext {
-                expected: ServerName::try_from("example.com")
-                    .unwrap()
-                    .to_owned(),
-                presented: vec![]
-            }
-        );
-        assert_ne!(
-            context,
-            NotValidForNameContext {
-                expected: ServerName::try_from("huh.com")
-                    .unwrap()
-                    .to_owned(),
-                presented: vec!["other.com".into()],
-            }
-        );
-        assert_eq!(InvalidPurpose, InvalidPurpose);
-        assert_eq!(
-            ApplicationVerificationFailure,
-            ApplicationVerificationFailure
-        );
-        assert_eq!(InvalidOcspResponse, InvalidOcspResponse);
-        let other = Other(OtherError::new(TestError));
-        assert_ne!(other, other);
-        assert_ne!(BadEncoding, Expired);
-    }
-
-    #[test]
-    fn crl_error_equality() {
-        use super::CertRevocationListError::*;
-        assert_eq!(BadSignature, BadSignature);
-        assert_eq!(
-            UnsupportedSignatureAlgorithm {
-                signature_algorithm_id: vec![1, 2, 3],
-                supported_algorithms: vec![]
-            },
-            UnsupportedSignatureAlgorithm {
-                signature_algorithm_id: vec![1, 2, 3],
-                supported_algorithms: vec![]
-            }
-        );
-        assert_eq!(
-            UnsupportedSignatureAlgorithmForPublicKey {
-                signature_algorithm_id: vec![1, 2, 3],
-                public_key_algorithm_id: vec![4, 5, 6]
-            },
-            UnsupportedSignatureAlgorithmForPublicKey {
-                signature_algorithm_id: vec![1, 2, 3],
-                public_key_algorithm_id: vec![4, 5, 6]
-            }
-        );
-        assert_eq!(InvalidCrlNumber, InvalidCrlNumber);
-        assert_eq!(
-            InvalidRevokedCertSerialNumber,
-            InvalidRevokedCertSerialNumber
-        );
-        assert_eq!(IssuerInvalidForCrl, IssuerInvalidForCrl);
-        assert_eq!(ParseError, ParseError);
-        assert_eq!(UnsupportedCriticalExtension, UnsupportedCriticalExtension);
-        assert_eq!(UnsupportedCrlVersion, UnsupportedCrlVersion);
-        assert_eq!(UnsupportedDeltaCrl, UnsupportedDeltaCrl);
-        assert_eq!(UnsupportedIndirectCrl, UnsupportedIndirectCrl);
-        assert_eq!(UnsupportedRevocationReason, UnsupportedRevocationReason);
-        let other = Other(OtherError::new(TestError));
-        assert_ne!(other, other);
-        assert_ne!(BadSignature, InvalidCrlNumber);
-    }
-
-    #[test]
-    #[cfg(feature = "std")]
-    fn other_error_equality() {
-        let other_error = OtherError::new(TestError);
-        assert_ne!(other_error, other_error);
-        let other: Error = other_error.into();
-        assert_ne!(other, other);
-    }
-
-    #[test]
-    fn smoke() {
-        use crate::enums::{AlertDescription, ContentType, HandshakeType};
-
-        let all = vec![
-            Error::InappropriateMessage {
-                expect_types: vec![ContentType::Alert],
-                got_type: ContentType::Handshake,
-            },
-            Error::InappropriateHandshakeMessage {
-                expect_types: vec![HandshakeType::ClientHello, HandshakeType::Finished],
-                got_type: HandshakeType::ServerHello,
-            },
-            Error::InvalidMessage(InvalidMessage::InvalidCcs),
-            Error::DecryptError,
-            super::PeerIncompatible::Tls12NotOffered.into(),
-            super::PeerMisbehaved::UnsolicitedCertExtension.into(),
-            Error::AlertReceived(AlertDescription::ExportRestriction),
-            super::CertificateError::Expired.into(),
-            super::CertificateError::NotValidForNameContext {
-                expected: ServerName::try_from("example.com")
-                    .unwrap()
-                    .to_owned(),
-                presented: vec![],
-            }
-            .into(),
-            super::CertificateError::NotValidForNameContext {
-                expected: ServerName::try_from("example.com")
-                    .unwrap()
-                    .to_owned(),
-                presented: vec!["DnsName(\"hello.com\")".into()],
-            }
-            .into(),
-            super::CertificateError::NotValidForNameContext {
-                expected: ServerName::try_from("example.com")
-                    .unwrap()
-                    .to_owned(),
-                presented: vec![
-                    "DnsName(\"hello.com\")".into(),
-                    "DnsName(\"goodbye.com\")".into(),
-                ],
-            }
-            .into(),
-            super::CertificateError::NotValidYetContext {
-                time: UnixTime::since_unix_epoch(Duration::from_secs(300)),
-                not_before: UnixTime::since_unix_epoch(Duration::from_secs(320)),
-            }
-            .into(),
-            super::CertificateError::ExpiredContext {
-                time: UnixTime::since_unix_epoch(Duration::from_secs(320)),
-                not_after: UnixTime::since_unix_epoch(Duration::from_secs(300)),
-            }
-            .into(),
-            super::CertificateError::ExpiredRevocationListContext {
-                time: UnixTime::since_unix_epoch(Duration::from_secs(320)),
-                next_update: UnixTime::since_unix_epoch(Duration::from_secs(300)),
-            }
-            .into(),
-            super::CertificateError::InvalidOcspResponse.into(),
-            Error::General("undocumented error".to_string()),
-            Error::FailedToGetCurrentTime,
-            Error::FailedToGetRandomBytes,
-            Error::HandshakeNotComplete,
-            Error::PeerSentOversizedRecord,
-            Error::NoApplicationProtocol,
-            Error::BadMaxFragmentSize,
-            Error::InconsistentKeys(InconsistentKeys::KeyMismatch),
-            Error::InconsistentKeys(InconsistentKeys::Unknown),
-            Error::InvalidCertRevocationList(CertRevocationListError::BadSignature),
-            Error::Unreachable("smoke"),
-            super::ApiMisuse::ExporterAlreadyUsed.into(),
-            Error::Other(OtherError::new(TestError)),
-        ];
-
-        for err in all {
-            println!("{err:?}:");
-            println!("  fmt '{err}'");
-        }
-    }
-
-    #[derive(Debug)]
-    struct TestError;
-
-    impl core::fmt::Display for TestError {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            write!(f, "test error")
-        }
-    }
-
-    impl core::error::Error for TestError {}
-
-    #[test]
-    fn alert_display() {
-        println!("Review the following error messages for syntax and grammar errors:");
-        for u in 0..=u8::MAX {
-            let err = Error::AlertReceived(AlertDescription::from(u));
-            println!(" - {err}");
-        }
-
-        // pipe the output of this test to `llm` for a quick check of these...
-    }
-
-    #[test]
-    fn rand_error_mapping() {
-        use super::rand;
-        let err: Error = rand::GetRandomFailed.into();
-        assert_eq!(err, Error::FailedToGetRandomBytes);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn time_error_mapping() {
-        use std::time::SystemTime;
-
-        let time_error = SystemTime::UNIX_EPOCH
-            .duration_since(SystemTime::now())
-            .unwrap_err();
-        let err: Error = time_error.into();
-        assert_eq!(err, Error::FailedToGetCurrentTime);
-    }
-}

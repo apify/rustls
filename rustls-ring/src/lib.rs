@@ -1,25 +1,7 @@
 //! A `CryptoProvider` implementation backed by *ring*.
 
 #![no_std]
-#![warn(
-    clippy::alloc_instead_of_core,
-    clippy::cloned_instead_of_copied,
-    clippy::exhaustive_enums,
-    clippy::exhaustive_structs,
-    clippy::manual_let_else,
-    clippy::or_fun_call,
-    clippy::std_instead_of_core,
-    clippy::use_self,
-    clippy::upper_case_acronyms,
-    elided_lifetimes_in_paths,
-    missing_docs,
-    trivial_numeric_casts,
-    unnameable_types,
-    unreachable_pub,
-    unused_import_braces,
-    unused_extern_crates,
-    unused_qualifications
-)]
+#![warn(clippy::exhaustive_enums, clippy::exhaustive_structs, missing_docs)]
 #![cfg_attr(bench, feature(test))]
 
 extern crate alloc;
@@ -38,13 +20,13 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use pki_types::PrivateKeyDer;
+use rustls::crypto::kx::SupportedKxGroup;
 use rustls::crypto::{
-    CryptoProvider, GetRandomFailed, KeyProvider, SecureRandom, SigningKey, SupportedKxGroup,
+    CryptoProvider, GetRandomFailed, KeyProvider, SecureRandom, SignatureScheme, SigningKey,
     WebPkiSupportedAlgorithms,
 };
 #[cfg(feature = "std")]
 use rustls::crypto::{TicketProducer, TicketerFactory};
-use rustls::enums::SignatureScheme;
 use rustls::error::Error;
 #[cfg(feature = "std")]
 use rustls::ticketer::TicketRotator;
@@ -280,7 +262,7 @@ pub static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] =
 /// Compatibility shims between ring 0.16.x and 0.17.x API
 mod ring_shim {
     use ring::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey};
-    use rustls::crypto::SharedSecret;
+    use rustls::crypto::kx::SharedSecret;
 
     pub(super) fn agree_ephemeral(
         priv_key: EphemeralPrivateKey,

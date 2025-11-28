@@ -8,26 +8,19 @@ use core::ops::Deref;
 
 use pki_types::ServerName;
 
-use crate::NamedGroup;
-use crate::SupportedCipherSuite;
-use crate::bs_debug;
-use super::{ClientCredentialResolver, Tls12Resumption};
+use super::config::{ClientConfig, ClientCredentialResolver, Tls12Resumption};
+use super::connection::ClientConnectionData;
+use super::ech::{EchMode, EchState, EchStatus};
+use super::{ClientHelloDetails, tls13};
 use crate::check::inappropriate_handshake_message;
 #[cfg(feature = "impit")]
-use crate::client::BrowserEmulator;
-#[cfg(feature = "impit")]
-use crate::client::builder::BrowserType;
-use crate::client::client_conn::ClientConnectionData;
-use crate::client::common::ClientHelloDetails;
-use crate::client::ech::EchState;
-use crate::client::{ClientConfig, EchMode, EchStatus, tls13};
+use crate::client::client_emulator::{BrowserEmulator, BrowserType};
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
 use crate::crypto::cipher::Payload;
-use crate::crypto::{CryptoProvider, KeyExchangeAlgorithm, StartedKeyExchange};
-use crate::enums::{
-    AlertDescription, CertificateType, CipherSuite, ContentType, HandshakeType, ProtocolVersion,
-};
-use crate::error::{ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
+use crate::crypto::kx::{KeyExchangeAlgorithm, NamedGroup, StartedKeyExchange};
+use crate::crypto::{CipherSuite, CryptoProvider, rand};
+use crate::enums::{CertificateType, ContentType, HandshakeType, ProtocolVersion};
+use crate::error::{AlertDescription, ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
 #[cfg(feature = "impit")]
@@ -49,6 +42,7 @@ use crate::tls12::Tls12CipherSuite;
 use crate::tls13::Tls13CipherSuite;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::verify::ServerVerifier;
+use crate::{SupportedCipherSuite, bs_debug};
 
 pub(super) type NextState = Box<dyn State<ClientConnectionData>>;
 pub(super) type NextStateOrError = Result<NextState, Error>;
@@ -236,7 +230,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
         )?;
         trace!("Got HRR {hrr:?}");
 
-        cx.common.check_aligned_handshake()?;
+        let proof = cx.common.check_aligned_handshake()?;
 
         // We always send a key share when TLS 1.3 is enabled.
         let offered_key_share = self.next.offered_key_share.unwrap();
@@ -364,13 +358,13 @@ impl ExpectServerHelloOrHelloRetryRequest {
             .next
             .transcript_buffer
             .start_hash(cs.hash_provider());
-        let mut transcript_buffer = transcript.into_hrr_buffer();
+        let mut transcript_buffer = transcript.into_hrr_buffer(&proof);
         transcript_buffer.add_message(&m);
 
         // If we offered ECH and the server accepted, we also need to update the separate
         // ECH transcript with the hello retry request message.
         if let Some(ech_state) = self.next.ech_state.as_mut() {
-            ech_state.transcript_hrr_update(cs.hash_provider(), &m);
+            ech_state.transcript_hrr_update(cs.hash_provider(), &m, &proof);
         }
 
         // Early data is not allowed after HelloRetryrequest
@@ -486,7 +480,7 @@ impl ClientHelloInput {
                 .protocols
                 .clone()
                 .unwrap_or_default(),
-            crate::rand::random_u16(config.provider.secure_random)?,
+            rand::random_u16(config.provider.secure_random)?,
         );
 
         Ok(Self {
@@ -575,23 +569,25 @@ fn emit_client_hello_for_retry(
     assert!(supported_versions.any(|_| true));
 
     // offer groups which are usable for any offered version
+    #[allow(unused_mut)]
     let mut offered_groups: Vec<NamedGroup> = config
-                .provider
-                .kx_groups
-                .iter()
-                .filter_map(|skxg| {
-                    let named_group = skxg.name();
-                    supported_versions
-                        .any(|v| named_group.usable_for_version(v))
-                        .then_some(named_group)
-                })
-                .collect();
+        .provider
+        .kx_groups
+        .iter()
+        .filter_map(|skxg| {
+            let named_group = skxg.name();
+            supported_versions
+                .any(|v| named_group.usable_for_version(v))
+                .then_some(named_group)
+        })
+        .collect();
 
     #[cfg(feature = "impit")]
     if let Some(BrowserEmulator {
-            browser_type: BrowserType::Chrome,
-            version: _,
-        }) = config.browser_emulation {
+        browser_type: BrowserType::Chrome,
+        version: _,
+    }) = config.browser_emulation
+    {
         offered_groups.push(NamedGroup::GREASE);
         // offered_groups.push(NamedGroup::X25519Kyber768Draft00);
     }

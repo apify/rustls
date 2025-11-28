@@ -7,31 +7,32 @@ use pki_types::{CertificateDer, DnsName};
 use super::base::{PayloadU8, PayloadU16, PayloadU24};
 use super::codec::{Codec, Reader, put_u16};
 use super::enums::{
-    ClientCertificateType, Compression, ECCurveType, EchVersion, ExtensionType, HpkeAead, HpkeKdf,
-    HpkeKem, KeyUpdateRequest, NamedGroup,
+    ClientCertificateType, Compression, ECCurveType, EchVersion, ExtensionType, KeyUpdateRequest,
 };
 use super::handshake::{
     CertificateChain, CertificateEntry, CertificateExtensions, CertificatePayloadTls13,
     CertificateRequestExtensions, CertificateRequestPayload, CertificateRequestPayloadTls13,
     CertificateStatus, CertificateStatusRequest, ClientExtensions, ClientHelloPayload,
-    ClientSessionTicket, CompressedCertificatePayload, DistinguishedName, EcParameters,
-    EchConfigContents, EchConfigPayload, EncryptedClientHello, HandshakeMessagePayload,
-    HandshakePayload, HelloRetryRequest, HelloRetryRequestExtensions, HpkeKeyConfig,
-    HpkeSymmetricCipherSuite, KeyShareEntry, NewSessionTicketExtensions, NewSessionTicketPayload,
-    NewSessionTicketPayloadTls13, PresharedKeyBinder, PresharedKeyIdentity, PresharedKeyOffer,
-    ProtocolName, PskKeyExchangeModes, Random, ServerDhParams, ServerEcdhParams,
-    ServerEncryptedClientHello, ServerExtensions, ServerHelloPayload, ServerKeyExchange,
-    ServerKeyExchangeParams, ServerKeyExchangePayload, ServerNamePayload, SessionId,
-    SingleProtocolName, SupportedEcPointFormats, SupportedProtocolVersions,
+    ClientSessionTicket, CompressedCertificatePayload, EcParameters, EchConfigContents,
+    EchConfigPayload, EncryptedClientHello, HandshakeMessagePayload, HandshakePayload,
+    HelloRetryRequest, HelloRetryRequestExtensions, HpkeKeyConfig, KeyShareEntry,
+    NewSessionTicketExtensions, NewSessionTicketPayload, NewSessionTicketPayloadTls13,
+    PresharedKeyBinder, PresharedKeyIdentity, PresharedKeyOffer, ProtocolName, PskKeyExchangeModes,
+    Random, ServerDhParams, ServerEcdhParams, ServerEncryptedClientHello, ServerExtensions,
+    ServerHelloPayload, ServerKeyExchange, ServerKeyExchangeParams, ServerKeyExchangePayload,
+    ServerNamePayload, SessionId, SingleProtocolName, SupportedEcPointFormats,
+    SupportedProtocolVersions,
 };
 use crate::crypto::cipher::Payload;
+use crate::crypto::hpke::{HpkeAead, HpkeKdf, HpkeKem, HpkeSymmetricCipherSuite};
+use crate::crypto::kx::NamedGroup;
+use crate::crypto::{CipherSuite, SignatureScheme};
 use crate::enums::{
-    CertificateCompressionAlgorithm, CertificateType, CipherSuite, HandshakeType, ProtocolVersion,
-    SignatureScheme,
+    CertificateCompressionAlgorithm, CertificateType, HandshakeType, ProtocolVersion,
 };
 use crate::error::InvalidMessage;
 use crate::sync::Arc;
-use crate::verify::DigitallySignedStruct;
+use crate::verify::{DigitallySignedStruct, DistinguishedName};
 
 #[test]
 fn rejects_short_random() {

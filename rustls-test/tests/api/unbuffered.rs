@@ -1,12 +1,11 @@
 #![allow(clippy::disallowed_types, clippy::duplicate_mod)]
 
-use std::num::NonZeroUsize;
+use core::num::NonZeroUsize;
 use std::sync::Arc;
 
 use rustls::client::{ClientConnectionData, EarlyDataError, UnbufferedClientConnection};
 use rustls::crypto::CryptoProvider;
-use rustls::enums::AlertDescription;
-use rustls::error::{CertificateError, Error, InvalidMessage};
+use rustls::error::{AlertDescription, CertificateError, Error, InvalidMessage};
 use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use rustls::unbuffered::{
     ConnectionState, EncodeError, EncryptError, InsufficientSizeError, ReadTraffic,
@@ -279,9 +278,9 @@ fn early_data() {
 
 fn run(
     client_config: Arc<ClientConfig>,
-    client_actions: &mut Actions,
+    client_actions: &mut Actions<'_>,
     server_config: Arc<ServerConfig>,
-    server_actions: &mut Actions,
+    server_actions: &mut Actions<'_>,
 ) -> Outcome {
     let mut outcome = Outcome::default();
     let mut count = 0;
@@ -492,7 +491,7 @@ fn full_closure_server_to_client() {
         // server sends message followed by close_notify, in one flight
         write_traffic(
             server.process_tls_records(&mut []),
-            |mut wt: WriteTraffic<_>| {
+            |mut wt: WriteTraffic<'_, _>| {
                 encrypt(&mut wt, b"hello", &mut buf);
                 queue_close_notify(&mut wt, &mut buf);
             },
@@ -548,7 +547,7 @@ fn junk_after_close_notify_received() {
         let mut len = dbg!(
             write_traffic(
                 client.process_tls_records(&mut []),
-                |mut wt: WriteTraffic<_>| wt.queue_close_notify(&mut client_send_buf),
+                |mut wt: WriteTraffic<'_, _>| wt.queue_close_notify(&mut client_send_buf),
             )
             .unwrap()
         );
@@ -585,7 +584,7 @@ fn queue_close_notify_is_idempotent() {
     let mut client_send_buf = [0u8; 128];
     let (len_first, len_second) = write_traffic(
         client.process_tls_records(&mut []),
-        |mut wt: WriteTraffic<_>| {
+        |mut wt: WriteTraffic<'_, _>| {
             (
                 wt.queue_close_notify(&mut client_send_buf),
                 wt.queue_close_notify(&mut client_send_buf),
@@ -949,7 +948,7 @@ fn rejects_junk() {
     confirm_transmit_tls_data(server.process_tls_records(&mut []));
 }
 
-fn write_traffic<T: SideData, R, F: FnMut(WriteTraffic<T>) -> R>(
+fn write_traffic<T: SideData, R, F: FnMut(WriteTraffic<'_, T>) -> R>(
     status: UnbufferedStatus<'_, '_, T>,
     mut f: F,
 ) -> R {
@@ -961,7 +960,7 @@ fn write_traffic<T: SideData, R, F: FnMut(WriteTraffic<T>) -> R>(
     }
 }
 
-fn read_traffic<T: SideData, R, F: FnMut(ReadTraffic<T>) -> R>(
+fn read_traffic<T: SideData, R, F: FnMut(ReadTraffic<'_, '_, T>) -> R>(
     status: UnbufferedStatus<'_, '_, T>,
     mut f: F,
 ) -> (R, usize) {
@@ -1049,7 +1048,7 @@ enum State {
     },
 }
 
-const NO_ACTIONS: Actions = Actions {
+const NO_ACTIONS: Actions<'_> = Actions {
     app_data_to_send: None,
     early_data_to_send: None,
     send_close_notify: false,
@@ -1086,7 +1085,7 @@ struct Outcome {
 fn advance_client(
     conn: &mut UnbufferedConnectionCommon<ClientConnectionData>,
     buffers: &mut Buffers,
-    actions: Actions,
+    actions: Actions<'_>,
     transcript: &mut Vec<String>,
 ) -> State {
     let UnbufferedStatus { discard, state, .. } =
@@ -1132,7 +1131,7 @@ fn advance_client(
 fn advance_server(
     conn: &mut UnbufferedConnectionCommon<ServerConnectionData>,
     buffers: &mut Buffers,
-    actions: Actions,
+    actions: Actions<'_>,
     transcript: &mut Vec<String>,
 ) -> State {
     let UnbufferedStatus { discard, state, .. } =
@@ -1168,7 +1167,7 @@ fn advance_server(
 fn handle_state<Side: SideData>(
     state: ConnectionState<'_, '_, Side>,
     outgoing: &mut Buffer,
-    actions: Actions,
+    actions: Actions<'_>,
 ) -> State {
     match dbg!(state) {
         ConnectionState::EncodeTlsData(mut state) => {
