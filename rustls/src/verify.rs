@@ -1,5 +1,7 @@
 use alloc::vec::Vec;
 use core::fmt::Debug;
+#[cfg(feature = "impit")]
+use std::vec;
 
 use pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 
@@ -12,9 +14,6 @@ use crate::msgs::base::{NonEmpty, PayloadU16};
 use crate::msgs::codec::{Codec, ListLength, Reader, TlsListElement};
 use crate::sync::Arc;
 use crate::x509::wrap_in_sequence;
-
-#[cfg(feature = "impit")]
-use std::vec;
 
 // Marker types.  These are used to bind the fact some verification
 // (certificate chain or handshake signature) has taken place into
@@ -63,10 +62,8 @@ impl ServerVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        use crate::{
-            client::client_emulator::BrowserType,
-            crypto::emulation::{CHROME_SIGNATURE_SCHEMES, FIREFOX_SIGNATURE_SCHEMES},
-        };
+        use crate::client::client_emulator::BrowserType;
+        use crate::crypto::emulation::{CHROME_SIGNATURE_SCHEMES, FIREFOX_SIGNATURE_SCHEMES};
 
         match &self.0 {
             Some(browser_emulator) => match browser_emulator.browser_type {

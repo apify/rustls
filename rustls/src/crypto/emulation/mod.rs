@@ -1,10 +1,9 @@
 #![cfg(feature = "impit")]
-use crate::Tls12CipherSuite;
-use crate::Tls13CipherSuite;
-use crate::crypto::SignatureScheme;
+use webpki::aws_lc_rs as webpki_algs_aws;
 
 use super::{WebPkiSupportedAlgorithms, aws_lc_rs};
-use webpki::aws_lc_rs as webpki_algs_aws;
+use crate::crypto::SignatureScheme;
+use crate::{Tls12CipherSuite, Tls13CipherSuite};
 
 /// The cipher suites supported by Google Chrome.
 /// Note that some of these are not real cipher suites and their implementation doesn't match the specification.

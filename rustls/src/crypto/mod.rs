@@ -248,22 +248,18 @@ impl CryptoProviderBuilder {
 
     /// Builds the `CryptoProvider`.
     pub fn build(self) -> CryptoProvider {
-        use crate::{
-            client::client_emulator::{BrowserEmulator, BrowserType},
-            crypto::aws_lc_rs::DEFAULT_PROVIDER,
-        };
+        use crate::client::client_emulator::{BrowserEmulator, BrowserType};
+        use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 
         match self.browser_emulator {
             Some(BrowserEmulator {
                 browser_type: BrowserType::Chrome,
                 version: _,
             }) => {
-                use crate::crypto::{
-                    aws_lc_rs::DEFAULT_PROVIDER,
-                    emulation::{
-                        CHROME_SIGNATURE_VERIFICATION_ALGOS, CHROME_TLS12_CIPHER_SUITES,
-                        CHROME_TLS13_CIPHER_SUITES,
-                    },
+                use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
+                use crate::crypto::emulation::{
+                    CHROME_SIGNATURE_VERIFICATION_ALGOS, CHROME_TLS12_CIPHER_SUITES,
+                    CHROME_TLS13_CIPHER_SUITES,
                 };
 
                 let provider = CryptoProvider {
@@ -279,12 +275,10 @@ impl CryptoProviderBuilder {
                 browser_type: BrowserType::Firefox,
                 version: _,
             }) => {
-                use crate::crypto::{
-                    aws_lc_rs::DEFAULT_PROVIDER,
-                    emulation::{
-                        FIREFOX_SIGNATURE_VERIFICATION_ALGOS, FIREFOX_TLS12_CIPHER_SUITES,
-                        FIREFOX_TLS13_CIPHER_SUITES,
-                    },
+                use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
+                use crate::crypto::emulation::{
+                    FIREFOX_SIGNATURE_VERIFICATION_ALGOS, FIREFOX_TLS12_CIPHER_SUITES,
+                    FIREFOX_TLS13_CIPHER_SUITES,
                 };
 
                 let provider = CryptoProvider {

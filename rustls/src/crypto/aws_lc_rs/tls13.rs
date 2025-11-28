@@ -20,7 +20,7 @@ use crate::version::TLS13_VERSION;
 #[cfg(feature = "impit")]
 macro_rules! fake_tls13_cipher_suite {
     ( $name:ident, $suite:expr  ) => {
-        /// [impit!] The bogus TLS1.3 ciphersuite $name
+        /// (impit) The bogus TLS1.3 ciphersuite $name
         #[cfg(feature = "impit")]
         pub static $name: &Tls13CipherSuite = &Tls13CipherSuite {
             protocol_version: TLS13_VERSION,
