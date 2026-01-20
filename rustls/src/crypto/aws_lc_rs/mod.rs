@@ -170,8 +170,10 @@ static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms
     all: &[
         webpki_algs::ECDSA_P256_SHA256,
         webpki_algs::ECDSA_P256_SHA384,
+        webpki_algs::ECDSA_P256_SHA512,
         webpki_algs::ECDSA_P384_SHA256,
         webpki_algs::ECDSA_P384_SHA384,
+        webpki_algs::ECDSA_P384_SHA512,
         webpki_algs::ECDSA_P521_SHA256,
         webpki_algs::ECDSA_P521_SHA384,
         webpki_algs::ECDSA_P521_SHA512,
@@ -206,7 +208,11 @@ static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms
         ),
         (
             SignatureScheme::ECDSA_NISTP521_SHA512,
-            &[webpki_algs::ECDSA_P521_SHA512],
+            &[
+                webpki_algs::ECDSA_P521_SHA512,
+                webpki_algs::ECDSA_P384_SHA512,
+                webpki_algs::ECDSA_P256_SHA512,
+            ],
         ),
         (SignatureScheme::ED25519, &[webpki_algs::ED25519]),
         (
@@ -311,6 +317,8 @@ pub(super) fn unspecified_err(_e: aws_lc_rs::error::Unspecified) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     #[cfg(feature = "fips")]
     #[test]
     fn default_suites_are_fips() {
@@ -325,5 +333,26 @@ mod tests {
     #[test]
     fn default_suites() {
         assert_eq!(super::DEFAULT_CIPHER_SUITES, super::ALL_CIPHER_SUITES);
+    }
+
+    #[test]
+    fn certificate_sig_algs() {
+        // `all` should not contain duplicates (not incorrect, but a waste of time)
+        assert_eq!(
+            super::SUPPORTED_SIG_ALGS
+                .all
+                .iter()
+                .map(|alg| {
+                    (
+                        alg.public_key_alg_id()
+                            .as_ref()
+                            .to_vec(),
+                        alg.signature_alg_id().as_ref().to_vec(),
+                    )
+                })
+                .collect::<HashSet<_>>()
+                .len(),
+            super::SUPPORTED_SIG_ALGS.all.len(),
+        );
     }
 }
