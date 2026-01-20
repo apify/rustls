@@ -80,7 +80,13 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                 );
             }
 
-            let deframer_output =
+            let deframer_output = if self
+                .core
+                .common_state
+                .has_received_close_notify
+            {
+                None
+            } else {
                 match self
                     .core
                     .deframe(None, buffer.filled_mut(), &mut buffer_progress)
@@ -93,7 +99,8 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                         };
                     }
                     Ok(r) => r,
-                };
+                }
+            };
 
             if let Some(msg) = deframer_output {
                 let mut state =
@@ -417,8 +424,8 @@ impl<'c, 'i> ReadEarlyData<'c, 'i, ServerConnectionData> {
 pub struct AppDataRecord<'i> {
     /// Number of additional bytes to discard
     ///
-    /// This number MUST be added to the value of [`UnbufferedStatus.discard`] *prior* to the
-    /// discard operation. See [`UnbufferedStatus.discard`] for more details
+    /// This number MUST be added to the value of [`UnbufferedStatus::discard`] *prior* to the
+    /// discard operation. See [`UnbufferedStatus::discard`] for more details
     pub discard: usize,
 
     /// The payload of the app-data record
