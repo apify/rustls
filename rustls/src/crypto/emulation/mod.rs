@@ -165,7 +165,7 @@ impl FingerprintKeyExchangeGroup {
 }
 
 /// Signature algorithms for fingerprinting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FingerprintSignatureAlgorithm {
     // ECDSA algorithms
     EcdsaSecp256r1Sha256,
@@ -401,43 +401,84 @@ impl FingerprintSignatureAlgorithm {
     }
 }
 
-impl TlsFingerprint {
-    /// Builds a `WebPkiSupportedAlgorithms` from this fingerprint's signature algorithms.
-    ///
-    /// The order of algorithms in the mapping reflects the fingerprint's preference order,
-    /// which is important for TLS fingerprinting.
-    pub fn to_signature_verification_algorithms(&self) -> WebPkiSupportedAlgorithms {
-        use alloc::boxed::Box;
-        use alloc::collections::BTreeSet;
+/// Global cache for `WebPkiSupportedAlgorithms` to avoid memory leaks from repeated `Box::leak` calls.
+/// Each unique signature algorithm configuration is only leaked once.
+mod sig_alg_cache {
+    use super::{FingerprintSignatureAlgorithm, WebPkiSupportedAlgorithms};
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeSet;
+    use alloc::vec::Vec;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
 
+    static CACHE: OnceLock<
+        Mutex<HashMap<Vec<FingerprintSignatureAlgorithm>, WebPkiSupportedAlgorithms>>,
+    > = OnceLock::new();
+
+    fn get_cache()
+    -> &'static Mutex<HashMap<Vec<FingerprintSignatureAlgorithm>, WebPkiSupportedAlgorithms>> {
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn get_or_create(
+        signature_algorithms: &[FingerprintSignatureAlgorithm],
+    ) -> WebPkiSupportedAlgorithms {
+        let cache = get_cache();
+
+        // Check if we already have this configuration cached
+        {
+            let guard = cache.lock().unwrap();
+            if let Some(cached) = guard.get(signature_algorithms) {
+                return *cached;
+            }
+        }
+
+        // Build the algorithms (will leak, but only once per unique configuration)
+        let algorithms = build_algorithms(signature_algorithms);
+
+        // Store in cache
+        {
+            let mut guard = cache.lock().unwrap();
+            // Double-check in case another thread added it while we were building
+            if let Some(cached) = guard.get(signature_algorithms) {
+                return *cached;
+            }
+            guard.insert(signature_algorithms.to_vec(), algorithms);
+        }
+
+        algorithms
+    }
+
+    fn build_algorithms(
+        signature_algorithms: &[FingerprintSignatureAlgorithm],
+    ) -> WebPkiSupportedAlgorithms {
         // Collect all unique webpki algorithms (using pointer address for dedup)
         let mut seen: BTreeSet<usize> = BTreeSet::new();
-        let all_algs: Vec<&'static dyn pki_types::SignatureVerificationAlgorithm> = self
-            .signature_algorithms
-            .iter()
-            .flat_map(|sa| sa.to_webpki_algs().iter().copied())
-            .filter(|alg| {
-                let ptr: *const dyn pki_types::SignatureVerificationAlgorithm = *alg;
-                seen.insert(ptr as *const () as usize)
-            })
-            .collect();
+        let all_algs: Vec<&'static dyn pki_types::SignatureVerificationAlgorithm> =
+            signature_algorithms
+                .iter()
+                .flat_map(|sa| sa.to_webpki_algs().iter().copied())
+                .filter(|alg| {
+                    let ptr: *const dyn pki_types::SignatureVerificationAlgorithm = *alg;
+                    seen.insert(ptr as *const () as usize)
+                })
+                .collect();
 
         // Collect mapping entries in fingerprint order
         let mapping_entries: Vec<(
-            SignatureScheme,
+            crate::SignatureScheme,
             &'static [&'static dyn pki_types::SignatureVerificationAlgorithm],
-        )> = self
-            .signature_algorithms
+        )> = signature_algorithms
             .iter()
             .filter_map(|sa| sa.to_mapping_entry())
             .collect();
 
         // Leak the vectors to get 'static references
-        // This is acceptable because fingerprints are typically long-lived configurations
+        // This only happens once per unique configuration due to caching
         let all_static: &'static [&'static dyn pki_types::SignatureVerificationAlgorithm] =
             Box::leak(all_algs.into_boxed_slice());
         let mapping_static: &'static [(
-            SignatureScheme,
+            crate::SignatureScheme,
             &'static [&'static dyn pki_types::SignatureVerificationAlgorithm],
         )] = Box::leak(mapping_entries.into_boxed_slice());
 
@@ -445,5 +486,18 @@ impl TlsFingerprint {
             all: all_static,
             mapping: mapping_static,
         }
+    }
+}
+
+impl TlsFingerprint {
+    /// Builds a `WebPkiSupportedAlgorithms` from this fingerprint's signature algorithms.
+    ///
+    /// The order of algorithms in the mapping reflects the fingerprint's preference order,
+    /// which is important for TLS fingerprinting.
+    ///
+    /// Results are cached globally to avoid memory leaks from repeated allocations.
+    /// Each unique signature algorithm configuration is only allocated once.
+    pub fn to_signature_verification_algorithms(&self) -> WebPkiSupportedAlgorithms {
+        sig_alg_cache::get_or_create(&self.signature_algorithms)
     }
 }

@@ -16,7 +16,7 @@ use crate::error::Error;
 use crate::sign::{CertifiedKey, SingleCertAndKey};
 use crate::sync::Arc;
 use crate::webpki::{self, WebPkiServerVerifier};
-use crate::{WantsVersions, compress, verify, versions};
+use crate::{WantsVersions, compress, verify, versions, version::TLS13};
 
 impl ConfigBuilder<ClientConfig, WantsVersions> {
     /// Enable Encrypted Client Hello (ECH) in the given mode.
