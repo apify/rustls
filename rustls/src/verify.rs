@@ -1,3 +1,5 @@
+#[cfg(feature = "impit")]
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Debug;
 
