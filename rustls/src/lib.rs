@@ -593,9 +593,12 @@ pub mod client {
 
     pub use builder::WantsClientCert;
     #[cfg(feature = "impit")]
-    pub use builder::WantsClientCertWithBrowserEmulationEnabled;
+    pub use builder::WantsClientCertWithTlsFingerprint;
     #[cfg(feature = "impit")]
-    pub use builder::{BrowserEmulator, BrowserType};
+    pub use builder::{
+        FingerprintCertCompressionAlgorithm, FingerprintCipherSuite, FingerprintKeyExchangeGroup,
+        FingerprintSignatureAlgorithm, TlsExtensionsConfig, TlsFingerprint,
+    };
     pub use client_conn::{
         ClientConfig, ClientConnectionData, ClientSessionStore, EarlyDataError, ResolvesClientCert,
         Resumption, Tls12Resumption, UnbufferedClientConnection,

@@ -2,7 +2,6 @@
 use crate::KeyLogFile;
 #[cfg(not(feature = "impit"))]
 use crate::NoKeyLog;
-use crate::versions::TLS13;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 #[cfg(feature = "impit")]
@@ -16,6 +15,8 @@ use crate::client::{ClientConfig, EchMode, ResolvesClientCert, handy};
 use crate::error::Error;
 use crate::sign::{CertifiedKey, SingleCertAndKey};
 use crate::sync::Arc;
+#[cfg(not(feature = "impit"))]
+use crate::version::TLS13;
 use crate::webpki::{self, WebPkiServerVerifier};
 use crate::{WantsVersions, compress, verify, versions};
 
@@ -132,24 +133,10 @@ pub(super) mod danger {
 }
 
 #[cfg(feature = "impit")]
-#[derive(Debug, Clone)]
-/// Emulate a browser's behavior.
-pub enum BrowserType {
-    /// Emulate Chrome's behavior.
-    Chrome,
-    /// Emulate Firefox's behavior.
-    Firefox,
-}
-
-#[cfg(feature = "impit")]
-/// Struct holding the browser emulator configuration.
-#[derive(Debug, Clone)]
-pub struct BrowserEmulator {
-    /// Emulated browser, e.g. Chrome or Firefox
-    pub browser_type: BrowserType,
-    /// Browser version
-    pub version: u8,
-}
+pub use crate::crypto::emulation::{
+    FingerprintCertCompressionAlgorithm, FingerprintCipherSuite, FingerprintKeyExchangeGroup,
+    FingerprintSignatureAlgorithm, TlsExtensionsConfig, TlsFingerprint,
+};
 
 /// A config builder state where the caller needs to supply whether and how to provide a client
 /// certificate.
@@ -163,24 +150,25 @@ pub struct WantsClientCert {
 }
 
 impl ConfigBuilder<ClientConfig, WantsClientCert> {
-    /// Enable a browser emulator.
+    /// Enable TLS fingerprinting with a custom fingerprint.
     #[cfg(feature = "impit")]
-    pub fn with_browser_emulator(
+    pub fn with_tls_fingerprint(
         self,
-        browser_emulator: &BrowserEmulator,
-    ) -> ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
+        fingerprint: TlsFingerprint,
+    ) -> ConfigBuilder<ClientConfig, WantsClientCertWithTlsFingerprint> {
         ConfigBuilder {
-            state: WantsClientCertWithBrowserEmulationEnabled {
+            state: WantsClientCertWithTlsFingerprint {
                 versions: self.state.versions,
                 verifier: self.state.verifier,
                 client_ech_mode: self.state.client_ech_mode,
-                browser_emulator: browser_emulator.clone(),
+                tls_fingerprint: fingerprint,
             },
             provider: self.provider,
             time_provider: self.time_provider,
             side: PhantomData,
         }
     }
+
     /// Sets a single certificate chain and matching private key for use
     /// in client authentication.
     ///
@@ -213,7 +201,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             provider: self.provider,
             alpn_protocols: Vec::new(),
             #[cfg(feature = "impit")]
-            browser_emulation: None,
+            tls_fingerprint: None,
             resumption: Resumption::default(),
             max_fragment_size: None,
             client_auth_cert_resolver,
@@ -238,20 +226,20 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
 }
 
 /// A config builder state where the caller needs to supply whether and how to provide a client
-/// certificate.
+/// certificate, with TLS fingerprint enabled.
 ///
 /// For more information, see the [`ConfigBuilder`] documentation.
 #[cfg(feature = "impit")]
 #[derive(Clone)]
-pub struct WantsClientCertWithBrowserEmulationEnabled {
+pub struct WantsClientCertWithTlsFingerprint {
     versions: versions::EnabledVersions,
     verifier: Arc<dyn verify::ServerCertVerifier>,
     client_ech_mode: Option<EchMode>,
-    browser_emulator: BrowserEmulator,
+    tls_fingerprint: TlsFingerprint,
 }
 
 #[cfg(feature = "impit")]
-impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
+impl ConfigBuilder<ClientConfig, WantsClientCertWithTlsFingerprint> {
     /// Sets a single certificate chain and matching private key for use
     /// in client authentication.
     ///
@@ -280,24 +268,39 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
         self,
         client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
     ) -> ClientConfig {
-        let (alpn_protocols, cert_compressors, cert_decompressors) =
-            match self.state.browser_emulator {
-                BrowserEmulator {
-                    browser_type: BrowserType::Chrome,
-                    version: _,
-                } => (
-                    vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-                    vec![crate::compress::BROTLI_COMPRESSOR],
-                    vec![crate::compress::BROTLI_DECOMPRESSOR],
-                ),
-                BrowserEmulator {
-                    browser_type: BrowserType::Firefox,
-                    version: _,
-                } => (vec![b"h2".to_vec(), b"http/1.1".to_vec()], vec![], vec![]),
-            };
+        use crate::crypto::emulation::FingerprintCertCompressionAlgorithm;
+
+        // Determine cert compression based on fingerprint
+        let (cert_compressors, cert_decompressors) = if let Some(ref compression) = self
+            .state
+            .tls_fingerprint
+            .cert_compression
+        {
+            let compressors: Vec<_> = compression
+                .iter()
+                .filter_map(|alg| match alg {
+                    FingerprintCertCompressionAlgorithm::Brotli => {
+                        Some(compress::BROTLI_COMPRESSOR)
+                    }
+                    _ => None, // Only Brotli is supported for now
+                })
+                .collect();
+            let decompressors: Vec<_> = compression
+                .iter()
+                .filter_map(|alg| match alg {
+                    FingerprintCertCompressionAlgorithm::Brotli => {
+                        Some(compress::BROTLI_DECOMPRESSOR)
+                    }
+                    _ => None,
+                })
+                .collect();
+            (compressors, decompressors)
+        } else {
+            (vec![], vec![])
+        };
 
         ClientConfig {
-            browser_emulation: Some(self.state.browser_emulator),
+            tls_fingerprint: Some(self.state.tls_fingerprint),
             provider: self.provider,
             resumption: Resumption::default(),
             max_fragment_size: None,
@@ -310,7 +313,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithBrowserEmulationEnabled> {
             #[cfg(feature = "tls12")]
             require_ems: cfg!(feature = "fips"),
             time_provider: self.time_provider,
-            alpn_protocols,
+            alpn_protocols: vec![], // Will be set by the caller or use fingerprint.alpn_protocols
             key_log: Arc::new(KeyLogFile::new()),
             cert_compressors,
             cert_decompressors,

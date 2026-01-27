@@ -14,10 +14,6 @@ use crate::SupportedCipherSuite;
 #[cfg(feature = "logging")]
 use crate::bs_debug;
 use crate::check::inappropriate_handshake_message;
-#[cfg(feature = "impit")]
-use crate::client::BrowserEmulator;
-#[cfg(feature = "impit")]
-use crate::client::builder::BrowserType;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
 use crate::client::ech::EchState;
@@ -226,25 +222,22 @@ fn emit_client_hello_for_retry(
         .collect();
 
     #[cfg(feature = "impit")]
-    let mut offered_groups: Vec<NamedGroup> = config
-        .provider
-        .kx_groups
-        .iter()
-        .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
-        .map(|skxg| skxg.name())
-        .collect();
-
-    #[cfg(feature = "impit")]
-    match config.browser_emulation {
-        Some(BrowserEmulator {
-            browser_type: BrowserType::Chrome,
-            version: _,
-        }) => {
-            offered_groups.push(NamedGroup::GREASE);
-            // offered_groups.push(NamedGroup::X25519Kyber768Draft00);
-        }
-        _ => {}
-    }
+    let offered_groups: Vec<NamedGroup> = if let Some(ref fingerprint) = config.tls_fingerprint {
+        // Use key exchange groups from TLS fingerprint
+        fingerprint
+            .key_exchange_groups
+            .iter()
+            .map(|g| g.to_named_group())
+            .collect()
+    } else {
+        config
+            .provider
+            .kx_groups
+            .iter()
+            .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
+            .map(|skxg| skxg.name())
+            .collect()
+    };
 
     let mut exts = Box::new(ClientExtensions {
         supported_versions: Some(supported_versions),
@@ -262,34 +255,40 @@ fn emit_client_hello_for_retry(
     });
 
     #[cfg(feature = "impit")]
-    match config.browser_emulation {
-        Some(BrowserEmulator {
-            browser_type: BrowserType::Chrome,
-            version: _,
-        }) => {
+    if let Some(ref fingerprint) = config.tls_fingerprint {
+        // Apply TLS fingerprint extensions configuration
+        let ext_config = &fingerprint.extensions;
+
+        if ext_config.grease {
+            exts.reserved_grease = Some(());
+        }
+
+        if ext_config.signed_certificate_timestamp {
+            exts.signed_certificate_timestamp = Some(());
+        }
+
+        if ext_config.application_settings {
             // hack - to avoid `Unexpected Message` when communicating with BoringSSL-based servers,
             // we cannot send an actual ALPN protocol name list
             let application_settings: PayloadU16 =
                 PayloadU16::new(vec![0x05, 0x69, 0x6d, 0x70, 0x69, 0x74]);
-
-            exts.reserved_grease = Some(());
-            exts.signed_certificate_timestamp = Some(());
             exts.application_settings = Some(application_settings);
-            exts.renegotiation_info = Some(PayloadU8::empty());
         }
-        Some(BrowserEmulator {
-            browser_type: BrowserType::Firefox,
-            version: _,
-        }) => {
+
+        if ext_config.delegated_credentials {
             // TODO: We don't really support the delegated credentials extension yet, just sending it in the client hello message
             let delegated_credentials_signature_algos =
                 PayloadU16::new(vec![0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03]);
-
             exts.delegated_credentials = Some(delegated_credentials_signature_algos);
-            exts.renegotiation_info = Some(PayloadU8::empty());
-            exts.record_size_limit = Some(16385);
         }
-        _ => {}
+
+        if ext_config.renegotiation_info {
+            exts.renegotiation_info = Some(PayloadU8::empty());
+        }
+
+        if let Some(record_size_limit) = ext_config.record_size_limit {
+            exts.record_size_limit = Some(record_size_limit);
+        }
     }
 
     match extra_exts.transport_parameters.clone() {
@@ -435,24 +434,10 @@ fn emit_client_hello_for_retry(
     }
 
     #[cfg(feature = "impit")]
-    match config.browser_emulation {
-        // Chrome doesn't send this cipher suite.
-        Some(BrowserEmulator {
-            browser_type: BrowserType::Chrome,
-            version: _,
-        }) => {}
-        // Firefox also doesn't seem to send this cipher suite?
-        Some(BrowserEmulator {
-            browser_type: BrowserType::Firefox,
-            version: _,
-        }) => {}
-        _ => {
-            // We don't do renegotiation at all, in fact.
-            if supported_versions.tls12 {
-                // We don't do renegotiation at all, in fact.
-                cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
-            }
-        }
+    // Skip adding TLS_EMPTY_RENEGOTIATION_INFO_SCSV when using tls_fingerprint
+    if config.tls_fingerprint.is_none() && supported_versions.tls12 {
+        // We don't do renegotiation at all, in fact.
+        cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
     }
 
     let mut chp_payload = ClientHelloPayload {

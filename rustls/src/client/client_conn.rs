@@ -5,8 +5,6 @@ use core::{fmt, mem};
 
 use pki_types::{ServerName, UnixTime};
 
-#[cfg(feature = "impit")]
-use super::BrowserEmulator;
 use super::handy::NoClientSessionStorage;
 use super::hs::{self, ClientHelloInput};
 #[cfg(feature = "std")]
@@ -164,13 +162,9 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
 /// [`RootCertStore`]: crate::RootCertStore
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
-    /// Whether this client is using browser-emulated settings.
-    /// This is used by the retch_rust project to emulate browsers' JA4 fingerprints.
-    ///
-    /// Note that this can be only set by the builder's `with_browser_emulation` method.
-    /// Setting this field directly won't work correctly and might cause inconsistencies in your JA4 fingerprints.
+    /// Custom TLS fingerprint configuration.
     #[cfg(feature = "impit")]
-    pub browser_emulation: Option<BrowserEmulator>,
+    pub tls_fingerprint: Option<crate::crypto::emulation::TlsFingerprint>,
 
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.

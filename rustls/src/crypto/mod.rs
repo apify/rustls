@@ -1,21 +1,12 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::Debug;
-#[cfg(feature = "impit")]
-use emulation::{
-    CHROME_CIPHER_SUITES, CHROME_SIGNATURE_VERIFICATION_ALGOS, FIREFOX_CIPHER_SUITES,
-    FIREFOX_SIGNATURE_VERIFICATION_ALGOS,
-};
 
 use pki_types::PrivateKeyDer;
 use zeroize::Zeroize;
 
 #[cfg(all(doc, feature = "tls12"))]
 use crate::Tls12CipherSuite;
-#[cfg(feature = "impit")]
-use crate::client::BrowserEmulator;
-#[cfg(feature = "impit")]
-use crate::client::builder::BrowserType;
 use crate::msgs::ffdhe_groups::FfdheGroup;
 use crate::sign::SigningKey;
 use crate::sync::Arc;
@@ -231,46 +222,39 @@ pub struct CryptoProvider {
 /// Convenience builder for `CryptoProvider`.
 #[cfg(feature = "impit")]
 pub struct CryptoProviderBuilder {
-    browser_emulator: Option<BrowserEmulator>,
+    tls_fingerprint: Option<emulation::TlsFingerprint>,
 }
 
 #[cfg(feature = "impit")]
 impl CryptoProviderBuilder {
-    /// Sets the browser emulator to use for this provider.
-    pub fn with_browser_emulator(mut self, browser_emulator: &BrowserEmulator) -> Self {
-        self.browser_emulator = Some(browser_emulator.clone());
+    /// Sets the TLS fingerprint to use for this provider.
+    pub fn with_tls_fingerprint(mut self, fingerprint: emulation::TlsFingerprint) -> Self {
+        self.tls_fingerprint = Some(fingerprint);
         self
     }
 
     /// Builds the `CryptoProvider`.
     pub fn build(self) -> CryptoProvider {
-        match self.browser_emulator {
-            Some(BrowserEmulator {
-                browser_type: BrowserType::Chrome,
-                version: _,
-            }) => {
-                let provider = CryptoProvider {
-                    cipher_suites: CHROME_CIPHER_SUITES.to_vec(),
-                    signature_verification_algorithms: CHROME_SIGNATURE_VERIFICATION_ALGOS,
-                    ..aws_lc_rs::default_provider()
-                };
+        if let Some(fingerprint) = self.tls_fingerprint {
+            let cipher_suites: Vec<_> = fingerprint
+                .cipher_suites
+                .iter()
+                .map(|cs| cs.to_supported_cipher_suite())
+                .collect();
 
-                provider
-            }
-            Some(BrowserEmulator {
-                browser_type: BrowserType::Firefox,
-                version: _,
-            }) => {
-                let provider = CryptoProvider {
-                    cipher_suites: FIREFOX_CIPHER_SUITES.to_vec(),
-                    signature_verification_algorithms: FIREFOX_SIGNATURE_VERIFICATION_ALGOS,
-                    ..aws_lc_rs::default_provider()
-                };
+            // Build signature verification algorithms from the fingerprint's signature algorithms
+            // This preserves the browser-specific order and algorithm selection
+            let signature_verification_algorithms =
+                fingerprint.to_signature_verification_algorithms();
 
-                provider
-            }
-            None => aws_lc_rs::default_provider(),
+            return CryptoProvider {
+                cipher_suites,
+                signature_verification_algorithms,
+                ..aws_lc_rs::default_provider()
+            };
         }
+
+        aws_lc_rs::default_provider()
     }
 }
 
@@ -279,7 +263,7 @@ impl CryptoProvider {
     #[cfg(feature = "impit")]
     pub fn builder() -> CryptoProviderBuilder {
         CryptoProviderBuilder {
-            browser_emulator: None,
+            tls_fingerprint: None,
         }
     }
 
