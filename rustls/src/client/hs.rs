@@ -272,7 +272,13 @@ fn emit_client_hello_for_retry(
             // we cannot send an actual ALPN protocol name list
             let application_settings: PayloadU16 =
                 PayloadU16::new(vec![0x05, 0x69, 0x6d, 0x70, 0x69, 0x74]);
-            exts.application_settings = Some(application_settings);
+            if ext_config.use_new_alps_codepoint {
+                // Use new ALPS codepoint (17613 / 0x44cd) for Chrome 136+
+                exts.application_settings_new = Some(application_settings);
+            } else {
+                // Use old ALPS codepoint (17513 / 0x4469)
+                exts.application_settings = Some(application_settings);
+            }
         }
 
         if ext_config.delegated_credentials {
@@ -416,6 +422,7 @@ fn emit_client_hello_for_retry(
     // but they also need to keep the same order as the previous ClientHello
     exts.order_seed = input.hello.extension_order_seed;
 
+    #[cfg(not(feature = "impit"))]
     let mut cipher_suites: Vec<_> = config
         .provider
         .cipher_suites
@@ -425,6 +432,26 @@ fn emit_client_hello_for_retry(
             false => None,
         })
         .collect();
+
+    #[cfg(feature = "impit")]
+    let mut cipher_suites: Vec<_> = if let Some(ref fingerprint) = config.tls_fingerprint {
+        // Use cipher suites from TLS fingerprint with correct codes for advertising
+        fingerprint
+            .cipher_suites
+            .iter()
+            .map(|cs| cs.to_cipher_suite())
+            .collect()
+    } else {
+        config
+            .provider
+            .cipher_suites
+            .iter()
+            .filter_map(|cs| match cs.usable_for_protocol(cx.common.protocol) {
+                true => Some(cs.suite()),
+                false => None,
+            })
+            .collect()
+    };
 
     #[cfg(not(feature = "impit"))]
     // We don't do renegotiation at all, in fact.
@@ -438,6 +465,15 @@ fn emit_client_hello_for_retry(
     if config.tls_fingerprint.is_none() && supported_versions.tls12 {
         // We don't do renegotiation at all, in fact.
         cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
+    }
+
+    // Add padding extension if configured (RFC7685)
+    #[cfg(feature = "impit")]
+    if let Some(ref fingerprint) = config.tls_fingerprint {
+        if fingerprint.extensions.padding {
+            // Smallest padding extension: type (0x0015) + length (0x0000) = 4 bytes
+            exts.padding = Some(Payload::empty());
+        }
     }
 
     let mut chp_payload = ClientHelloPayload {

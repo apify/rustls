@@ -940,9 +940,18 @@ extension_struct! {
         ExtensionType::RecordSizeLimit =>
             pub(crate) record_size_limit: Option<u16>,
 
-        /// Bogus impit extension
+        /// ALPS extension (old codepoint 17513)
         ExtensionType::ApplicationSettings =>
             pub(crate) application_settings: Option<PayloadU16>,
+
+        /// ALPS extension (new codepoint 17613, used by Chrome 136+)
+        ExtensionType::ApplicationSettingsNew =>
+            pub(crate) application_settings_new: Option<PayloadU16>,
+
+        /// Padding extension (RFC7685) - used to pad ClientHello to avoid triggering
+        /// bugs in some middleboxes. Contains zero bytes.
+        ExtensionType::Padding =>
+            pub(crate) padding: Option<Payload<'a>>,
 
         /// Encrypted client hello outer extensions (draft-ietf-tls-esni)
         ExtensionType::EncryptedClientHelloOuterExtensions =>
@@ -984,10 +993,12 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             application_settings,
+            application_settings_new,
             reserved_grease,
             signed_certificate_timestamp,
             delegated_credentials,
             record_size_limit,
+            padding,
             contiguous_extensions,
         } = self;
         ClientExtensions {
@@ -1017,10 +1028,12 @@ impl ClientExtensions<'_> {
             order_seed,
             contiguous_extensions,
             application_settings,
+            application_settings_new,
             reserved_grease,
             signed_certificate_timestamp,
             delegated_credentials,
             record_size_limit,
+            padding: padding.map(|x| x.into_owned()),
         }
     }
 

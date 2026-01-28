@@ -311,6 +311,42 @@ pub(super) fn initial_key_share(
     server_name: &ServerName<'_>,
     kx_state: &mut KxState,
 ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+    // When fingerprinting is enabled, use the first non-GREASE group from the fingerprint
+    #[cfg(feature = "impit")]
+    let group = if let Some(ref fingerprint) = config.tls_fingerprint {
+        use crate::NamedGroup;
+        use crate::crypto::emulation::FingerprintKeyExchangeGroup;
+
+        // Find the first non-GREASE group from the fingerprint
+        let first_real_group = fingerprint
+            .key_exchange_groups
+            .iter()
+            .find(|g| !matches!(g, FingerprintKeyExchangeGroup::Grease))
+            .map(|g| g.to_named_group())
+            .unwrap_or(NamedGroup::X25519);
+
+        // Find the corresponding SupportedKxGroup from the provider
+        config
+            .find_kx_group(first_real_group, ProtocolVersion::TLSv1_3)
+            .expect("Fingerprint key exchange group not available in provider")
+    } else {
+        config
+            .resumption
+            .store
+            .kx_hint(server_name)
+            .and_then(|group_name| config.find_kx_group(group_name, ProtocolVersion::TLSv1_3))
+            .unwrap_or_else(|| {
+                config
+                    .provider
+                    .kx_groups
+                    .iter()
+                    .copied()
+                    .next()
+                    .expect("No kx groups configured")
+            })
+    };
+
+    #[cfg(not(feature = "impit"))]
     let group = config
         .resumption
         .store
