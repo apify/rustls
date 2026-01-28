@@ -75,6 +75,53 @@ pub enum FingerprintCipherSuite {
 }
 
 impl FingerprintCipherSuite {
+    /// Returns the CipherSuite code to advertise in the ClientHello.
+    /// This returns the actual cipher suite code, even for cipher suites
+    /// that are not implemented (like 3DES).
+    pub fn to_cipher_suite(&self) -> crate::CipherSuite {
+        use crate::CipherSuite;
+        match self {
+            Self::TLS13_AES_128_GCM_SHA256 => CipherSuite::TLS13_AES_128_GCM_SHA256,
+            Self::TLS13_AES_256_GCM_SHA384 => CipherSuite::TLS13_AES_256_GCM_SHA384,
+            Self::TLS13_CHACHA20_POLY1305_SHA256 => CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+            Self::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => {
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+            }
+            Self::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => {
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+            }
+            Self::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => {
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+            }
+            Self::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+            }
+            Self::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+            Self::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
+                CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+            Self::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA => {
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
+            }
+            Self::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA => {
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
+            }
+            Self::TLS_RSA_WITH_AES_128_GCM_SHA256 => CipherSuite::TLS_RSA_WITH_AES_128_GCM_SHA256,
+            Self::TLS_RSA_WITH_AES_256_GCM_SHA384 => CipherSuite::TLS_RSA_WITH_AES_256_GCM_SHA384,
+            Self::TLS_RSA_WITH_AES_128_CBC_SHA => CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            Self::TLS_RSA_WITH_AES_256_CBC_SHA => CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA,
+            Self::TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA => {
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA
+            }
+            Self::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA => {
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA
+            }
+            Self::Grease => CipherSuite::TLS_RESERVED_GREASE,
+        }
+    }
+
     /// Converts the fingerprint cipher suite to rustls's SupportedCipherSuite.
     pub fn to_supported_cipher_suite(&self) -> SupportedCipherSuite {
         match self {
@@ -134,6 +181,8 @@ impl FingerprintCipherSuite {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FingerprintKeyExchangeGroup {
     X25519,
+    /// X25519 with MLKEM768 (post-quantum hybrid)
+    X25519MLKEM768,
     Secp256r1,
     Secp384r1,
     Secp521r1,
@@ -151,6 +200,7 @@ impl FingerprintKeyExchangeGroup {
     pub fn to_named_group(&self) -> NamedGroup {
         match self {
             Self::X25519 => NamedGroup::X25519,
+            Self::X25519MLKEM768 => NamedGroup::X25519MLKEM768,
             Self::Secp256r1 => NamedGroup::secp256r1,
             Self::Secp384r1 => NamedGroup::secp384r1,
             Self::Secp521r1 => NamedGroup::secp521r1,
@@ -225,12 +275,17 @@ pub struct TlsExtensionsConfig {
     pub signed_certificate_timestamp: bool,
     /// Whether to send application_settings extension
     pub application_settings: bool,
+    /// Whether to use new ALPS codepoint (17613) instead of old (17513)
+    /// Chrome 136+ uses the new codepoint
+    pub use_new_alps_codepoint: bool,
     /// Whether to send delegated_credentials extension
     pub delegated_credentials: bool,
     /// Whether to send record_size_limit extension
     pub record_size_limit: Option<u16>,
     /// Whether to send renegotiation_info extension
     pub renegotiation_info: bool,
+    /// Whether to send padding extension (RFC7685)
+    pub padding: bool,
 }
 
 /// Default signature verification algorithms.

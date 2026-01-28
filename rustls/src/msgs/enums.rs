@@ -149,7 +149,8 @@ enum_builder! {
         ReservedGrease => 0xbaba,
         DelegatedCredentials => 0x0022,
         RecordSizeLimit => 0x001c,
-        ApplicationSettings => 0x4469,
+        ApplicationSettings => 0x4469, // Old ALPS codepoint (17513)
+        ApplicationSettingsNew => 0x44cd, // New ALPS codepoint (17613) used by Chrome 136+
     }
 }
 
