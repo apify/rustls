@@ -3,6 +3,7 @@
 use alloc::vec::Vec;
 
 use crate::{NamedGroup, SignatureScheme, SupportedCipherSuite};
+use crate::msgs::enums::ExtensionType;
 
 use super::{WebPkiSupportedAlgorithms, aws_lc_rs};
 use webpki::aws_lc_rs as webpki_algs;
@@ -286,6 +287,10 @@ pub struct TlsExtensionsConfig {
     pub renegotiation_info: bool,
     /// Whether to send padding extension (RFC7685)
     pub padding: bool,
+    /// Explicit extension order for fingerprinting.
+    /// When non-empty, all listed extensions are emitted in this exact order
+    /// via contiguous_extensions, bypassing randomization.
+    pub extension_order: Vec<ExtensionType>,
 }
 
 /// Default signature verification algorithms.
