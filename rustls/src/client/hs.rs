@@ -422,6 +422,22 @@ fn emit_client_hello_for_retry(
     // but they also need to keep the same order as the previous ClientHello
     exts.order_seed = input.hello.extension_order_seed;
 
+    #[cfg(feature = "impit")]
+    if let Some(ref fingerprint) = config.tls_fingerprint {
+        if !fingerprint.extensions.extension_order.is_empty() {
+            let order = &fingerprint.extensions.extension_order;
+            exts.contiguous_extensions = order.clone();
+
+            // Suppress extensions that rustls auto-populates but the fingerprint
+            // doesn't want (e.g. TLS 1.2-only fingerprints shouldn't send
+            // supported_versions even though rustls always sets it).
+            use crate::msgs::enums::ExtensionType as ET;
+            if !order.contains(&ET::SupportedVersions) {
+                exts.supported_versions = None;
+            }
+        }
+    }
+
     #[cfg(not(feature = "impit"))]
     let mut cipher_suites: Vec<_> = config
         .provider
