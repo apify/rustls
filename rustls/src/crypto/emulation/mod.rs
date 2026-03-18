@@ -2,8 +2,8 @@
 #![cfg(feature = "impit")]
 use alloc::vec::Vec;
 
-use crate::{NamedGroup, SignatureScheme, SupportedCipherSuite};
 use crate::msgs::enums::ExtensionType;
+use crate::{NamedGroup, SignatureScheme, SupportedCipherSuite};
 
 use super::{WebPkiSupportedAlgorithms, aws_lc_rs};
 use webpki::aws_lc_rs as webpki_algs;
@@ -287,6 +287,10 @@ pub struct TlsExtensionsConfig {
     pub renegotiation_info: bool,
     /// Whether to send padding extension (RFC7685)
     pub padding: bool,
+    /// Whether to send supported_versions extension.
+    /// Defaults to true. Set to false for TLS 1.2-only fingerprints (e.g.
+    /// OkHttp 3) where the real client never advertises TLS 1.3 support.
+    pub supported_versions: bool,
     /// Explicit extension order for fingerprinting.
     /// When non-empty, all listed extensions are emitted in this exact order
     /// via contiguous_extensions, bypassing randomization.
