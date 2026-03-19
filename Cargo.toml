@@ -60,9 +60,9 @@ hashbrown = { version = "0.15", default-features = false, features = ["default-h
 hex = "0.4"
 hickory-resolver = { version = "0.25", features = ["https-aws-lc-rs", "webpki-roots"] }
 hmac = "0.12"
-hpke-rs = "0.3"
-hpke-rs-crypto = "0.3"
-hpke-rs-rust-crypto = "0.3"
+hpke-rs = "0.6"
+hpke-rs-crypto = "0.6"
+hpke-rs-rust-crypto = "0.6"
 itertools = "0.14"
 log = { version = "0.4.8" }
 macro_rules_attribute = "0.2"
@@ -96,7 +96,7 @@ webpki-roots = "1"
 x25519-dalek = "2"
 x509-parser = "0.17"
 zeroize = "1.8"
-zlib-rs = "0.5"
+zlib-rs = "0.6"
 
 [profile.bench]
 codegen-units = 1
