@@ -788,7 +788,10 @@ fn emit_client_hello_for_retry(
                 .clone();
         }
 
-        if !fingerprint.extensions.supported_versions {
+        if !fingerprint
+            .extensions
+            .supported_versions
+        {
             exts.supported_versions = None;
         }
     }

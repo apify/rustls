@@ -14,12 +14,12 @@ pub use crate::webpki::{
 };
 
 mod config;
+#[cfg(feature = "impit")]
+pub use config::WantsClientCertWithTlsFingerprint;
 pub use config::{
     ClientConfig, ClientCredentialResolver, ClientSessionStore, CredentialRequest, Resumption,
     Tls12Resumption, WantsClientCert,
 };
-#[cfg(feature = "impit")]
-pub use config::WantsClientCertWithTlsFingerprint;
 
 mod connection;
 #[cfg(feature = "std")]

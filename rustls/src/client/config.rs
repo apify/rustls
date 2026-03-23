@@ -11,10 +11,10 @@ use super::ech::EchMode;
 use super::handy::ClientSessionMemoryCache;
 use super::handy::{FailResolveClientCert, NoClientSessionStorage};
 use crate::builder::{ConfigBuilder, WantsVerifier};
-#[cfg(feature = "impit")]
-use crate::crypto::emulation::TlsFingerprint;
 #[cfg(doc)]
 use crate::crypto;
+#[cfg(feature = "impit")]
+use crate::crypto::emulation::TlsFingerprint;
 use crate::crypto::kx::NamedGroup;
 use crate::crypto::{
     CipherSuite, Credentials, CryptoProvider, Identity, SelectedCredential, SignatureScheme,
@@ -684,30 +684,33 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithTlsFingerprint> {
         self.provider.consistency_check()?;
 
         // Determine cert compression based on fingerprint
-        let (cert_compressors, cert_decompressors) =
-            if let Some(ref compression) = self.state.tls_fingerprint.cert_compression {
-                let compressors: Vec<_> = compression
-                    .iter()
-                    .filter_map(|alg| match alg {
-                        FingerprintCertCompressionAlgorithm::Brotli => {
-                            Some(compress::BROTLI_COMPRESSOR)
-                        }
-                        _ => None, // Only Brotli is supported for now
-                    })
-                    .collect();
-                let decompressors: Vec<_> = compression
-                    .iter()
-                    .filter_map(|alg| match alg {
-                        FingerprintCertCompressionAlgorithm::Brotli => {
-                            Some(compress::BROTLI_DECOMPRESSOR)
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                (compressors, decompressors)
-            } else {
-                (vec![], vec![])
-            };
+        let (cert_compressors, cert_decompressors) = if let Some(ref compression) = self
+            .state
+            .tls_fingerprint
+            .cert_compression
+        {
+            let compressors: Vec<_> = compression
+                .iter()
+                .filter_map(|alg| match alg {
+                    FingerprintCertCompressionAlgorithm::Brotli => {
+                        Some(compress::BROTLI_COMPRESSOR)
+                    }
+                    _ => None, // Only Brotli is supported for now
+                })
+                .collect();
+            let decompressors: Vec<_> = compression
+                .iter()
+                .filter_map(|alg| match alg {
+                    FingerprintCertCompressionAlgorithm::Brotli => {
+                        Some(compress::BROTLI_DECOMPRESSOR)
+                    }
+                    _ => None,
+                })
+                .collect();
+            (compressors, decompressors)
+        } else {
+            (vec![], vec![])
+        };
 
         Ok(ClientConfig {
             tls_fingerprint: Some(self.state.tls_fingerprint),

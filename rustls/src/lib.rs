@@ -473,10 +473,17 @@ pub mod unbuffered {
 
 // The public interface is:
 pub use crate::builder::{ConfigBuilder, ConfigSide, WantsVerifier};
+#[cfg(feature = "impit")]
+pub use crate::client::WantsClientCertWithTlsFingerprint;
 pub use crate::common_state::{CommonState, HandshakeKind, IoState, Side};
 #[cfg(feature = "std")]
 pub use crate::conn::{Connection, Reader, Writer};
 pub use crate::conn::{ConnectionCommon, KeyingMaterialExporter, SideData, kernel};
+#[cfg(feature = "impit")]
+pub use crate::crypto::emulation::{
+    FingerprintCertCompressionAlgorithm, FingerprintCipherSuite, FingerprintKeyExchangeGroup,
+    FingerprintSignatureAlgorithm, TlsExtensionsConfig, TlsFingerprint,
+};
 pub use crate::error::Error;
 pub use crate::key_log::{KeyLog, NoKeyLog};
 #[cfg(feature = "std")]
@@ -492,13 +499,6 @@ pub use crate::tls12::Tls12CipherSuite;
 pub use crate::tls13::Tls13CipherSuite;
 #[cfg(feature = "impit")]
 pub use crate::verify::NoVerifier;
-#[cfg(feature = "impit")]
-pub use crate::client::WantsClientCertWithTlsFingerprint;
-#[cfg(feature = "impit")]
-pub use crate::crypto::emulation::{
-    FingerprintCertCompressionAlgorithm, FingerprintCipherSuite, FingerprintKeyExchangeGroup,
-    FingerprintSignatureAlgorithm, TlsExtensionsConfig, TlsFingerprint,
-};
 pub use crate::verify::{DigitallySignedStruct, DistinguishedName, SignerPublicKey};
 pub use crate::versions::{ALL_VERSIONS, DEFAULT_VERSIONS, SupportedProtocolVersion};
 pub use crate::webpki::RootCertStore;

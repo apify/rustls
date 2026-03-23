@@ -127,55 +127,61 @@ impl FingerprintCipherSuite {
     /// Converts the fingerprint cipher suite to rustls's SupportedCipherSuite.
     pub fn to_supported_cipher_suite(&self) -> SupportedCipherSuite {
         match self {
-            Self::TLS13_AES_128_GCM_SHA256 => SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256),
-            Self::TLS13_AES_256_GCM_SHA384 => SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384),
+            Self::TLS13_AES_128_GCM_SHA256 => {
+                SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256)
+            }
+            Self::TLS13_AES_256_GCM_SHA384 => {
+                SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384)
+            }
             Self::TLS13_CHACHA20_POLY1305_SHA256 => {
                 SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256)
             }
-            Self::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => {
-                SupportedCipherSuite::Tls12(aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
-            }
-            Self::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => {
-                SupportedCipherSuite::Tls12(aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
-            }
-            Self::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => {
-                SupportedCipherSuite::Tls12(aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)
-            }
-            Self::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
-                SupportedCipherSuite::Tls12(aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384)
-            }
-            Self::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
-                SupportedCipherSuite::Tls12(aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
-            }
-            Self::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
-                SupportedCipherSuite::Tls12(aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256)
-            }
+            Self::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => SupportedCipherSuite::Tls12(
+                aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            ),
+            Self::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => SupportedCipherSuite::Tls12(
+                aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            ),
+            Self::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => SupportedCipherSuite::Tls12(
+                aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            ),
+            Self::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => SupportedCipherSuite::Tls12(
+                aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            ),
+            Self::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => SupportedCipherSuite::Tls12(
+                aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            ),
+            Self::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => SupportedCipherSuite::Tls12(
+                aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            ),
             // These CBC/RSA cipher suites are fake TLS 1.3 cipher suites from the impit patch
-            Self::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA => {
-                SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA)
-            }
-            Self::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA => {
-                SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA)
-            }
-            Self::TLS_RSA_WITH_AES_128_GCM_SHA256 => {
-                SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS_RSA_WITH_AES_128_GCM_SHA256)
-            }
-            Self::TLS_RSA_WITH_AES_256_GCM_SHA384 => {
-                SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS_RSA_WITH_AES_256_GCM_SHA384)
-            }
+            Self::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA => SupportedCipherSuite::Tls13(
+                aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+            ),
+            Self::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA => SupportedCipherSuite::Tls13(
+                aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+            ),
+            Self::TLS_RSA_WITH_AES_128_GCM_SHA256 => SupportedCipherSuite::Tls13(
+                aws_lc_rs::cipher_suite::TLS_RSA_WITH_AES_128_GCM_SHA256,
+            ),
+            Self::TLS_RSA_WITH_AES_256_GCM_SHA384 => SupportedCipherSuite::Tls13(
+                aws_lc_rs::cipher_suite::TLS_RSA_WITH_AES_256_GCM_SHA384,
+            ),
             Self::TLS_RSA_WITH_AES_128_CBC_SHA => {
                 SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS_RSA_WITH_AES_128_CBC_SHA)
             }
             Self::TLS_RSA_WITH_AES_256_CBC_SHA => {
                 SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS_RSA_WITH_AES_256_CBC_SHA)
             }
-            Self::TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA => {
-                SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA)
+            Self::TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA => SupportedCipherSuite::Tls13(
+                aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+            ),
+            Self::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA => SupportedCipherSuite::Tls13(
+                aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+            ),
+            Self::Grease => {
+                SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS13_RESERVED_GREASE)
             }
-            Self::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA => {
-                SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA)
-            }
-            Self::Grease => SupportedCipherSuite::Tls13(aws_lc_rs::cipher_suite::TLS13_RESERVED_GREASE),
         }
     }
 }
@@ -457,9 +463,7 @@ impl FingerprintSignatureAlgorithm {
             Self::RsaPkcs1Sha256 => Some((SignatureScheme::RSA_PKCS1_SHA256, RSA_PKCS1_256)),
             Self::RsaPkcs1Sha384 => Some((SignatureScheme::RSA_PKCS1_SHA384, RSA_PKCS1_384)),
             Self::RsaPkcs1Sha512 => Some((SignatureScheme::RSA_PKCS1_SHA512, RSA_PKCS1_512)),
-            Self::RsaPkcs1Sha1 => {
-                Some((SignatureScheme::RSA_PKCS1_SHA1, RSA_PKCS1_SHA1_FALLBACK))
-            }
+            Self::RsaPkcs1Sha1 => Some((SignatureScheme::RSA_PKCS1_SHA1, RSA_PKCS1_SHA1_FALLBACK)),
             Self::EcdsaSha1Legacy => {
                 Some((SignatureScheme::ECDSA_SHA1_Legacy, ECDSA_SHA1_FALLBACK))
             }
