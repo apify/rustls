@@ -473,10 +473,17 @@ pub mod unbuffered {
 
 // The public interface is:
 pub use crate::builder::{ConfigBuilder, ConfigSide, WantsVerifier};
+#[cfg(feature = "impit")]
+pub use crate::client::WantsClientCertWithTlsFingerprint;
 pub use crate::common_state::{CommonState, HandshakeKind, IoState, Side};
 #[cfg(feature = "std")]
 pub use crate::conn::{Connection, Reader, Writer};
 pub use crate::conn::{ConnectionCommon, KeyingMaterialExporter, SideData, kernel};
+#[cfg(feature = "impit")]
+pub use crate::crypto::emulation::{
+    FingerprintCertCompressionAlgorithm, FingerprintCipherSuite, FingerprintKeyExchangeGroup,
+    FingerprintSignatureAlgorithm, TlsExtensionsConfig, TlsFingerprint,
+};
 pub use crate::error::Error;
 pub use crate::key_log::{KeyLog, NoKeyLog};
 #[cfg(feature = "std")]

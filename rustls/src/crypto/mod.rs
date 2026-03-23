@@ -7,8 +7,6 @@ use core::time::Duration;
 
 use pki_types::PrivateKeyDer;
 
-#[cfg(feature = "impit")]
-use crate::client::client_emulator::BrowserEmulator;
 use crate::enums::ProtocolVersion;
 use crate::error::{ApiMisuse, Error};
 use crate::msgs::handshake::ALL_KEY_EXCHANGE_ALGORITHMS;
@@ -235,60 +233,47 @@ pub struct CryptoProvider {
 /// Convenience builder for `CryptoProvider`.
 #[cfg(feature = "impit")]
 pub struct CryptoProviderBuilder {
-    browser_emulator: Option<BrowserEmulator>,
+    tls_fingerprint: Option<emulation::TlsFingerprint>,
 }
 
 #[cfg(feature = "impit")]
 impl CryptoProviderBuilder {
-    /// Sets the browser emulator to use for this provider.
-    pub fn with_browser_emulator(mut self, browser_emulator: &BrowserEmulator) -> Self {
-        self.browser_emulator = Some(browser_emulator.clone());
+    /// Sets the TLS fingerprint to use for this provider.
+    pub fn with_tls_fingerprint(mut self, fingerprint: &emulation::TlsFingerprint) -> Self {
+        self.tls_fingerprint = Some(fingerprint.clone());
         self
     }
 
     /// Builds the `CryptoProvider`.
     pub fn build(self) -> CryptoProvider {
-        use crate::client::client_emulator::{BrowserEmulator, BrowserType};
         use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 
-        match self.browser_emulator {
-            Some(BrowserEmulator {
-                browser_type: BrowserType::Chrome,
-                version: _,
-            }) => {
-                use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
-                use crate::crypto::emulation::{
-                    CHROME_SIGNATURE_VERIFICATION_ALGOS, CHROME_TLS12_CIPHER_SUITES,
-                    CHROME_TLS13_CIPHER_SUITES,
-                };
+        match self.tls_fingerprint {
+            Some(ref fingerprint) => {
+                let tls13: Vec<_> = fingerprint
+                    .cipher_suites
+                    .iter()
+                    .filter_map(|cs| match cs.to_supported_cipher_suite() {
+                        SupportedCipherSuite::Tls13(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                let tls12: Vec<_> = fingerprint
+                    .cipher_suites
+                    .iter()
+                    .filter_map(|cs| match cs.to_supported_cipher_suite() {
+                        SupportedCipherSuite::Tls12(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                let sig_algs = fingerprint.to_signature_verification_algorithms();
 
-                let provider = CryptoProvider {
-                    tls13_cipher_suites: Cow::Borrowed(&CHROME_TLS13_CIPHER_SUITES),
-                    tls12_cipher_suites: Cow::Borrowed(&CHROME_TLS12_CIPHER_SUITES),
-                    signature_verification_algorithms: CHROME_SIGNATURE_VERIFICATION_ALGOS,
+                CryptoProvider {
+                    tls13_cipher_suites: Cow::Owned(tls13),
+                    tls12_cipher_suites: Cow::Owned(tls12),
+                    signature_verification_algorithms: sig_algs,
                     ..DEFAULT_PROVIDER
-                };
-
-                provider
-            }
-            Some(BrowserEmulator {
-                browser_type: BrowserType::Firefox,
-                version: _,
-            }) => {
-                use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
-                use crate::crypto::emulation::{
-                    FIREFOX_SIGNATURE_VERIFICATION_ALGOS, FIREFOX_TLS12_CIPHER_SUITES,
-                    FIREFOX_TLS13_CIPHER_SUITES,
-                };
-
-                let provider = CryptoProvider {
-                    tls13_cipher_suites: Cow::Borrowed(&FIREFOX_TLS13_CIPHER_SUITES),
-                    tls12_cipher_suites: Cow::Borrowed(&FIREFOX_TLS12_CIPHER_SUITES),
-                    signature_verification_algorithms: FIREFOX_SIGNATURE_VERIFICATION_ALGOS,
-                    ..DEFAULT_PROVIDER
-                };
-
-                provider
+                }
             }
             None => DEFAULT_PROVIDER,
         }
@@ -300,7 +285,7 @@ impl CryptoProvider {
     #[cfg(feature = "impit")]
     pub fn builder() -> CryptoProviderBuilder {
         CryptoProviderBuilder {
-            browser_emulator: None,
+            tls_fingerprint: None,
         }
     }
 

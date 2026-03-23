@@ -1,3 +1,5 @@
+#[cfg(feature = "impit")]
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 use core::marker::PhantomData;
@@ -9,10 +11,10 @@ use super::ech::EchMode;
 use super::handy::ClientSessionMemoryCache;
 use super::handy::{FailResolveClientCert, NoClientSessionStorage};
 use crate::builder::{ConfigBuilder, WantsVerifier};
-#[cfg(feature = "impit")]
-use crate::client::client_emulator::BrowserEmulator;
 #[cfg(doc)]
 use crate::crypto;
+#[cfg(feature = "impit")]
+use crate::crypto::emulation::TlsFingerprint;
 use crate::crypto::kx::NamedGroup;
 use crate::crypto::{
     CipherSuite, Credentials, CryptoProvider, Identity, SelectedCredential, SignatureScheme,
@@ -60,13 +62,12 @@ use crate::{DistinguishedName, KeyLog, compress, verify};
 /// [`RootCertStore`]: crate::RootCertStore
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
-    /// Whether this client is using browser-emulated settings.
-    /// This is used by the retch_rust project to emulate browsers' JA4 fingerprints.
+    /// TLS fingerprint configuration for browser emulation.
+    /// This allows fine-grained control over TLS parameters to match specific browser fingerprints.
     ///
-    /// Note that this can be only set by the builder's `with_browser_emulation` method.
-    /// Setting this field directly won't work correctly and might cause inconsistencies in your JA4 fingerprints.
+    /// Note that this should be set via the builder's `with_tls_fingerprint` method.
     #[cfg(feature = "impit")]
-    pub browser_emulation: Option<BrowserEmulator>,
+    pub tls_fingerprint: Option<TlsFingerprint>,
 
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.
@@ -557,6 +558,24 @@ pub struct WantsClientCert {
 }
 
 impl ConfigBuilder<ClientConfig, WantsClientCert> {
+    /// Enable TLS fingerprinting with a custom fingerprint.
+    #[cfg(feature = "impit")]
+    pub fn with_tls_fingerprint(
+        self,
+        fingerprint: TlsFingerprint,
+    ) -> ConfigBuilder<ClientConfig, WantsClientCertWithTlsFingerprint> {
+        ConfigBuilder {
+            state: WantsClientCertWithTlsFingerprint {
+                verifier: self.state.verifier,
+                client_ech_mode: self.state.client_ech_mode,
+                tls_fingerprint: fingerprint,
+            },
+            provider: self.provider,
+            time_provider: self.time_provider,
+            side: PhantomData,
+        }
+    }
+
     /// Sets a single certificate chain and matching private key for use
     /// in client authentication.
     ///
@@ -607,7 +626,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             alpn_protocols: Vec::new(),
             resumption: Resumption::default(),
             #[cfg(feature = "impit")]
-            browser_emulation: None,
+            tls_fingerprint: None,
             max_fragment_size: None,
             client_auth_cert_resolver,
             enable_sni: true,
@@ -620,6 +639,96 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             cert_compressors: compress::default_cert_compressors().to_vec(),
             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
             cert_decompressors: compress::default_cert_decompressors().to_vec(),
+            ech_mode: self.state.client_ech_mode,
+        })
+    }
+}
+
+/// A config builder state where the caller needs to supply whether and how to provide a client
+/// certificate, with TLS fingerprint enabled.
+///
+/// For more information, see the [`ConfigBuilder`] documentation.
+#[cfg(feature = "impit")]
+#[derive(Clone)]
+pub struct WantsClientCertWithTlsFingerprint {
+    verifier: Arc<dyn verify::ServerVerifier>,
+    client_ech_mode: Option<EchMode>,
+    tls_fingerprint: TlsFingerprint,
+}
+
+#[cfg(feature = "impit")]
+impl ConfigBuilder<ClientConfig, WantsClientCertWithTlsFingerprint> {
+    /// Sets a single certificate chain and matching private key for use
+    /// in client authentication.
+    pub fn with_client_auth_cert(
+        self,
+        identity: Arc<Identity<'static>>,
+        key_der: PrivateKeyDer<'static>,
+    ) -> Result<ClientConfig, Error> {
+        let credentials = Credentials::from_der(identity, key_der, &self.provider)?;
+        self.with_client_credential_resolver(Arc::new(SingleCredential::from(credentials)))
+    }
+
+    /// Do not support client auth.
+    pub fn with_no_client_auth(self) -> Result<ClientConfig, Error> {
+        self.with_client_credential_resolver(Arc::new(FailResolveClientCert {}))
+    }
+
+    /// Sets a custom [`ClientCredentialResolver`].
+    pub fn with_client_credential_resolver(
+        self,
+        client_auth_cert_resolver: Arc<dyn ClientCredentialResolver>,
+    ) -> Result<ClientConfig, Error> {
+        use crate::crypto::emulation::FingerprintCertCompressionAlgorithm;
+
+        self.provider.consistency_check()?;
+
+        // Determine cert compression based on fingerprint
+        let (cert_compressors, cert_decompressors) = if let Some(ref compression) = self
+            .state
+            .tls_fingerprint
+            .cert_compression
+        {
+            let compressors: Vec<_> = compression
+                .iter()
+                .filter_map(|alg| match alg {
+                    FingerprintCertCompressionAlgorithm::Brotli => {
+                        Some(compress::BROTLI_COMPRESSOR)
+                    }
+                    _ => None, // Only Brotli is supported for now
+                })
+                .collect();
+            let decompressors: Vec<_> = compression
+                .iter()
+                .filter_map(|alg| match alg {
+                    FingerprintCertCompressionAlgorithm::Brotli => {
+                        Some(compress::BROTLI_DECOMPRESSOR)
+                    }
+                    _ => None,
+                })
+                .collect();
+            (compressors, decompressors)
+        } else {
+            (vec![], vec![])
+        };
+
+        Ok(ClientConfig {
+            tls_fingerprint: Some(self.state.tls_fingerprint),
+            provider: self.provider,
+            alpn_protocols: Vec::new(),
+            resumption: Resumption::default(),
+            max_fragment_size: None,
+            client_auth_cert_resolver,
+            enable_sni: true,
+            verifier: self.state.verifier,
+            key_log: Arc::new(crate::KeyLogFile::new()),
+            enable_secret_extraction: false,
+            enable_early_data: false,
+            require_ems: cfg!(feature = "fips"),
+            time_provider: self.time_provider,
+            cert_compressors,
+            cert_compression_cache: Arc::new(compress::CompressionCache::default()),
+            cert_decompressors,
             ech_mode: self.state.client_ech_mode,
         })
     }
