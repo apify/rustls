@@ -492,6 +492,13 @@ pub use crate::tls12::Tls12CipherSuite;
 pub use crate::tls13::Tls13CipherSuite;
 #[cfg(feature = "impit")]
 pub use crate::verify::NoVerifier;
+#[cfg(feature = "impit")]
+pub use crate::client::WantsClientCertWithTlsFingerprint;
+#[cfg(feature = "impit")]
+pub use crate::crypto::emulation::{
+    FingerprintCertCompressionAlgorithm, FingerprintCipherSuite, FingerprintKeyExchangeGroup,
+    FingerprintSignatureAlgorithm, TlsExtensionsConfig, TlsFingerprint,
+};
 pub use crate::verify::{DigitallySignedStruct, DistinguishedName, SignerPublicKey};
 pub use crate::versions::{ALL_VERSIONS, DEFAULT_VERSIONS, SupportedProtocolVersion};
 pub use crate::webpki::RootCertStore;

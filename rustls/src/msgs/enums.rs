@@ -105,6 +105,7 @@ enum_builder! {
         DelegatedCredentials => 0x0022,
         RecordSizeLimit => 0x001c,
         ApplicationSettings => 0x4469,
+        ApplicationSettingsNew => 0x44cd,
     }
 }
 

@@ -1,12 +1,9 @@
+#[cfg(feature = "impit")]
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Debug;
-#[cfg(feature = "impit")]
-use std::vec;
-
 use pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 
-#[cfg(feature = "impit")]
-use crate::client::client_emulator::BrowserEmulator;
 use crate::crypto::{Identity, SignatureScheme};
 use crate::enums::CertificateType;
 use crate::error::{Error, InvalidMessage};
@@ -31,13 +28,36 @@ use crate::x509::wrap_in_sequence;
 /// Used for the `ignore_tls_errors` option in `impit`.
 #[cfg(feature = "impit")]
 #[derive(Debug)]
-pub struct NoVerifier(Option<BrowserEmulator>);
+pub struct NoVerifier {
+    signature_schemes: Vec<SignatureScheme>,
+}
 
 #[cfg(feature = "impit")]
 impl NoVerifier {
-    /// Create a new `NoVerifier` instance.
-    pub fn new(browser_emulator: Option<BrowserEmulator>) -> Self {
-        Self(browser_emulator)
+    /// Create a new `NoVerifier` instance with the given signature schemes.
+    pub fn new(signature_schemes: Vec<SignatureScheme>) -> Self {
+        Self { signature_schemes }
+    }
+
+    /// Create a new `NoVerifier` instance with default signature schemes.
+    pub fn with_default_schemes() -> Self {
+        Self {
+            signature_schemes: vec![
+                SignatureScheme::RSA_PKCS1_SHA1,
+                SignatureScheme::ECDSA_SHA1_Legacy,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA512,
+                SignatureScheme::ECDSA_NISTP521_SHA512,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::ED25519,
+                SignatureScheme::ED448,
+            ],
+        }
     }
 }
 
@@ -62,30 +82,7 @@ impl ServerVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        use crate::client::client_emulator::BrowserType;
-        use crate::crypto::emulation::{CHROME_SIGNATURE_SCHEMES, FIREFOX_SIGNATURE_SCHEMES};
-
-        match &self.0 {
-            Some(browser_emulator) => match browser_emulator.browser_type {
-                BrowserType::Chrome => CHROME_SIGNATURE_SCHEMES.to_vec(),
-                BrowserType::Firefox => FIREFOX_SIGNATURE_SCHEMES.to_vec(),
-            },
-            None => vec![
-                SignatureScheme::RSA_PKCS1_SHA1,
-                SignatureScheme::ECDSA_SHA1_Legacy,
-                SignatureScheme::RSA_PKCS1_SHA256,
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::RSA_PKCS1_SHA384,
-                SignatureScheme::ECDSA_NISTP384_SHA384,
-                SignatureScheme::RSA_PKCS1_SHA512,
-                SignatureScheme::ECDSA_NISTP521_SHA512,
-                SignatureScheme::RSA_PSS_SHA256,
-                SignatureScheme::RSA_PSS_SHA384,
-                SignatureScheme::RSA_PSS_SHA512,
-                SignatureScheme::ED25519,
-                SignatureScheme::ED448,
-            ],
-        }
+        self.signature_schemes.clone()
     }
 
     fn request_ocsp_response(&self) -> bool {
