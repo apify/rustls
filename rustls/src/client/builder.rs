@@ -202,6 +202,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             alpn_protocols: Vec::new(),
             #[cfg(feature = "impit")]
             tls_fingerprint: None,
+            check_selected_alpn: true,
             resumption: Resumption::default(),
             max_fragment_size: None,
             client_auth_cert_resolver,
@@ -302,6 +303,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithTlsFingerprint> {
         ClientConfig {
             tls_fingerprint: Some(self.state.tls_fingerprint),
             provider: self.provider,
+            check_selected_alpn: true,
             resumption: Resumption::default(),
             max_fragment_size: None,
             client_auth_cert_resolver,

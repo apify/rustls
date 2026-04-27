@@ -258,6 +258,55 @@ fn connection_level_alpn_protocols() {
     assert_eq!(client.alpn_protocol(), Some(&b"http/1.1"[..]));
 }
 
+#[test]
+fn server_selects_unoffered_alpn_checked() {
+    let result = unoffered_alpn_test(true);
+    assert_eq!(
+        result.err(),
+        Some(PeerMisbehaved::SelectedUnofferedApplicationProtocol.into())
+    );
+}
+
+#[test]
+fn server_selects_unoffered_alpn_unchecked() {
+    let result = unoffered_alpn_test(false);
+    assert_ne!(
+        result.err(),
+        Some(PeerMisbehaved::SelectedUnofferedApplicationProtocol.into())
+    );
+}
+
+fn unoffered_alpn_test(check_selected_alpn: bool) -> Result<rustls::IoState, Error> {
+    let mut config = make_client_config(KeyType::Rsa2048, &provider::default_provider());
+    config.check_selected_alpn = check_selected_alpn;
+    let mut client = ClientConnection::new_with_alpn(
+        Arc::new(config),
+        server_name("localhost"),
+        vec![b"http/1.1".to_vec()],
+    )
+    .unwrap();
+    client
+        .write_tls(&mut Vec::new())
+        .unwrap();
+    client
+        .read_tls(
+            &mut encoding::message_framing(
+                ContentType::Handshake,
+                ProtocolVersion::TLSv1_2,
+                encoding::server_hello(
+                    ProtocolVersion::TLSv1_2,
+                    &[b'a'; 32],
+                    &[0],
+                    CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                    vec![encoding::Extension::new_alpn(b"\x05blorp")],
+                ),
+            )
+            .as_slice(),
+        )
+        .unwrap();
+    client.process_new_packets()
+}
+
 fn version_test(
     client_versions: &[&'static rustls::SupportedProtocolVersion],
     server_versions: &[&'static rustls::SupportedProtocolVersion],
@@ -1954,7 +2003,7 @@ fn client_cert_resolve_server_added_hint() {
         // Create a verifier that adds the extra_name as a hint subject in addition to the ones
         // from the root cert store.
         let verifier = webpki_client_verifier_builder(get_client_root_store(*key_type), &provider)
-            .add_root_hint_subjects([DistinguishedName::from(extra_name.clone())].into_iter());
+            .add_root_hint_subjects([DistinguishedName::from(extra_name.clone())]);
         let server_config = make_server_config_with_client_verifier(*key_type, verifier, &provider);
         test_client_cert_resolve(*key_type, server_config.into(), expected_hint_subjects);
     }
