@@ -303,11 +303,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -Dwarnings
 
-      # - name: Check README.md
-      #   run: |
-      #     cargo build --locked --all-features
-      #     ./admin/pull-readme
-      #     git diff --exit-code
+      - name: Check README.md
+        run: |
+          cargo build --locked --all-features
+          ./admin/pull-readme
+          git diff --exit-code
 
       - name: Spell check code
         uses: crate-ci/typos@v1
@@ -485,8 +485,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: ./admin/clippy -- --allow clippy::disallowed_types --allow clippy::incompatible_msrv
-      - run: cargo clippy -p rustls
+      - run: ./admin/clippy -- --deny warnings
 
   clippy-nightly:
     name: Clippy (Nightly)

@@ -7,8 +7,6 @@ use core::time::Duration;
 
 use pki_types::PrivateKeyDer;
 
-#[cfg(feature = "impit")]
-use crate::client::client_emulator::BrowserEmulator;
 use crate::enums::ProtocolVersion;
 use crate::error::{ApiMisuse, Error};
 use crate::msgs::handshake::ALL_KEY_EXCHANGE_ALGORITHMS;
@@ -23,9 +21,6 @@ use crate::{SupportedCipherSuite, Tls12CipherSuite, Tls13CipherSuite};
 /// aws-lc-rs-based CryptoProvider.
 #[cfg(feature = "aws-lc-rs")]
 pub mod aws_lc_rs;
-
-/// retch-specific CryptoProvider.
-pub mod emulation;
 
 /// TLS message encryption/decryption interfaces.
 pub mod cipher;
@@ -232,78 +227,7 @@ pub struct CryptoProvider {
     pub ticketer_factory: &'static dyn TicketerFactory,
 }
 
-/// Convenience builder for `CryptoProvider`.
-#[cfg(feature = "impit")]
-pub struct CryptoProviderBuilder {
-    browser_emulator: Option<BrowserEmulator>,
-}
-
-#[cfg(feature = "impit")]
-impl CryptoProviderBuilder {
-    /// Sets the browser emulator to use for this provider.
-    pub fn with_browser_emulator(mut self, browser_emulator: &BrowserEmulator) -> Self {
-        self.browser_emulator = Some(browser_emulator.clone());
-        self
-    }
-
-    /// Builds the `CryptoProvider`.
-    pub fn build(self) -> CryptoProvider {
-        use crate::client::client_emulator::{BrowserEmulator, BrowserType};
-        use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
-
-        match self.browser_emulator {
-            Some(BrowserEmulator {
-                browser_type: BrowserType::Chrome,
-                version: _,
-            }) => {
-                use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
-                use crate::crypto::emulation::{
-                    CHROME_SIGNATURE_VERIFICATION_ALGOS, CHROME_TLS12_CIPHER_SUITES,
-                    CHROME_TLS13_CIPHER_SUITES,
-                };
-
-                let provider = CryptoProvider {
-                    tls13_cipher_suites: Cow::Borrowed(&CHROME_TLS13_CIPHER_SUITES),
-                    tls12_cipher_suites: Cow::Borrowed(&CHROME_TLS12_CIPHER_SUITES),
-                    signature_verification_algorithms: CHROME_SIGNATURE_VERIFICATION_ALGOS,
-                    ..DEFAULT_PROVIDER
-                };
-
-                provider
-            }
-            Some(BrowserEmulator {
-                browser_type: BrowserType::Firefox,
-                version: _,
-            }) => {
-                use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
-                use crate::crypto::emulation::{
-                    FIREFOX_SIGNATURE_VERIFICATION_ALGOS, FIREFOX_TLS12_CIPHER_SUITES,
-                    FIREFOX_TLS13_CIPHER_SUITES,
-                };
-
-                let provider = CryptoProvider {
-                    tls13_cipher_suites: Cow::Borrowed(&FIREFOX_TLS13_CIPHER_SUITES),
-                    tls12_cipher_suites: Cow::Borrowed(&FIREFOX_TLS12_CIPHER_SUITES),
-                    signature_verification_algorithms: FIREFOX_SIGNATURE_VERIFICATION_ALGOS,
-                    ..DEFAULT_PROVIDER
-                };
-
-                provider
-            }
-            None => DEFAULT_PROVIDER,
-        }
-    }
-}
-
 impl CryptoProvider {
-    /// Returns a new `CryptoProviderBuilder`.
-    #[cfg(feature = "impit")]
-    pub fn builder() -> CryptoProviderBuilder {
-        CryptoProviderBuilder {
-            browser_emulator: None,
-        }
-    }
-
     /// Sets this `CryptoProvider` as the default for this process.
     ///
     /// This can be called successfully at most once in any process execution.

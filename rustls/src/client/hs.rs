@@ -12,19 +12,16 @@ use super::config::{ClientConfig, ClientCredentialResolver, Tls12Resumption};
 use super::connection::ClientConnectionData;
 use super::ech::{EchMode, EchState, EchStatus};
 use super::{ClientHelloDetails, tls13};
+use crate::bs_debug;
 use crate::check::inappropriate_handshake_message;
-#[cfg(feature = "impit")]
-use crate::client::client_emulator::{BrowserEmulator, BrowserType};
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
 use crate::crypto::cipher::Payload;
-use crate::crypto::kx::{KeyExchangeAlgorithm, NamedGroup, StartedKeyExchange};
+use crate::crypto::kx::{KeyExchangeAlgorithm, StartedKeyExchange};
 use crate::crypto::{CipherSuite, CryptoProvider, rand};
 use crate::enums::{CertificateType, ContentType, HandshakeType, ProtocolVersion};
 use crate::error::{AlertDescription, ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
-#[cfg(feature = "impit")]
-use crate::msgs::base::{PayloadU8, PayloadU16};
 use crate::msgs::enums::{Compression, ExtensionType};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
@@ -36,13 +33,12 @@ use crate::msgs::handshake::{
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
 use crate::sealed::Sealed;
-use crate::suites::Suite;
+use crate::suites::{Suite, SupportedCipherSuite};
 use crate::sync::Arc;
 use crate::tls12::Tls12CipherSuite;
 use crate::tls13::Tls13CipherSuite;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::verify::ServerVerifier;
-use crate::{SupportedCipherSuite, bs_debug};
 
 pub(super) type NextState = Box<dyn State<ClientConnectionData>>;
 pub(super) type NextStateOrError = Result<NextState, Error>;
@@ -568,34 +564,22 @@ fn emit_client_hello_for_retry(
     // should be unreachable thanks to config builder
     assert!(supported_versions.any(|_| true));
 
-    // offer groups which are usable for any offered version
-    #[allow(unused_mut)]
-    let mut offered_groups: Vec<NamedGroup> = config
-        .provider
-        .kx_groups
-        .iter()
-        .filter_map(|skxg| {
-            let named_group = skxg.name();
-            supported_versions
-                .any(|v| named_group.usable_for_version(v))
-                .then_some(named_group)
-        })
-        .collect();
-
-    #[cfg(feature = "impit")]
-    if let Some(BrowserEmulator {
-        browser_type: BrowserType::Chrome,
-        version: _,
-    }) = config.browser_emulation
-    {
-        offered_groups.push(NamedGroup::GREASE);
-        // offered_groups.push(NamedGroup::X25519Kyber768Draft00);
-    }
-
     let mut exts = Box::new(ClientExtensions {
-        supported_versions: Some(supported_versions),
         // offer groups which are usable for any offered version
-        named_groups: Some(offered_groups),
+        named_groups: Some(
+            config
+                .provider
+                .kx_groups
+                .iter()
+                .filter_map(|skxg| {
+                    let named_group = skxg.name();
+                    supported_versions
+                        .any(|v| named_group.usable_for_version(v))
+                        .then_some(named_group)
+                })
+                .collect(),
+        ),
+        supported_versions: Some(supported_versions),
         signature_schemes: Some(
             config
                 .verifier
@@ -609,37 +593,6 @@ fn emit_client_hello_for_retry(
         protocols: extra_exts.protocols.clone(),
         ..Default::default()
     });
-
-    #[cfg(feature = "impit")]
-    match config.browser_emulation {
-        Some(BrowserEmulator {
-            browser_type: BrowserType::Chrome,
-            version: _,
-        }) => {
-            // hack - to avoid `Unexpected Message` when communicating with BoringSSL-based servers,
-            // we cannot send an actual ALPN protocol name list
-            let application_settings: PayloadU16 =
-                PayloadU16::new(vec![0x05, 0x69, 0x6d, 0x70, 0x69, 0x74]);
-
-            exts.reserved_grease = Some(());
-            exts.signed_certificate_timestamp = Some(());
-            exts.application_settings = Some(application_settings);
-            exts.renegotiation_info = Some(PayloadU8::empty());
-        }
-        Some(BrowserEmulator {
-            browser_type: BrowserType::Firefox,
-            version: _,
-        }) => {
-            // TODO: We don't really support the delegated credentials extension yet, just sending it in the client hello message
-            let delegated_credentials_signature_algos =
-                PayloadU16::new(vec![0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03]);
-
-            exts.delegated_credentials = Some(delegated_credentials_signature_algos);
-            exts.renegotiation_info = Some(PayloadU8::empty());
-            exts.record_size_limit = Some(16385);
-        }
-        _ => {}
-    }
 
     if let Some(TransportParameters::Quic(v)) = &extra_exts.transport_parameters {
         exts.transport_parameters = Some(v.clone());
@@ -775,32 +728,9 @@ fn emit_client_hello_for_retry(
         })
         .collect();
 
-    #[cfg(not(feature = "impit"))]
-    // We don't do renegotiation at all, in fact.
     if supported_versions.tls12 {
         // We don't do renegotiation at all, in fact.
         cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
-    }
-
-    #[cfg(feature = "impit")]
-    match config.browser_emulation {
-        // Chrome doesn't send this cipher suite.
-        Some(BrowserEmulator {
-            browser_type: BrowserType::Chrome,
-            version: _,
-        }) => {}
-        // Firefox also doesn't seem to send this cipher suite?
-        Some(BrowserEmulator {
-            browser_type: BrowserType::Firefox,
-            version: _,
-        }) => {}
-        _ => {
-            // We don't do renegotiation at all, in fact.
-            if supported_versions.tls12 {
-                // We don't do renegotiation at all, in fact.
-                cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
-            }
-        }
     }
 
     let mut chp_payload = ClientHelloPayload {

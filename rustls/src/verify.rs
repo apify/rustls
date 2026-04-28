@@ -1,12 +1,8 @@
 use alloc::vec::Vec;
 use core::fmt::Debug;
-#[cfg(feature = "impit")]
-use std::vec;
 
 use pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 
-#[cfg(feature = "impit")]
-use crate::client::client_emulator::BrowserEmulator;
 use crate::crypto::{Identity, SignatureScheme};
 use crate::enums::CertificateType;
 use crate::error::{Error, InvalidMessage};
@@ -24,74 +20,6 @@ use crate::x509::wrap_in_sequence;
 // These types are public, but cannot be directly constructed.  This
 // means their origins can be precisely determined by looking
 // for their `assertion` constructors.
-
-/// Disables all server certificate verification.
-/// Note that this can be potentially dangerous!
-///
-/// Used for the `ignore_tls_errors` option in `impit`.
-#[cfg(feature = "impit")]
-#[derive(Debug)]
-pub struct NoVerifier(Option<BrowserEmulator>);
-
-#[cfg(feature = "impit")]
-impl NoVerifier {
-    /// Create a new `NoVerifier` instance.
-    pub fn new(browser_emulator: Option<BrowserEmulator>) -> Self {
-        Self(browser_emulator)
-    }
-}
-
-#[cfg(feature = "impit")]
-impl ServerVerifier for NoVerifier {
-    fn verify_identity(&self, _identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
-        Ok(PeerVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _input: &SignatureVerificationInput<'_>,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _input: &SignatureVerificationInput<'_>,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        use crate::client::client_emulator::BrowserType;
-        use crate::crypto::emulation::{CHROME_SIGNATURE_SCHEMES, FIREFOX_SIGNATURE_SCHEMES};
-
-        match &self.0 {
-            Some(browser_emulator) => match browser_emulator.browser_type {
-                BrowserType::Chrome => CHROME_SIGNATURE_SCHEMES.to_vec(),
-                BrowserType::Firefox => FIREFOX_SIGNATURE_SCHEMES.to_vec(),
-            },
-            None => vec![
-                SignatureScheme::RSA_PKCS1_SHA1,
-                SignatureScheme::ECDSA_SHA1_Legacy,
-                SignatureScheme::RSA_PKCS1_SHA256,
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::RSA_PKCS1_SHA384,
-                SignatureScheme::ECDSA_NISTP384_SHA384,
-                SignatureScheme::RSA_PKCS1_SHA512,
-                SignatureScheme::ECDSA_NISTP521_SHA512,
-                SignatureScheme::RSA_PSS_SHA256,
-                SignatureScheme::RSA_PSS_SHA384,
-                SignatureScheme::RSA_PSS_SHA512,
-                SignatureScheme::ED25519,
-                SignatureScheme::ED448,
-            ],
-        }
-    }
-
-    fn request_ocsp_response(&self) -> bool {
-        false
-    }
-}
 
 /// Something that can verify a server certificate chain, and verify
 /// signatures made by certificates.

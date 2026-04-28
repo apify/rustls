@@ -73,7 +73,6 @@ macro_rules! enum_builder {
             }
         }
 
-        #[allow(unreachable_patterns)]
         impl From<$uint> for $enum_name {
             fn from(x: $uint) -> Self {
                 match x {

@@ -334,7 +334,6 @@ enum_builder! {
     #[repr(u16)]
     #[expect(non_camel_case_types)]
     pub enum NamedGroup {
-        GREASE => 0x0a0a,
         secp256r1 => 0x0017,
         secp384r1 => 0x0018,
         secp521r1 => 0x0019,

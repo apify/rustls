@@ -1065,7 +1065,6 @@ fn sample_certificate_payload_tls13() -> CertificatePayloadTls13<'static> {
                 status: Some(CertificateStatus {
                     ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
                 }),
-                signed_certificate_timestamp: None,
             },
         }],
     }

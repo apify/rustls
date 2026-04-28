@@ -923,26 +923,6 @@ extension_struct! {
         ExtensionType::EncryptedClientHello =>
             pub(crate) encrypted_client_hello: Option<EncryptedClientHello>,
 
-        // Bogus impit extension
-        ExtensionType::ReservedGrease =>
-            pub(crate) reserved_grease: Option<()>,
-
-        /// Bogus impit extension
-        ExtensionType::SCT =>
-            pub(crate) signed_certificate_timestamp: Option<()>,
-
-        /// Bogus impit extension
-        ExtensionType::DelegatedCredentials =>
-            pub(crate) delegated_credentials: Option<PayloadU16>,
-
-        /// Bogus impit extension
-        ExtensionType::RecordSizeLimit =>
-            pub(crate) record_size_limit: Option<u16>,
-
-        /// Bogus impit extension
-        ExtensionType::ApplicationSettings =>
-            pub(crate) application_settings: Option<PayloadU16>,
-
         /// Encrypted client hello outer extensions (draft-ietf-tls-esni)
         ExtensionType::EncryptedClientHelloOuterExtensions =>
             pub(crate) encrypted_client_hello_outer: Option<Vec<ExtensionType>>,
@@ -981,11 +961,6 @@ impl ClientExtensions<'_> {
             encrypted_client_hello,
             encrypted_client_hello_outer,
             order_seed,
-            application_settings,
-            reserved_grease,
-            signed_certificate_timestamp,
-            delegated_credentials,
-            record_size_limit,
             contiguous_extensions,
         } = self;
         ClientExtensions {
@@ -1013,11 +988,6 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
-            application_settings,
-            reserved_grease,
-            signed_certificate_timestamp,
-            delegated_credentials,
-            record_size_limit,
         }
     }
 
@@ -1697,8 +1667,6 @@ extension_struct! {
     pub(crate) struct CertificateExtensions<'a> {
         ExtensionType::StatusRequest =>
             pub(crate) status: Option<CertificateStatus<'a>>,
-        ExtensionType::SCT =>
-            pub(crate) signed_certificate_timestamp: Option<PayloadU16>,
     }
 }
 
@@ -1706,7 +1674,6 @@ impl CertificateExtensions<'_> {
     fn into_owned(self) -> CertificateExtensions<'static> {
         CertificateExtensions {
             status: self.status.map(|s| s.into_owned()),
-            signed_certificate_timestamp: self.signed_certificate_timestamp,
         }
     }
 }

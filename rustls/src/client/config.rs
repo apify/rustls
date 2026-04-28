@@ -9,8 +9,6 @@ use super::ech::EchMode;
 use super::handy::ClientSessionMemoryCache;
 use super::handy::{FailResolveClientCert, NoClientSessionStorage};
 use crate::builder::{ConfigBuilder, WantsVerifier};
-#[cfg(feature = "impit")]
-use crate::client::client_emulator::BrowserEmulator;
 #[cfg(doc)]
 use crate::crypto;
 use crate::crypto::kx::NamedGroup;
@@ -60,14 +58,6 @@ use crate::{DistinguishedName, KeyLog, compress, verify};
 /// [`RootCertStore`]: crate::RootCertStore
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
-    /// Whether this client is using browser-emulated settings.
-    /// This is used by the retch_rust project to emulate browsers' JA4 fingerprints.
-    ///
-    /// Note that this can be only set by the builder's `with_browser_emulation` method.
-    /// Setting this field directly won't work correctly and might cause inconsistencies in your JA4 fingerprints.
-    #[cfg(feature = "impit")]
-    pub browser_emulation: Option<BrowserEmulator>,
-
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.
     pub alpn_protocols: Vec<Vec<u8>>,
@@ -606,8 +596,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             provider: self.provider,
             alpn_protocols: Vec::new(),
             resumption: Resumption::default(),
-            #[cfg(feature = "impit")]
-            browser_emulation: None,
             max_fragment_size: None,
             client_auth_cert_resolver,
             enable_sni: true,
