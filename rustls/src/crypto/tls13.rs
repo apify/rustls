@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use pki_types::FipsStatus;
 use zeroize::Zeroize;
 
 use super::hmac;
@@ -178,9 +179,9 @@ pub trait Hkdf: Send + Sync {
     /// definition of HMAC.
     fn hmac_sign(&self, key: &OkmBlock, message: &[u8]) -> hmac::Tag;
 
-    /// Return `true` if this is backed by a FIPS-approved implementation.
-    fn fips(&self) -> bool {
-        false
+    /// Return the FIPS validation status of this implementation.
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated
     }
 }
 
@@ -193,7 +194,7 @@ pub trait Hkdf: Send + Sync {
 /// In other contexts (for example, hybrid public key encryption (HPKE)) it may be necessary
 /// to use the extracted PRK directly for purposes other than an immediate expansion.
 /// This trait can be implemented to offer this functionality when it is required.
-pub(crate) trait HkdfPrkExtract: Hkdf {
+pub trait HkdfPrkExtract: Hkdf {
     /// `HKDF-Extract(salt, secret)`
     ///
     /// A `salt` of `None` should be treated as a sequence of `HashLen` zero bytes.
@@ -248,6 +249,7 @@ impl OkmBlock {
 }
 
 impl Drop for OkmBlock {
+    #[inline(never)]
     fn drop(&mut self) {
         self.buf.zeroize();
     }

@@ -1,5 +1,7 @@
 use alloc::boxed::Box;
 
+use pki_types::FipsStatus;
+
 use super::enums::HashAlgorithm;
 
 /// Describes a single cryptographic hash function.
@@ -19,9 +21,9 @@ pub trait Hash: Send + Sync {
     /// Which hash function this is, eg, `HashAlgorithm::SHA256`.
     fn algorithm(&self) -> HashAlgorithm;
 
-    /// Return `true` if this is backed by a FIPS-approved implementation.
-    fn fips(&self) -> bool {
-        false
+    /// Return the FIPS validation status of this implementation.
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated
     }
 }
 
@@ -78,50 +80,4 @@ pub trait Context: Send + Sync {
 
     /// Add `data` to computation.
     fn update(&mut self, data: &[u8]);
-}
-
-#[cfg(all(test, feature = "aws-lc-rs"))]
-pub(crate) struct FakeHash;
-
-#[cfg(all(test, feature = "aws-lc-rs"))]
-impl Hash for FakeHash {
-    fn algorithm(&self) -> HashAlgorithm {
-        todo!()
-    }
-
-    fn fips(&self) -> bool {
-        false
-    }
-
-    fn hash(&self, _bytes: &[u8]) -> Output {
-        todo!()
-    }
-
-    fn output_len(&self) -> usize {
-        todo!()
-    }
-
-    fn start(&self) -> Box<dyn Context> {
-        Box::new(FakeHashContext)
-    }
-}
-
-#[cfg(all(test, feature = "aws-lc-rs"))]
-struct FakeHashContext;
-
-#[cfg(all(test, feature = "aws-lc-rs"))]
-impl Context for FakeHashContext {
-    fn fork_finish(&self) -> Output {
-        todo!()
-    }
-
-    fn fork(&self) -> Box<dyn Context> {
-        todo!()
-    }
-
-    fn finish(self: Box<Self>) -> Output {
-        todo!()
-    }
-
-    fn update(&mut self, _data: &[u8]) {}
 }

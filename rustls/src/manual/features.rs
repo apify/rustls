@@ -1,10 +1,14 @@
 /*!
 
-The below list reflects the support provided with the default crate features.
-Items marked with an asterisk `*` can be extended or altered via public
-APIs ([`CryptoProvider`] for example).
+The below list reflects the support provided from the first-party provider crates
+[`rustls-aws-lc-rs`] or [`rustls-ring`].
+
+Items marked with an asterisk `*` can be extended or altered via public APIs ([`CryptoProvider`] for example)
+and are dependent on the provider used.
 
 [`CryptoProvider`]: crate::crypto::CryptoProvider
+[`rustls-aws-lc-rs`]: https://crates.io/crates/rustls-aws-lc-rs
+[`rustls-ring`]: https://crates.io/crates/rustls-ring
 
 ## Current features
 
@@ -31,7 +35,7 @@ APIs ([`CryptoProvider`] for example).
 * [RFC8879](https://tools.ietf.org/html/rfc8879) certificate compression by clients
   and servers `*`
 * Client-side Encrypted client hello (ECH)
-   ([draft-ietf-tls-esni](https://datatracker.ietf.org/doc/draft-ietf-tls-esni/)).
+   ([RFC 9849](https://datatracker.ietf.org/doc/html/rfc9849)).
 
 [^1]: Note that, at the time of writing, Ed25519 does not have wide support
       in browsers.  It is also not supported by the WebPKI, because the

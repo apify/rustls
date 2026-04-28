@@ -2,17 +2,18 @@
 
 #![allow(clippy::disallowed_types, clippy::duplicate_mod)]
 
+use core::hash::Hasher;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use pki_types::{CertificateDer, DnsName};
 use rustls::client::{ClientCredentialResolver, CredentialRequest};
 use rustls::crypto::{CipherSuite, Credentials, Identity, SelectedCredential, SignatureScheme};
-use rustls::enums::{CertificateType, ProtocolVersion};
+use rustls::enums::{ApplicationProtocol, CertificateType, ProtocolVersion};
 use rustls::error::{CertificateError, Error, PeerMisbehaved};
 use rustls::server::{ClientHello, ServerCredentialResolver, ServerNameResolver};
 use rustls::{
-    ClientConfig, ClientConnection, DistinguishedName, ServerConfig, ServerConnection,
+    ClientConfig, Connection, DistinguishedName, ServerConfig, ServerConnection,
     SupportedCipherSuite,
 };
 use rustls_test::{
@@ -29,7 +30,7 @@ use super::{ALL_VERSIONS, provider, provider_is_aws_lc_rs};
 fn server_cert_resolve_with_sni() {
     let provider = provider::DEFAULT_PROVIDER;
     for kt in KeyType::all_for_provider(&provider) {
-        let client_config = make_client_config(*kt, &provider);
+        let client_config = Arc::new(make_client_config(*kt, &provider));
         let mut server_config = make_server_config(*kt, &provider);
 
         server_config.cert_resolver = Arc::new(ServerCheckCertResolve {
@@ -37,13 +38,17 @@ fn server_cert_resolve_with_sni() {
             ..Default::default()
         });
 
-        let mut client =
-            ClientConnection::new(Arc::new(client_config), server_name("the.value.from.sni"))
-                .unwrap();
+        let mut client = client_config
+            .connect(server_name("the.value.from.sni"))
+            .build()
+            .unwrap();
         let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
 
         let err = do_handshake_until_error(&mut client, &mut server);
-        assert!(err.is_err());
+        assert_eq!(
+            err.err(),
+            Some(ErrorFromPeer::Server(Error::NoSuitableCertificate))
+        );
     }
 }
 
@@ -52,7 +57,10 @@ fn server_cert_resolve_with_alpn() {
     let provider = provider::DEFAULT_PROVIDER;
     for kt in KeyType::all_for_provider(&provider) {
         let mut client_config = make_client_config(*kt, &provider);
-        client_config.alpn_protocols = vec!["foo".into(), "bar".into()];
+        client_config.alpn_protocols = vec![
+            ApplicationProtocol::from(b"foo"),
+            ApplicationProtocol::from(b"bar"),
+        ];
 
         let mut server_config = make_server_config(*kt, &provider);
         server_config.cert_resolver = Arc::new(ServerCheckCertResolve {
@@ -60,12 +68,17 @@ fn server_cert_resolve_with_alpn() {
             ..Default::default()
         });
 
-        let mut client =
-            ClientConnection::new(Arc::new(client_config), server_name("sni-value")).unwrap();
-        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+        let mut client = Arc::new(client_config)
+            .connect(server_name("sni-value"))
+            .build()
+            .unwrap();
 
+        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
         let err = do_handshake_until_error(&mut client, &mut server);
-        assert!(err.is_err());
+        assert_eq!(
+            err.err(),
+            Some(ErrorFromPeer::Server(Error::NoSuitableCertificate))
+        );
     }
 }
 
@@ -89,7 +102,10 @@ fn server_cert_resolve_with_named_groups() {
 
         let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
         let err = do_handshake_until_error(&mut client, &mut server);
-        assert!(err.is_err());
+        assert_eq!(
+            err.err(),
+            Some(ErrorFromPeer::Server(Error::NoSuitableCertificate))
+        );
     }
 }
 
@@ -97,7 +113,7 @@ fn server_cert_resolve_with_named_groups() {
 fn client_trims_terminating_dot() {
     let provider = provider::DEFAULT_PROVIDER;
     for kt in KeyType::all_for_provider(&provider) {
-        let client_config = make_client_config(*kt, &provider);
+        let client_config = Arc::new(make_client_config(*kt, &provider));
         let mut server_config = make_server_config(*kt, &provider);
 
         server_config.cert_resolver = Arc::new(ServerCheckCertResolve {
@@ -105,12 +121,17 @@ fn client_trims_terminating_dot() {
             ..Default::default()
         });
 
-        let mut client =
-            ClientConnection::new(Arc::new(client_config), server_name("some-host.com.")).unwrap();
+        let mut client = client_config
+            .connect(server_name("some-host.com."))
+            .build()
+            .unwrap();
         let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
 
         let err = do_handshake_until_error(&mut client, &mut server);
-        assert!(err.is_err());
+        assert_eq!(
+            err.err(),
+            Some(ErrorFromPeer::Server(Error::NoSuitableCertificate))
+        );
     }
 }
 
@@ -132,12 +153,17 @@ fn check_sigalgs_reduced_by_ciphersuite(
         ..Default::default()
     });
 
-    let mut client =
-        ClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
+    let mut client = Arc::new(client_config)
+        .connect(server_name("localhost"))
+        .build()
+        .unwrap();
     let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
 
     let err = do_handshake_until_error(&mut client, &mut server);
-    assert!(err.is_err());
+    assert_eq!(
+        Some(ErrorFromPeer::Server(Error::NoSuitableCertificate)),
+        err.err()
+    );
 }
 
 fn find_suite(suite: CipherSuite) -> SupportedCipherSuite {
@@ -208,14 +234,18 @@ fn client_with_sni_disabled_does_not_send_sni() {
             let mut client_config = make_client_config(*kt, &version_provider);
             client_config.enable_sni = false;
 
-            let mut client =
-                ClientConnection::new(Arc::new(client_config), server_name("value-not-sent"))
-                    .unwrap();
-            let mut server = ServerConnection::new(server_config.clone()).unwrap();
+            let mut client = Arc::new(client_config)
+                .connect(server_name("value-not-sent"))
+                .build()
+                .unwrap();
 
+            let mut server = ServerConnection::new(server_config.clone()).unwrap();
             let err = do_handshake_until_error(&mut client, &mut server);
             dbg!(&err);
-            assert!(err.is_err());
+            assert_eq!(
+                err.err(),
+                Some(ErrorFromPeer::Server(Error::NoSuitableCertificate))
+            );
         }
     }
 }
@@ -284,6 +314,8 @@ impl ClientCredentialResolver for ClientCheckCertResolve {
     fn supported_certificate_types(&self) -> &'static [CertificateType] {
         &[CertificateType::X509]
     }
+
+    fn hash_config(&self, _: &mut dyn Hasher) {}
 }
 
 fn test_client_cert_resolve(
@@ -297,12 +329,14 @@ fn test_client_cert_resolve(
     ] {
         println!("{version:?} {key_type:?}:");
 
-        let mut client_config = make_client_config(key_type, version_provider);
-        client_config.client_auth_cert_resolver = Arc::new(ClientCheckCertResolve::new(
-            1,
-            expected_root_hint_subjects.clone(),
-            default_signature_schemes(version),
-        ));
+        let client_config = ClientConfig::builder(version_provider.clone().into())
+            .add_root_certs(key_type)
+            .with_client_credential_resolver(Arc::new(ClientCheckCertResolve::new(
+                1,
+                expected_root_hint_subjects.clone(),
+                default_signature_schemes(version),
+            )))
+            .unwrap();
 
         let (mut client, mut server) =
             make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
@@ -389,7 +423,7 @@ fn client_cert_resolve_server_added_hint() {
         // Create a verifier that adds the extra_name as a hint subject in addition to the ones
         // from the root cert store.
         let verifier = webpki_client_verifier_builder(key_type.client_root_store(), &provider)
-            .add_root_hint_subjects([extra_name.clone()].into_iter());
+            .add_root_hint_subjects([extra_name.clone()]);
         let server_config = make_server_config_with_client_verifier(*key_type, verifier, &provider);
         test_client_cert_resolve(*key_type, server_config.into(), expected_hint_subjects);
     }
@@ -406,11 +440,12 @@ fn server_exposes_offered_sni_even_if_resolver_fails() {
     let server_config = Arc::new(server_config);
 
     for version_provider in ALL_VERSIONS {
-        let client_config = make_client_config(kt, &version_provider);
+        let client_config = Arc::new(make_client_config(kt, &version_provider));
         let mut server = ServerConnection::new(server_config.clone()).unwrap();
-        let mut client =
-            ClientConnection::new(Arc::new(client_config), server_name("thisdoesNOTexist.com"))
-                .unwrap();
+        let mut client = client_config
+            .connect(server_name("thisdoesNOTexist.com"))
+            .build()
+            .unwrap();
 
         assert_eq!(None, server.server_name());
         transfer(&mut client, &mut server);
@@ -443,20 +478,18 @@ fn sni_resolver_works() {
     let server_config = Arc::new(server_config);
 
     let mut server1 = ServerConnection::new(server_config.clone()).unwrap();
-    let mut client1 = ClientConnection::new(
-        Arc::new(make_client_config(kt, &provider)),
-        server_name("localhost"),
-    )
-    .unwrap();
+    let mut client1 = Arc::new(make_client_config(kt, &provider))
+        .connect(server_name("localhost"))
+        .build()
+        .unwrap();
     let err = do_handshake_until_error(&mut client1, &mut server1);
     assert_eq!(err, Ok(()));
 
-    let mut server2 = ServerConnection::new(server_config.clone()).unwrap();
-    let mut client2 = ClientConnection::new(
-        Arc::new(make_client_config(kt, &provider)),
-        server_name("notlocalhost"),
-    )
-    .unwrap();
+    let mut server2 = ServerConnection::new(server_config).unwrap();
+    let mut client2 = Arc::new(make_client_config(kt, &provider))
+        .connect(server_name("notlocalhost"))
+        .build()
+        .unwrap();
     let err = do_handshake_until_error(&mut client2, &mut server2);
     assert_eq!(
         err,
@@ -508,12 +541,11 @@ fn sni_resolver_lower_cases_configured_names() {
     server_config.cert_resolver = Arc::new(resolver);
     let server_config = Arc::new(server_config);
 
-    let mut server1 = ServerConnection::new(server_config.clone()).unwrap();
-    let mut client1 = ClientConnection::new(
-        Arc::new(make_client_config(kt, &provider)),
-        server_name("localhost"),
-    )
-    .unwrap();
+    let mut server1 = ServerConnection::new(server_config).unwrap();
+    let mut client1 = Arc::new(make_client_config(kt, &provider))
+        .connect(server_name("localhost"))
+        .build()
+        .unwrap();
     let err = do_handshake_until_error(&mut client1, &mut server1);
     assert_eq!(err, Ok(()));
 }
@@ -538,12 +570,11 @@ fn sni_resolver_lower_cases_queried_names() {
     server_config.cert_resolver = Arc::new(resolver);
     let server_config = Arc::new(server_config);
 
-    let mut server1 = ServerConnection::new(server_config.clone()).unwrap();
-    let mut client1 = ClientConnection::new(
-        Arc::new(make_client_config(kt, &provider)),
-        server_name("LOCALHOST"),
-    )
-    .unwrap();
+    let mut server1 = ServerConnection::new(server_config).unwrap();
+    let mut client1 = Arc::new(make_client_config(kt, &provider))
+        .connect(server_name("LOCALHOST"))
+        .build()
+        .unwrap();
     let err = do_handshake_until_error(&mut client1, &mut server1);
     assert_eq!(err, Ok(()));
 }

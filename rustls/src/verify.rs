@@ -1,13 +1,14 @@
 use alloc::vec::Vec;
 use core::fmt::Debug;
+use core::hash::Hasher;
 
 use pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 
+use crate::crypto::cipher::Payload;
 use crate::crypto::{Identity, SignatureScheme};
 use crate::enums::CertificateType;
 use crate::error::{Error, InvalidMessage};
-use crate::msgs::base::{NonEmpty, PayloadU16};
-use crate::msgs::codec::{Codec, ListLength, Reader, TlsListElement};
+use crate::msgs::{Codec, ListLength, MaybeEmpty, NonEmpty, Reader, SizedPayload, TlsListElement};
 use crate::sync::Arc;
 use crate::x509::wrap_in_sequence;
 
@@ -96,6 +97,9 @@ pub trait ServerVerifier: Debug + Send + Sync {
     fn root_hint_subjects(&self) -> Option<Arc<[DistinguishedName]>> {
         None
     }
+
+    /// Instance configuration should be input to `h`.
+    fn hash_config(&self, h: &mut dyn Hasher);
 }
 
 /// Data required to verify a server's identity.
@@ -113,6 +117,18 @@ pub struct ServerIdentity<'a> {
     pub ocsp_response: &'a [u8],
     /// Current time against which time-sensitive inputs should be validated.
     pub now: UnixTime,
+}
+
+impl<'a> ServerIdentity<'a> {
+    /// Create a new `ServerIdentity` instance with empty OCSP response.
+    pub fn new(identity: &'a Identity<'a>, server_name: &'a ServerName<'a>, now: UnixTime) -> Self {
+        Self {
+            identity,
+            server_name,
+            ocsp_response: &[],
+            now,
+        }
+    }
 }
 
 /// Something that can verify a client certificate chain
@@ -298,20 +314,20 @@ impl ClientVerifier for NoClientAuth {
 pub struct DigitallySignedStruct {
     /// The [`SignatureScheme`] used to produce the signature.
     pub scheme: SignatureScheme,
-    sig: PayloadU16,
+    sig: SizedPayload<'static, u16, MaybeEmpty>,
 }
 
 impl DigitallySignedStruct {
     pub(crate) fn new(scheme: SignatureScheme, sig: Vec<u8>) -> Self {
         Self {
             scheme,
-            sig: PayloadU16::new(sig),
+            sig: SizedPayload::from(Payload::new(sig)),
         }
     }
 
     /// Get the signature.
     pub fn signature(&self) -> &[u8] {
-        &self.sig.0
+        self.sig.bytes()
     }
 }
 
@@ -322,10 +338,10 @@ impl Codec<'_> for DigitallySignedStruct {
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
-        let scheme = SignatureScheme::read(r)?;
-        let sig = PayloadU16::read(r)?;
-
-        Ok(Self { scheme, sig })
+        Ok(Self {
+            scheme: SignatureScheme::read(r)?,
+            sig: SizedPayload::read(r)?.into_owned(),
+        })
     }
 }
 
@@ -345,7 +361,7 @@ wrapped_payload!(
     ///
     /// The TLS encoding is defined in RFC5246: `opaque DistinguishedName<1..2^16-1>;`
     pub struct DistinguishedName,
-    PayloadU16<NonEmpty>,
+    SizedPayload<u16, NonEmpty>,
 );
 
 impl DistinguishedName {
@@ -358,13 +374,13 @@ impl DistinguishedName {
     /// println!("{}", x509_parser::x509::X509Name::from_der(dn.as_ref())?.1);
     /// ```
     pub fn in_sequence(bytes: &[u8]) -> Self {
-        Self(PayloadU16::new(wrap_in_sequence(bytes)))
+        Self(SizedPayload::from(Payload::new(wrap_in_sequence(bytes))))
     }
 }
 
 impl PartialEq for DistinguishedName {
     fn eq(&self, other: &Self) -> bool {
-        self.0.0 == other.0.0
+        self.0.bytes() == other.0.bytes()
     }
 }
 

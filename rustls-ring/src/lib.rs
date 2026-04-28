@@ -9,29 +9,26 @@ extern crate alloc;
 extern crate std;
 
 // Import `test` sysroot crate for `Bencher` definitions.
-#[cfg(bench)]
-#[expect(unused_extern_crates)]
+#[cfg(all(test, bench))]
+#[allow(unused_extern_crates)]
 extern crate test;
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
-use core::time::Duration;
+use alloc::sync::Arc;
 #[cfg(feature = "std")]
-use std::sync::Arc;
+use core::time::Duration;
 
-use pki_types::PrivateKeyDer;
+use pki_types::{FipsStatus, PrivateKeyDer};
 use rustls::crypto::kx::SupportedKxGroup;
 use rustls::crypto::{
     CryptoProvider, GetRandomFailed, KeyProvider, SecureRandom, SignatureScheme, SigningKey,
-    WebPkiSupportedAlgorithms,
+    TicketProducer, TicketerFactory, WebPkiSupportedAlgorithms,
 };
-#[cfg(feature = "std")]
-use rustls::crypto::{TicketProducer, TicketerFactory};
 use rustls::error::Error;
 #[cfg(feature = "std")]
 use rustls::ticketer::TicketRotator;
 use rustls::{Tls12CipherSuite, Tls13CipherSuite};
-use webpki::ring as webpki_algs;
 
 /// Using software keys for authentication.
 pub mod sign;
@@ -41,11 +38,22 @@ pub(crate) mod hash;
 pub(crate) mod hmac;
 pub(crate) mod kx;
 pub(crate) mod quic;
+#[cfg(feature = "std")]
 pub(crate) mod ticketer;
 #[cfg(feature = "std")]
 use ticketer::AeadTicketer;
 pub(crate) mod tls12;
 pub(crate) mod tls13;
+mod verify;
+pub use verify::{
+    ALL_VERIFICATION_ALGS, ECDSA_P256_SHA256, ECDSA_P256_SHA384, ECDSA_P384_SHA256,
+    ECDSA_P384_SHA384, ED25519, RSA_PKCS1_2048_8192_SHA256,
+    RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS, RSA_PKCS1_2048_8192_SHA384,
+    RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS, RSA_PKCS1_2048_8192_SHA512,
+    RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS, RSA_PKCS1_3072_8192_SHA384,
+    RSA_PSS_2048_8192_SHA256_LEGACY_KEY, RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+    RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+};
 
 /// The default `CryptoProvider` backed by [*ring*].
 ///
@@ -135,7 +143,7 @@ impl TicketerFactory for Ring {
         }
     }
 
-    fn fips(&self) -> bool {
+    fn fips(&self) -> FipsStatus {
         fips()
     }
 }
@@ -148,11 +156,11 @@ pub static DEFAULT_TLS12_CIPHER_SUITES: &[&Tls12CipherSuite] = ALL_TLS12_CIPHER_
 
 /// A list of all the TLS1.2 cipher suites supported by the rustls *ring* provider.
 pub static ALL_TLS12_CIPHER_SUITES: &[&Tls12CipherSuite] = &[
-    tls12::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
     tls12::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    tls12::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
     tls12::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-    tls12::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
     tls12::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    tls12::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
     tls12::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
 ];
 
@@ -164,8 +172,8 @@ pub static DEFAULT_TLS13_CIPHER_SUITES: &[&Tls13CipherSuite] = ALL_TLS13_CIPHER_
 
 /// A list of all the TLS1.3 cipher suites supported by the rustls *ring* provider.
 pub static ALL_TLS13_CIPHER_SUITES: &[&Tls13CipherSuite] = &[
-    tls13::TLS13_AES_256_GCM_SHA384,
     tls13::TLS13_AES_128_GCM_SHA256,
+    tls13::TLS13_AES_256_GCM_SHA384,
     tls13::TLS13_CHACHA20_POLY1305_SHA256,
 ];
 
@@ -183,65 +191,62 @@ pub mod cipher_suite {
 
 /// A `WebPkiSupportedAlgorithms` value that reflects webpki's capabilities when
 /// compiled against *ring*.
-static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
-    all: &[
-        webpki_algs::ECDSA_P256_SHA256,
-        webpki_algs::ECDSA_P256_SHA384,
-        webpki_algs::ECDSA_P384_SHA256,
-        webpki_algs::ECDSA_P384_SHA384,
-        webpki_algs::ED25519,
-        webpki_algs::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
-        webpki_algs::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
-        webpki_algs::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
-        webpki_algs::RSA_PKCS1_2048_8192_SHA256,
-        webpki_algs::RSA_PKCS1_2048_8192_SHA384,
-        webpki_algs::RSA_PKCS1_2048_8192_SHA512,
-        webpki_algs::RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS,
-        webpki_algs::RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS,
-        webpki_algs::RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS,
+static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = match WebPkiSupportedAlgorithms::new(
+    &[
+        ECDSA_P256_SHA256,
+        ECDSA_P256_SHA384,
+        ECDSA_P384_SHA256,
+        ECDSA_P384_SHA384,
+        ED25519,
+        RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+        RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+        RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+        RSA_PKCS1_2048_8192_SHA256,
+        RSA_PKCS1_2048_8192_SHA384,
+        RSA_PKCS1_2048_8192_SHA512,
+        RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS,
+        RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS,
+        RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS,
     ],
-    mapping: &[
+    &[
         // Note: for TLS1.2 the curve is not fixed by SignatureScheme. For TLS1.3 it is.
         (
             SignatureScheme::ECDSA_NISTP384_SHA384,
-            &[
-                webpki_algs::ECDSA_P384_SHA384,
-                webpki_algs::ECDSA_P256_SHA384,
-            ],
+            &[ECDSA_P384_SHA384, ECDSA_P256_SHA384],
         ),
         (
             SignatureScheme::ECDSA_NISTP256_SHA256,
-            &[
-                webpki_algs::ECDSA_P256_SHA256,
-                webpki_algs::ECDSA_P384_SHA256,
-            ],
+            &[ECDSA_P256_SHA256, ECDSA_P384_SHA256],
         ),
-        (SignatureScheme::ED25519, &[webpki_algs::ED25519]),
+        (SignatureScheme::ED25519, &[ED25519]),
         (
             SignatureScheme::RSA_PSS_SHA512,
-            &[webpki_algs::RSA_PSS_2048_8192_SHA512_LEGACY_KEY],
+            &[RSA_PSS_2048_8192_SHA512_LEGACY_KEY],
         ),
         (
             SignatureScheme::RSA_PSS_SHA384,
-            &[webpki_algs::RSA_PSS_2048_8192_SHA384_LEGACY_KEY],
+            &[RSA_PSS_2048_8192_SHA384_LEGACY_KEY],
         ),
         (
             SignatureScheme::RSA_PSS_SHA256,
-            &[webpki_algs::RSA_PSS_2048_8192_SHA256_LEGACY_KEY],
+            &[RSA_PSS_2048_8192_SHA256_LEGACY_KEY],
         ),
         (
             SignatureScheme::RSA_PKCS1_SHA512,
-            &[webpki_algs::RSA_PKCS1_2048_8192_SHA512],
+            &[RSA_PKCS1_2048_8192_SHA512],
         ),
         (
             SignatureScheme::RSA_PKCS1_SHA384,
-            &[webpki_algs::RSA_PKCS1_2048_8192_SHA384],
+            &[RSA_PKCS1_2048_8192_SHA384],
         ),
         (
             SignatureScheme::RSA_PKCS1_SHA256,
-            &[webpki_algs::RSA_PKCS1_2048_8192_SHA256],
+            &[RSA_PKCS1_2048_8192_SHA256],
         ),
     ],
+) {
+    Ok(algs) => algs,
+    Err(_) => panic!("bad WebPkiSupportedAlgorithms"),
 };
 
 /// All defined key exchange groups supported by *ring* appear in this module.
@@ -273,9 +278,10 @@ mod ring_shim {
     }
 }
 
-/// Return `true` if this is backed by a FIPS-approved implementation.
-pub fn fips() -> bool {
-    false
+/// Return the FIPS validation status of this implementation.
+pub fn fips() -> FipsStatus {
+    FipsStatus::Unvalidated
 }
 
+#[cfg(feature = "std")]
 const SIX_HOURS: Duration = Duration::from_secs(6 * 60 * 60);

@@ -4,11 +4,13 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::{fs, str, thread};
 
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use rustls::crypto::{CryptoProvider, Identity, aws_lc_rs as provider};
+use openssl::ssl::{SslAcceptor, SslConnector, SslFiletype, SslMethod};
+use rustls::crypto::{CryptoProvider, Identity};
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{ClientConfig, Connection, RootCertStore, ServerConfig, ServerConnection};
+use rustls_aws_lc_rs as provider;
+use rustls_util::complete_io;
 
 use crate::ffdhe::{self, FFDHE2048_GROUP};
 use crate::utils::verify_openssl3_available;
@@ -34,20 +36,19 @@ fn test_rustls_server_with_ffdhe_kx(provider: CryptoProvider, iters: usize) {
     let server_thread = thread::spawn(move || {
         let config = Arc::new(server_config_with_ffdhe_kx(provider));
         for _ in 0..iters {
-            let mut server = rustls::ServerConnection::new(config.clone()).unwrap();
+            let mut server = ServerConnection::new(config.clone()).unwrap();
             let (mut tcp_stream, _addr) = listener.accept().unwrap();
             server
                 .writer()
                 .write_all(message.as_bytes())
                 .unwrap();
-            server
-                .complete_io(&mut tcp_stream)
-                .unwrap();
+
+            complete_io(&mut tcp_stream, &mut server).unwrap();
             tcp_stream.flush().unwrap();
         }
     });
 
-    let mut connector = openssl::ssl::SslConnector::builder(SslMethod::tls()).unwrap();
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
     connector
         .set_ca_file(CA_PEM_FILE)
         .unwrap();
@@ -119,20 +120,28 @@ fn test_rustls_client_with_ffdhe_kx(iters: usize) {
     });
 
     // client:
+    let config = Arc::new(
+        ClientConfig::builder(
+            // OpenSSL 3 does not support RFC 7919 with TLS 1.2: https://github.com/openssl/openssl/issues/10971
+            FFDHE_TLS13_PROVIDER.into(),
+        )
+        .with_root_certificates(root_ca())
+        .with_no_client_auth()
+        .unwrap(),
+    );
+    let server_name = ServerName::try_from("localhost").unwrap();
     for _ in 0..iters {
         let mut tcp_stream = TcpStream::connect(("localhost", port)).unwrap();
-        let mut client = rustls::client::ClientConnection::new(
-            client_config_with_ffdhe_kx().into(),
-            "localhost".try_into().unwrap(),
-        )
-        .unwrap();
+        let mut client = config
+            .connect(server_name.clone())
+            .build()
+            .unwrap();
         client
             .writer()
             .write_all(message.as_bytes())
             .unwrap();
-        client
-            .complete_io(&mut tcp_stream)
-            .unwrap();
+
+        complete_io(&mut tcp_stream, &mut client).unwrap();
         client.send_close_notify();
         client
             .write_tls(&mut tcp_stream)
@@ -141,16 +150,6 @@ fn test_rustls_client_with_ffdhe_kx(iters: usize) {
     }
 
     server_thread.join().unwrap();
-}
-
-fn client_config_with_ffdhe_kx() -> ClientConfig {
-    ClientConfig::builder(
-        // OpenSSL 3 does not support RFC 7919 with TLS 1.2: https://github.com/openssl/openssl/issues/10971
-        FFDHE_TLS13_PROVIDER.into(),
-    )
-    .with_root_certificates(root_ca())
-    .with_no_client_auth()
-    .unwrap()
 }
 
 // TLS 1.2 requires stripping leading zeros of the shared secret,

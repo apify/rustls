@@ -1,6 +1,3 @@
-use alloc::vec::Vec;
-use core::fmt;
-
 use pki_types::{
     CertificateDer, ServerName, SignatureVerificationAlgorithm, SubjectPublicKeyInfoDer, UnixTime,
 };
@@ -8,7 +5,7 @@ use webpki::ExtendedKeyUsage;
 
 use super::anchors::RootCertStore;
 use super::pki_error;
-use crate::crypto::SignatureScheme;
+use crate::crypto::WebPkiSupportedAlgorithms;
 use crate::error::{ApiMisuse, Error, PeerMisbehaved};
 use crate::verify::{HandshakeSignatureValid, SignatureVerificationInput, SignerPublicKey};
 
@@ -53,76 +50,6 @@ pub fn verify_server_name(
         .map_err(pki_error)
 }
 
-/// Describes which `webpki` signature verification algorithms are supported and
-/// how they map to TLS [`SignatureScheme`]s.
-#[expect(clippy::exhaustive_structs)]
-#[derive(Clone, Copy)]
-pub struct WebPkiSupportedAlgorithms {
-    /// A list of all supported signature verification algorithms.
-    ///
-    /// Used for verifying certificate chains.
-    ///
-    /// The order of this list is not significant.
-    pub all: &'static [&'static dyn SignatureVerificationAlgorithm],
-
-    /// A mapping from TLS `SignatureScheme`s to matching webpki signature verification algorithms.
-    ///
-    /// This is one (`SignatureScheme`) to many ([`SignatureVerificationAlgorithm`]) because
-    /// (depending on the protocol version) there is not necessary a 1-to-1 mapping.
-    ///
-    /// For TLS1.2, all `SignatureVerificationAlgorithm`s are tried in sequence.
-    ///
-    /// For TLS1.3, only the first is tried.
-    ///
-    /// The supported schemes in this mapping is communicated to the peer and the order is significant.
-    /// The first mapping is our highest preference.
-    pub mapping: &'static [(
-        SignatureScheme,
-        &'static [&'static dyn SignatureVerificationAlgorithm],
-    )],
-}
-
-impl WebPkiSupportedAlgorithms {
-    /// Return all the `scheme` items in `mapping`, maintaining order.
-    pub fn supported_schemes(&self) -> Vec<SignatureScheme> {
-        self.mapping
-            .iter()
-            .map(|item| item.0)
-            .collect()
-    }
-
-    /// Return the first item in `mapping` that matches `scheme`.
-    fn convert_scheme(
-        &self,
-        scheme: SignatureScheme,
-    ) -> Result<&[&'static dyn SignatureVerificationAlgorithm], Error> {
-        self.mapping
-            .iter()
-            .filter_map(|item| if item.0 == scheme { Some(item.1) } else { None })
-            .next()
-            .ok_or_else(|| PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into())
-    }
-
-    /// Return `true` if all cryptography is FIPS-approved.
-    pub fn fips(&self) -> bool {
-        self.all.iter().all(|alg| alg.fips())
-            && self
-                .mapping
-                .iter()
-                .all(|item| item.1.iter().all(|alg| alg.fips()))
-    }
-}
-
-impl fmt::Debug for WebPkiSupportedAlgorithms {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WebPkiSupportedAlgorithms {{ all: [ .. ], mapping: ")?;
-        f.debug_list()
-            .entries(self.mapping.iter().map(|item| item.0))
-            .finish()?;
-        write!(f, " }}")
-    }
-}
-
 /// Wrapper around internal representation of a parsed certificate.
 ///
 /// This is used in order to avoid parsing twice when specifying custom verification
@@ -151,7 +78,7 @@ impl<'a> TryFrom<&'a CertificateDer<'a>> for ParsedCertificate<'a> {
 /// [`SignatureVerificationAlgorithm`], this function will map to several candidates and try each in
 /// succession until one succeeds or we exhaust all candidates.
 ///
-/// See [WebPkiSupportedAlgorithms::mapping] for more information.
+/// See [`WebPkiSupportedAlgorithms::mapping()`] for more information.
 pub fn verify_tls12_signature(
     input: &SignatureVerificationInput<'_>,
     supported_schemes: &WebPkiSupportedAlgorithms,
@@ -188,8 +115,8 @@ pub fn verify_tls12_signature(
 /// supported scheme.
 ///
 /// This function verifies the `dss` signature over `message` using the subject public key from
-/// `cert`. Unlike [verify_tls12_signature], this function only tries the first matching scheme. See
-/// [WebPkiSupportedAlgorithms::mapping] for more information.
+/// `cert`. Unlike [`verify_tls12_signature()`], this function only tries the first matching scheme. See
+/// [`WebPkiSupportedAlgorithms::mapping()`] for more information.
 pub fn verify_tls13_signature(
     input: &SignatureVerificationInput<'_>,
     supported_schemes: &WebPkiSupportedAlgorithms,
@@ -202,7 +129,13 @@ pub fn verify_tls13_signature(
         return Err(PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
     }
 
-    let alg = supported_schemes.convert_scheme(input.signature.scheme)?[0];
+    let &alg = supported_schemes
+        .convert_scheme(input.signature.scheme)?
+        .first()
+        .ok_or(Error::ApiMisuse(
+            ApiMisuse::NoSignatureVerificationAlgorithms,
+        ))?;
+
     match input.signer {
         SignerPublicKey::X509(cert_der) => {
             webpki::EndEntityCert::try_from(*cert_der).and_then(|cert| {
@@ -254,9 +187,36 @@ pub(crate) fn verify_identity_signed_by_trust_anchor_impl(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
     use std::format;
 
     use super::*;
+    use crate::crypto::{SignatureScheme, TEST_PROVIDER};
+    use crate::verify::DigitallySignedStruct;
+
+    #[test]
+    fn tls13_empty_signature_mapping_panics() {
+        let supported = WebPkiSupportedAlgorithms {
+            all: TEST_PROVIDER
+                .signature_verification_algorithms
+                .all,
+            mapping: &[(SignatureScheme::ED25519, &[])],
+        };
+
+        let cert = CertificateDer::from(vec![0u8]); // never parsed; panic happens first
+        let dss = DigitallySignedStruct::new(SignatureScheme::ED25519, vec![]);
+        let signer = SignerPublicKey::X509(&cert);
+        let input = SignatureVerificationInput {
+            message: b"hello",
+            signer: &signer,
+            signature: &dss,
+        };
+
+        assert_eq!(
+            verify_tls13_signature(&input, &supported).unwrap_err(),
+            Error::ApiMisuse(ApiMisuse::NoSignatureVerificationAlgorithms)
+        );
+    }
 
     #[test]
     fn certificate_debug() {

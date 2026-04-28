@@ -1,12 +1,12 @@
 use alloc::boxed::Box;
 
+use pki_types::FipsStatus;
 use ring::hkdf::{self, KeyType};
 use ring::{aead, hmac};
 use rustls::crypto::CipherSuite;
 use rustls::crypto::cipher::{
-    AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, MessageDecrypter, MessageEncrypter,
-    Nonce, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload, Tls13AeadAlgorithm,
-    UnsupportedOperationError, make_tls13_aad,
+    AeadKey, EncodedMessage, InboundOpaque, Iv, MessageDecrypter, MessageEncrypter, Nonce,
+    OutboundOpaque, OutboundPlain, Tls13AeadAlgorithm, UnsupportedOperationError, make_tls13_aad,
 };
 use rustls::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
 use rustls::enums::{ContentType, ProtocolVersion};
@@ -98,8 +98,8 @@ impl Tls13AeadAlgorithm for Chacha20Poly1305Aead {
         Ok(ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv })
     }
 
-    fn fips(&self) -> bool {
-        false // chacha20poly1305 not FIPS approved
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated // chacha20poly1305 not FIPS approved
     }
 }
 
@@ -126,7 +126,7 @@ impl Tls13AeadAlgorithm for Aes256GcmAead {
         Ok(ConnectionTrafficSecrets::Aes256Gcm { key, iv })
     }
 
-    fn fips(&self) -> bool {
+    fn fips(&self) -> FipsStatus {
         super::fips()
     }
 }
@@ -154,7 +154,7 @@ impl Tls13AeadAlgorithm for Aes128GcmAead {
         Ok(ConnectionTrafficSecrets::Aes128Gcm { key, iv })
     }
 
-    fn fips(&self) -> bool {
+    fn fips(&self) -> FipsStatus {
         super::fips()
     }
 }
@@ -197,11 +197,11 @@ struct Tls13MessageDecrypter {
 impl MessageEncrypter for Tls13MessageEncrypter {
     fn encrypt(
         &mut self,
-        msg: OutboundPlainMessage<'_>,
+        msg: EncodedMessage<OutboundPlain<'_>>,
         seq: u64,
-    ) -> Result<OutboundOpaqueMessage, Error> {
+    ) -> Result<EncodedMessage<OutboundOpaque>, Error> {
         let total_len = self.encrypted_payload_len(msg.payload.len());
-        let mut payload = PrefixedPayload::with_capacity(total_len);
+        let mut payload = OutboundOpaque::with_capacity(total_len);
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).to_array()?);
         let aad = aead::Aad::from(make_tls13_aad(total_len));
@@ -212,7 +212,7 @@ impl MessageEncrypter for Tls13MessageEncrypter {
             .seal_in_place_append_tag(nonce, aad, &mut payload)
             .map_err(|_| Error::EncryptError)?;
 
-        Ok(OutboundOpaqueMessage {
+        Ok(EncodedMessage {
             typ: ContentType::ApplicationData,
             // Note: all TLS 1.3 application data records use TLSv1_2 (0x0303) as the legacy record
             // protocol version, see https://www.rfc-editor.org/rfc/rfc8446#section-5.1
@@ -229,9 +229,9 @@ impl MessageEncrypter for Tls13MessageEncrypter {
 impl MessageDecrypter for Tls13MessageDecrypter {
     fn decrypt<'a>(
         &mut self,
-        mut msg: InboundOpaqueMessage<'a>,
+        mut msg: EncodedMessage<InboundOpaque<'a>>,
         seq: u64,
-    ) -> Result<InboundPlainMessage<'a>, Error> {
+    ) -> Result<EncodedMessage<&'a [u8]>, Error> {
         let payload = &mut msg.payload;
         if payload.len() < self.dec_key.algorithm().tag_len() {
             return Err(Error::DecryptError);
@@ -288,7 +288,7 @@ impl Hkdf for RingHkdf {
         crypto::hmac::Tag::new(hmac::sign(&hmac::Key::new(self.1, key.as_ref()), message).as_ref())
     }
 
-    fn fips(&self) -> bool {
+    fn fips(&self) -> FipsStatus {
         super::fips()
     }
 }
@@ -331,7 +331,7 @@ impl KeyType for Len {
 
 #[cfg(test)]
 mod tests {
-    use std::prelude::v1::*;
+    use alloc::vec::Vec;
 
     use rustls::crypto::tls13::{HkdfUsingHmac, expand};
 

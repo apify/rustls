@@ -32,18 +32,14 @@
 //! [cc_cd]: crate::ClientConfig::cert_decompressors
 //! [sc_cd]: crate::ServerConfig::cert_decompressors
 
-#[cfg(feature = "std")]
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::fmt::Debug;
-#[cfg(feature = "std")]
 use std::sync::Mutex;
 
 use crate::crypto::cipher::Payload;
 use crate::enums::CertificateCompressionAlgorithm;
-use crate::msgs::base::PayloadU24;
-use crate::msgs::codec::Codec;
-use crate::msgs::handshake::{CertificatePayloadTls13, CompressedCertificatePayload};
+use crate::msgs::{CertificatePayloadTls13, Codec, CompressedCertificatePayload, SizedPayload};
 use crate::sync::Arc;
 
 /// Returns the supported `CertDecompressor` implementations enabled
@@ -129,8 +125,9 @@ pub struct CompressionFailed;
 
 #[cfg(feature = "zlib")]
 mod feat_zlib_rs {
-    use zlib_rs::c_api::Z_BEST_COMPRESSION;
-    use zlib_rs::{ReturnCode, deflate, inflate};
+    use zlib_rs::{
+        DeflateConfig, InflateConfig, ReturnCode, compress_bound, compress_slice, decompress_slice,
+    };
 
     use super::*;
 
@@ -143,7 +140,7 @@ mod feat_zlib_rs {
     impl CertDecompressor for ZlibRsDecompressor {
         fn decompress(&self, input: &[u8], output: &mut [u8]) -> Result<(), DecompressionFailed> {
             let output_len = output.len();
-            match inflate::uncompress_slice(output, input, inflate::InflateConfig::default()) {
+            match decompress_slice(output, input, InflateConfig::default()) {
                 (output_filled, ReturnCode::Ok) if output_filled.len() == output_len => Ok(()),
                 (_, _) => Err(DecompressionFailed),
             }
@@ -166,12 +163,12 @@ mod feat_zlib_rs {
             input: Vec<u8>,
             level: CompressionLevel,
         ) -> Result<Vec<u8>, CompressionFailed> {
-            let mut output = alloc::vec![0u8; deflate::compress_bound(input.len())];
+            let mut output = alloc::vec![0u8; compress_bound(input.len())];
             let config = match level {
-                CompressionLevel::Interactive => deflate::DeflateConfig::default(),
-                CompressionLevel::Amortized => deflate::DeflateConfig::new(Z_BEST_COMPRESSION),
+                CompressionLevel::Interactive => DeflateConfig::default(),
+                CompressionLevel::Amortized => DeflateConfig::best_compression(),
             };
-            let (output_filled, rc) = deflate::compress_slice(&mut output, &input, config);
+            let (output_filled, rc) = compress_slice(&mut output, &input, config);
             if rc != ReturnCode::Ok {
                 return Err(CompressionFailed);
             }
@@ -283,14 +280,12 @@ pub enum CompressionCache {
     Disabled,
 
     /// Compressions are stored in an LRU cache.
-    #[cfg(feature = "std")]
     Enabled(CompressionCacheInner),
 }
 
 /// Innards of an enabled CompressionCache.
 ///
 /// You cannot make one of these directly. Use [`CompressionCache::new`].
-#[cfg(feature = "std")]
 #[derive(Debug)]
 pub struct CompressionCacheInner {
     /// Maximum size of underlying storage.
@@ -305,7 +300,6 @@ pub struct CompressionCacheInner {
 impl CompressionCache {
     /// Make a `CompressionCache` that stores up to `size` compressed
     /// certificate messages.
-    #[cfg(feature = "std")]
     pub fn new(size: usize) -> Self {
         if size == 0 {
             return Self::Disabled;
@@ -329,13 +323,10 @@ impl CompressionCache {
     ) -> Result<Arc<CompressionCacheEntry>, CompressionFailed> {
         match self {
             Self::Disabled => Self::uncached_compression(compressor, original),
-
-            #[cfg(feature = "std")]
             Self::Enabled(_) => self.compression_for_impl(compressor, original),
         }
     }
 
-    #[cfg(feature = "std")]
     fn compression_for_impl(
         &self,
         compressor: &dyn CertCompressor,
@@ -348,7 +339,7 @@ impl CompressionCache {
 
         // context is a per-connection quantity, and included in the compressed data.
         // it is not suitable for inclusion in the cache.
-        if !original.context.0.is_empty() {
+        if !original.context.is_empty() {
             return Self::uncached_compression(compressor, original);
         }
 
@@ -378,7 +369,7 @@ impl CompressionCache {
             compressed: CompressedCertificatePayload {
                 alg: algorithm,
                 uncompressed_len,
-                compressed: PayloadU24::from(Payload::new(compressed)),
+                compressed: SizedPayload::from(Payload::new(compressed)),
             },
         });
 
@@ -411,7 +402,7 @@ impl CompressionCache {
             compressed: CompressedCertificatePayload {
                 alg: algorithm,
                 uncompressed_len,
-                compressed: PayloadU24::from(Payload::new(compressed)),
+                compressed: SizedPayload::from(Payload::new(compressed)),
             },
         }))
     }
@@ -419,20 +410,11 @@ impl CompressionCache {
 
 impl Default for CompressionCache {
     fn default() -> Self {
-        #[cfg(feature = "std")]
-        {
-            // 4 entries allows 2 certificate chains times 2 compression algorithms
-            Self::new(4)
-        }
-
-        #[cfg(not(feature = "std"))]
-        {
-            Self::Disabled
-        }
+        // 4 entries allows 2 certificate chains times 2 compression algorithms
+        Self::new(4)
     }
 }
 
-#[cfg_attr(not(feature = "std"), expect(dead_code))]
 #[derive(Debug)]
 pub(crate) struct CompressionCacheEntry {
     // cache key is algorithm + original:

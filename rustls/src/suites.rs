@@ -1,5 +1,7 @@
 use core::fmt;
 
+use pki_types::FipsStatus;
+
 use crate::common_state::Protocol;
 use crate::crypto::cipher::{AeadKey, Iv};
 use crate::crypto::kx::KeyExchangeAlgorithm;
@@ -51,7 +53,7 @@ impl CipherSuiteCommon {
     /// Return `true` if this is backed by a FIPS-approved implementation.
     ///
     /// This means all the constituent parts that do cryptography return `true` for `fips()`.
-    pub fn fips(&self) -> bool {
+    pub fn fips(&self) -> FipsStatus {
         self.hash_provider.fips()
     }
 }
@@ -177,6 +179,22 @@ pub enum ConnectionTrafficSecrets {
         /// Initialization vector
         iv: Iv,
     },
+
+    /// Secrets for the SM4_GCM AEAD algorithm
+    Sm4Gcm {
+        /// AEAD Key
+        key: AeadKey,
+        /// Initialization vector
+        iv: Iv,
+    },
+
+    /// Secrets for the SM4_CCM AEAD algorithm
+    Sm4Ccm {
+        /// AEAD Key
+        key: AeadKey,
+        /// Initialization vector
+        iv: Iv,
+    },
 }
 
 #[cfg(test)]
@@ -184,14 +202,18 @@ mod tests {
     use std::println;
 
     use super::SupportedCipherSuite;
-    use crate::TEST_PROVIDERS;
-    use crate::crypto::{CipherSuite, tls13_suite};
+    use crate::crypto::TEST_PROVIDER;
 
     #[test]
     fn test_scs_is_debug() {
-        for &provider in TEST_PROVIDERS {
-            let aes_128_gcm = tls13_suite(CipherSuite::TLS13_AES_128_GCM_SHA256, provider);
-            println!("{:?}", SupportedCipherSuite::Tls13(aes_128_gcm));
-        }
+        println!(
+            "{:?}",
+            SupportedCipherSuite::Tls13(
+                TEST_PROVIDER
+                    .tls13_cipher_suites
+                    .first()
+                    .unwrap()
+            )
+        );
     }
 }

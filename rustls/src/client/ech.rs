@@ -1,43 +1,36 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::iter;
 
-use pki_types::{DnsName, EchConfigListBytes, ServerName};
+use pki_types::{DnsName, EchConfigListBytes, FipsStatus, ServerName};
 use subtle::ConstantTimeEq;
 
 use super::config::ClientConfig;
-use super::tls13;
-use crate::crypto::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
-use crate::crypto::SecureRandom;
+use super::{Retrieved, Tls13Session, tls13};
+use crate::common_state::Protocol;
 use crate::crypto::cipher::Payload;
 use crate::crypto::hash::Hash;
 use crate::crypto::hpke::{
     EncapsulatedSecret, Hpke, HpkeKem, HpkePublicKey, HpkeSealer, HpkeSuite,
     HpkeSymmetricCipherSuite,
 };
+use crate::crypto::{CipherSuite, SecureRandom};
 use crate::enums::ProtocolVersion;
-use crate::error::{
-    AlertDescription, EncryptedClientHelloError, Error, PeerMisbehaved, RejectedEch,
-};
+use crate::error::{EncryptedClientHelloError, Error, PeerMisbehaved, RejectedEch};
 use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
 use crate::log::{debug, trace, warn};
-use crate::msgs::base::PayloadU16;
-use crate::msgs::codec::{Codec, Reader};
-use crate::msgs::deframer::HandshakeAlignedProof;
-use crate::msgs::enums::ExtensionType;
-use crate::msgs::handshake::{
-    ClientExtensions, ClientHelloPayload, EchConfigContents, EchConfigPayload, Encoding,
-    EncryptedClientHello, EncryptedClientHelloOuter, HandshakeMessagePayload, HandshakePayload,
-    HelloRetryRequest, HpkeKeyConfig, PresharedKeyBinder, PresharedKeyOffer, Random,
-    ServerHelloPayload, ServerNamePayload,
+use crate::msgs::{
+    ClientExtensions, ClientHelloPayload, Codec, EchConfigContents, EchConfigPayload, Encoding,
+    EncryptedClientHello, EncryptedClientHelloOuter, ExtensionType, HandshakeAlignedProof,
+    HandshakeMessagePayload, HandshakePayload, HelloRetryRequest, HpkeKeyConfig, Message,
+    MessagePayload, PresharedKeyBinder, PresharedKeyOffer, Random, Reader, ServerHelloPayload,
+    ServerNamePayload, SizedPayload,
 };
-use crate::msgs::message::{Message, MessagePayload};
-use crate::msgs::persist;
-use crate::msgs::persist::Retrieved;
+use crate::tls13::Tls13CipherSuite;
 use crate::tls13::key_schedule::{
-    KeyScheduleEarly, KeyScheduleHandshakeStart, server_ech_hrr_confirmation_secret,
+    KeyScheduleEarlyClient, KeyScheduleHandshakeStart, server_ech_hrr_confirmation_secret,
 };
-use crate::{CommonState, Tls13CipherSuite};
 
 /// Controls how Encrypted Client Hello (ECH) is used in a client handshake.
 #[non_exhaustive]
@@ -56,7 +49,7 @@ pub enum EchMode {
 
 impl EchMode {
     /// Returns true if the ECH mode will use a FIPS approved HPKE suite.
-    pub fn fips(&self) -> bool {
+    pub fn fips(&self) -> FipsStatus {
         match self {
             Self::Enable(ech_config) => ech_config.suite.fips(),
             Self::Grease(grease_config) => grease_config.suite.fips(),
@@ -108,7 +101,7 @@ impl EchConfig {
         ech_config_list: EchConfigListBytes<'_>,
         hpke_suites: &[&'static dyn Hpke],
     ) -> Result<Self, Error> {
-        let ech_configs = Vec::<EchConfigPayload>::read(&mut Reader::init(&ech_config_list))
+        let ech_configs = Vec::<EchConfigPayload>::read(&mut Reader::new(&ech_config_list))
             .map_err(|_| {
                 Error::InvalidEncryptedClientHello(EncryptedClientHelloError::InvalidConfigList)
             })?;
@@ -134,23 +127,25 @@ impl EchConfig {
     pub(super) fn state(
         &self,
         server_name: ServerName<'static>,
+        protocol: Protocol,
         config: &ClientConfig,
     ) -> Result<EchState, Error> {
         EchState::new(
             self,
             server_name.clone(),
+            protocol,
             !config
-                .client_auth_cert_resolver
+                .resolver()
                 .supported_certificate_types()
                 .is_empty(),
-            config.provider.secure_random,
+            config.provider().secure_random,
             config.enable_sni,
         )
     }
 
     /// Compute the HPKE `SetupBaseS` `info` parameter for this ECH configuration.
     ///
-    /// See <https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-17#section-6.1>.
+    /// See <https://datatracker.ietf.org/doc/html/rfc9849#section-6.1>.
     pub(crate) fn hpke_info(&self) -> Vec<u8> {
         let mut info = Vec::with_capacity(128);
         // "tls ech" || 0x00 || ECHConfig
@@ -233,11 +228,12 @@ impl EchGreaseConfig {
 
     /// Build a GREASE ECH extension based on the placeholder configuration.
     ///
-    /// See <https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#name-grease-ech> for
+    /// See <https://datatracker.ietf.org/doc/html/rfc9849#name-grease-ech> for
     /// more information.
     pub(crate) fn grease_ext(
         &self,
         secure_random: &'static dyn SecureRandom,
+        protocol: Protocol,
         inner_name: ServerName<'static>,
         outer_hello: &ClientHelloPayload,
     ) -> Result<EncryptedClientHello, Error> {
@@ -257,7 +253,7 @@ impl EchGreaseConfig {
                     key_config: HpkeKeyConfig {
                         config_id: config_id[0],
                         kem_id: HpkeKem::DHKEM_P256_HKDF_SHA256,
-                        public_key: PayloadU16::new(self.placeholder_key.0.clone()),
+                        public_key: SizedPayload::from(self.placeholder_key.0.clone()),
                         symmetric_cipher_suites: vec![suite.sym],
                     },
                     maximum_name_length: 0,
@@ -267,6 +263,7 @@ impl EchGreaseConfig {
                 suite: self.suite,
             },
             inner_name,
+            protocol,
             false,
             secure_random,
             false, // Does not matter if we enable/disable SNI here. Inner hello is not used.
@@ -274,7 +271,7 @@ impl EchGreaseConfig {
 
         // Construct an inner hello using the outer hello - this allows us to know the size of
         // dummy payload we should use for the GREASE extension.
-        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, &None);
+        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, None);
 
         // Generate a payload of random data equivalent in length to a real inner hello.
         let payload_len = encoded_inner_hello.len()
@@ -292,17 +289,18 @@ impl EchGreaseConfig {
         Ok(EncryptedClientHello::Outer(EncryptedClientHelloOuter {
             cipher_suite: suite.sym,
             config_id: config_id[0],
-            enc: PayloadU16::new(grease_state.enc.0),
-            payload: PayloadU16::new(payload),
+            enc: SizedPayload::from(Payload::new(grease_state.enc.0)),
+            payload: SizedPayload::from(Payload::new(payload)),
         }))
     }
 }
 
 /// An enum representing ECH offer status.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 pub enum EchStatus {
     /// ECH was not offered - it is a normal TLS handshake.
+    #[default]
     NotOffered,
     /// GREASE ECH was sent. This is not considered offering ECH.
     Grease,
@@ -321,7 +319,7 @@ pub(crate) struct EchState {
     pub(crate) outer_name: DnsName<'static>,
     // If we're resuming in the inner hello, this is the early key schedule to use for encrypting
     // early data if the ECH offer is accepted.
-    pub(crate) early_data_key_schedule: Option<KeyScheduleEarly>,
+    pub(crate) early_data_key_schedule: Option<KeyScheduleEarlyClient>,
     // A random value we use for the inner hello.
     pub(crate) inner_hello_random: Random,
     // A transcript buffer maintained for the inner hello. Once ECH is confirmed we switch to
@@ -329,6 +327,8 @@ pub(crate) struct EchState {
     pub(crate) inner_hello_transcript: HandshakeHashBuffer,
     // A source of secure random data.
     secure_random: &'static dyn SecureRandom,
+    // The top level protocol
+    protocol: Protocol,
     // An HPKE sealer context that can be used for encrypting ECH data.
     sender: Box<dyn HpkeSealer>,
     // The ID of the ECH configuration we've chosen - this is included in the outer ECH extension.
@@ -354,6 +354,7 @@ impl EchState {
     pub(crate) fn new(
         config: &EchConfig,
         inner_name: ServerName<'static>,
+        protocol: Protocol,
         client_auth_enabled: bool,
         secure_random: &'static dyn SecureRandom,
         enable_sni: bool,
@@ -369,7 +370,7 @@ impl EchState {
         // we can use to seal messages.
         let (enc, sender) = config.suite.setup_sealer(
             &config.hpke_info(),
-            &HpkePublicKey(key_config.public_key.0.clone()),
+            &HpkePublicKey(key_config.public_key.to_vec()),
         )?;
 
         // Start a new transcript buffer for the inner hello.
@@ -379,17 +380,18 @@ impl EchState {
         }
 
         Ok(Self {
+            outer_name: config_contents.public_name.clone(),
+            early_data_key_schedule: None,
+            inner_hello_random: Random::new(secure_random)?,
+            inner_hello_transcript,
             secure_random,
             sender,
             config_id: key_config.config_id,
             inner_name,
-            outer_name: config_contents.public_name.clone(),
             maximum_name_length: config_contents.maximum_name_length,
             cipher_suite: config.suite.suite().sym,
+            protocol,
             enc,
-            inner_hello_random: Random::new(secure_random)?,
-            inner_hello_transcript,
-            early_data_key_schedule: None,
             enable_sni,
             sent_extensions: Vec::new(),
         })
@@ -407,7 +409,7 @@ impl EchState {
         &mut self,
         mut outer_hello: ClientHelloPayload,
         retry_req: Option<&HelloRetryRequest>,
-        resuming: &Option<Retrieved<&persist::Tls13ClientSessionValue>>,
+        resuming: Option<&Retrieved<&Tls13Session>>,
     ) -> Result<ClientHelloPayload, Error> {
         trace!(
             "Preparing ECH offer {}",
@@ -439,8 +441,8 @@ impl EchState {
             EncryptedClientHello::Outer(EncryptedClientHelloOuter {
                 cipher_suite: ctx.cipher_suite,
                 config_id: ctx.config_id,
-                enc: PayloadU16::new(enc),
-                payload: PayloadU16::new(payload),
+                enc: SizedPayload::from(Payload::new(enc)),
+                payload: SizedPayload::from(Payload::new(payload)),
             })
         }
 
@@ -470,7 +472,7 @@ impl EchState {
     /// Confirm whether an ECH offer was accepted based on examining the server hello.
     pub(crate) fn confirm_acceptance(
         self,
-        ks: &mut KeyScheduleHandshakeStart,
+        ks: &KeyScheduleHandshakeStart,
         server_hello: &ServerHelloPayload,
         server_hello_encoded: &Payload<'_>,
         hash: &'static dyn Hash,
@@ -519,7 +521,6 @@ impl EchState {
         &self,
         hrr: &HelloRetryRequest,
         cs: &Tls13CipherSuite,
-        common: &mut CommonState,
     ) -> Result<bool, Error> {
         // The client checks for the "encrypted_client_hello" extension.
         let ech_conf = match &hrr.encrypted_client_hello {
@@ -528,12 +529,7 @@ impl EchState {
             // Otherwise, if it has a length other than 8, the client aborts the
             // handshake with a "decode_error" alert.
             Some(ech_conf) if ech_conf.bytes().len() != 8 => {
-                return Err({
-                    common.send_fatal_alert(
-                        AlertDescription::DecodeError,
-                        PeerMisbehaved::IllegalHelloRetryRequestWithInvalidEch,
-                    )
-                });
+                return Err(PeerMisbehaved::IllegalHelloRetryRequestWithInvalidEch.into());
             }
             Some(ech_conf) => ech_conf,
         };
@@ -591,22 +587,18 @@ impl EchState {
         &mut self,
         outer_hello: &ClientHelloPayload,
         retryreq: Option<&HelloRetryRequest>,
-        resuming: &Option<Retrieved<&persist::Tls13ClientSessionValue>>,
+        resuming: Option<&Retrieved<&Tls13Session>>,
     ) -> Vec<u8> {
         // Start building an inner hello using the outer_hello as a template.
         let mut inner_hello = ClientHelloPayload {
             // Some information is copied over as-is.
             client_version: outer_hello.client_version,
-            session_id: outer_hello.session_id,
-            compression_methods: outer_hello.compression_methods.clone(),
-
-            // We will build up the included extensions ourselves.
-            extensions: Box::new(ClientExtensions::default()),
 
             // Set the inner hello random to the one we generated when creating the ECH state.
             // We hold on to the inner_hello_random in the ECH state to use later for confirming
             // whether ECH was accepted or not.
             random: self.inner_hello_random,
+            session_id: outer_hello.session_id,
 
             // We remove the empty renegotiation info SCSV from the outer hello's ciphersuite.
             // Similar to the TLS 1.2 specific extensions we will filter out, this is seen as a
@@ -614,9 +606,13 @@ impl EchState {
             cipher_suites: outer_hello
                 .cipher_suites
                 .iter()
-                .filter(|cs| **cs != TLS_EMPTY_RENEGOTIATION_INFO_SCSV)
+                .filter(|cs| **cs != CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV)
                 .copied()
                 .collect(),
+            compression_methods: outer_hello.compression_methods.clone(),
+
+            // We will build up the included extensions ourselves.
+            extensions: Box::new(ClientExtensions::default()),
         };
 
         inner_hello.order_seed = outer_hello.order_seed;
@@ -683,12 +679,10 @@ impl EchState {
         if let Some(resuming) = resuming.as_ref() {
             let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(inner_hello));
 
-            // Retain the early key schedule we get from processing the binder.
-            self.early_data_key_schedule = Some(tls13::fill_in_psk_binder(
-                resuming,
-                &self.inner_hello_transcript,
-                &mut chp,
-            ));
+            let key_schedule =
+                KeyScheduleEarlyClient::new(self.protocol, resuming.suite, resuming.secret.bytes());
+            tls13::fill_in_psk_binder(&key_schedule, &self.inner_hello_transcript, &mut chp);
+            self.early_data_key_schedule = Some(key_schedule);
 
             // fill_in_psk_binder works on an owned HandshakeMessagePayload, so we need to
             // extract our inner hello back out of it to retain ownership.
@@ -708,30 +702,25 @@ impl EchState {
 
         // Calculate padding
         // max_name_len = L
-        let max_name_len = self.maximum_name_length;
+        let max_name_len = usize::from(self.maximum_name_length);
         let max_name_len = if max_name_len > 0 { max_name_len } else { 255 };
 
-        let padding_len = match &self.inner_name {
-            ServerName::DnsName(name) => {
+        let name_padding_len = match &inner_hello.server_name {
+            Some(ServerNamePayload::SingleDnsName(name)) => {
                 // name.len() = D
                 // max(0, L - D)
-                core::cmp::max(
-                    0,
-                    max_name_len.saturating_sub(name.as_ref().len() as u8) as usize,
-                )
+                Ord::max(0, max_name_len.saturating_sub(name.as_ref().len()))
             }
-            _ => {
-                // L + 9
-                // "This is the length of a "server_name" extension with an L-byte name."
-                // We widen to usize here to avoid overflowing u8 + u8.
-                max_name_len as usize + 9
-            }
+            // L + 9
+            // "This is the length of a "server_name" extension with an L-byte name."
+            _ => max_name_len + 9,
         };
+        encoded_hello.extend(iter::repeat_n(0, name_padding_len));
 
         // Let L be the length of the EncodedClientHelloInner with all the padding computed so far
         // Let N = 31 - ((L - 1) % 32) and add N bytes of padding.
-        let padding_len = 31 - ((encoded_hello.len() + padding_len - 1) % 32);
-        encoded_hello.extend(vec![0; padding_len]);
+        let padding_len = 31 - ((encoded_hello.len() - 1) % 32);
+        encoded_hello.extend(iter::repeat_n(0, padding_len));
 
         // Construct the inner hello message that will be used for the transcript.
         let inner_hello_msg = Message {
@@ -759,13 +748,16 @@ impl EchState {
         encoded_hello
     }
 
-    // See https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#name-grease-psk
+    // See https://datatracker.ietf.org/doc/html/rfc9849#name-grease-psk
     fn grease_psk(&self, psk_offer: &mut PresharedKeyOffer) -> Result<(), Error> {
         for ident in psk_offer.identities.iter_mut() {
             // "For each PSK identity advertised in the ClientHelloInner, the
             // client generates a random PSK identity with the same length."
-            self.secure_random
-                .fill(&mut ident.identity.0)?;
+            match ident.identity.as_mut() {
+                Some(ident) => self.secure_random.fill(ident)?,
+                None => unreachable!(),
+            }
+
             // "It also generates a random, 32-bit, unsigned integer to use as
             // the obfuscated_ticket_age."
             let mut ticket_age = [0_u8; 4];
@@ -854,21 +846,14 @@ pub(crate) struct EchAccepted {
     pub(crate) sent_extensions: Vec<ExtensionType>,
 }
 
-pub(crate) fn fatal_alert_required(
-    retry_configs: Option<Vec<EchConfigPayload>>,
-    common: &mut CommonState,
-) -> Error {
-    common.send_fatal_alert(
-        AlertDescription::EncryptedClientHelloRequired,
-        RejectedEch { retry_configs },
-    )
-}
-
 #[cfg(test)]
 mod tests {
+    use std::string::String;
+
     use super::*;
-    use crate::crypto::CipherSuite;
-    use crate::msgs::handshake::{Random, ServerExtensions, SessionId};
+    use crate::crypto::hpke::{HpkeAead, HpkeKdf};
+    use crate::crypto::{CipherSuite, TEST_PROVIDER};
+    use crate::msgs::{Compression, Random, ServerExtensions, SessionId};
 
     #[test]
     fn server_hello_conf_alters_server_hello_random() {
@@ -877,7 +862,7 @@ mod tests {
             random: Random([0xffu8; 32]),
             session_id: SessionId::empty(),
             cipher_suite: CipherSuite::TLS13_AES_256_GCM_SHA384,
-            compression_method: crate::msgs::enums::Compression::Null,
+            compression_method: Compression::Null,
             extensions: Box::new(ServerExtensions::default()),
         };
         let message = Message {
@@ -922,5 +907,182 @@ mod tests {
             "020000280303ffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000001302000000",
             "                          afterwards those bytes are zeroed ^^^^^^^^^^^^^^^^            "
         );
+    }
+
+    #[test]
+    fn inner_client_hello_length_conceals_inner_name_length() {
+        let base_inner_len = inner_hello_encoding_for_name(dns_name_of_len(1), true).len();
+        assert!(
+            base_inner_len % 32 == 0,
+            "inner hello length must be 32-byte padded"
+        );
+        assert!(
+            base_inner_len >= 256,
+            "inner hello must include inner name and its padding"
+        );
+
+        for inner_name_len in 1..251 {
+            assert_eq!(
+                inner_hello_encoding_for_name(dns_name_of_len(inner_name_len), true).len(),
+                base_inner_len,
+                "all inner hello lengths must be invariant wrt inner name length"
+            );
+        }
+    }
+
+    #[test]
+    fn inner_client_hello_length_does_not_leak_length_of_omitted_inner_name() {
+        let base_inner_len = inner_hello_encoding_for_name(dns_name_of_len(1), false).len();
+        assert!(
+            base_inner_len % 32 == 0,
+            "inner hello length must be 32-byte padded"
+        );
+        assert!(
+            base_inner_len >= 256,
+            "inner hello must include maximum_name_length bytes of padding"
+        );
+
+        for inner_name_len in 1..251 {
+            assert_eq!(
+                inner_hello_encoding_for_name(dns_name_of_len(inner_name_len), false).len(),
+                base_inner_len,
+                "all inner hello lengths must be invariant wrt inner name length"
+            );
+        }
+    }
+
+    fn inner_hello_encoding_for_name(name: DnsName<'static>, enable_sni: bool) -> Vec<u8> {
+        let config = EchConfig {
+            config: EchConfigPayload::V18(EchConfigContents {
+                key_config: HpkeKeyConfig {
+                    config_id: 0,
+                    kem_id: MockHpke::SUITE.kem,
+                    public_key: vec![0; 32].into(),
+                    symmetric_cipher_suites: vec![],
+                },
+                maximum_name_length: 255,
+                public_name: DnsName::try_from("public").unwrap(),
+                extensions: vec![],
+            }),
+            suite: &MockHpke,
+        };
+
+        EchState::new(
+            &config,
+            ServerName::from(name.clone()),
+            Protocol::Tcp,
+            false,
+            TEST_PROVIDER.secure_random,
+            enable_sni,
+        )
+        .unwrap()
+        .encode_inner_hello(
+            &ClientHelloPayload {
+                client_version: ProtocolVersion::TLSv1_3,
+                random: Random([0u8; 32]),
+                session_id: SessionId::empty(),
+                cipher_suites: vec![],
+                compression_methods: vec![Compression::Null],
+                extensions: Box::new(ClientExtensions {
+                    server_name: Some(ServerNamePayload::from(&name)),
+                    ..Default::default()
+                }),
+            },
+            None,
+            None,
+        )
+    }
+
+    fn dns_name_of_len(mut len: usize) -> DnsName<'static> {
+        let mut s = String::new();
+        let labels = len.div_ceil(63);
+        for _ in 0..labels {
+            let chars = Ord::min(len, 63);
+            len -= chars;
+            for _ in 0..chars {
+                s.push('a');
+            }
+            if len != 0 {
+                s.push('.');
+            }
+        }
+        DnsName::try_from(s).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct MockHpke;
+
+    impl MockHpke {
+        const SUITE: HpkeSuite = HpkeSuite {
+            kem: HpkeKem::DHKEM_P256_HKDF_SHA256,
+            sym: HpkeSymmetricCipherSuite {
+                kdf_id: HpkeKdf::HKDF_SHA256,
+                aead_id: HpkeAead::AES_128_GCM,
+            },
+        };
+    }
+
+    impl Hpke for MockHpke {
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        fn seal(
+            &self,
+            _info: &[u8],
+            _aad: &[u8],
+            _plaintext: &[u8],
+            _pub_key: &HpkePublicKey,
+        ) -> Result<(EncapsulatedSecret, Vec<u8>), Error> {
+            todo!()
+        }
+
+        fn setup_sealer(
+            &self,
+            _info: &[u8],
+            _pub_key: &HpkePublicKey,
+        ) -> Result<(EncapsulatedSecret, Box<dyn HpkeSealer + 'static>), Error> {
+            Ok((EncapsulatedSecret(vec![]), Box::new(MockHpkeSealer)))
+        }
+
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        fn open(
+            &self,
+            _enc: &EncapsulatedSecret,
+            _info: &[u8],
+            _aad: &[u8],
+            _ciphertext: &[u8],
+            _secret_key: &crate::crypto::hpke::HpkePrivateKey,
+        ) -> Result<Vec<u8>, Error> {
+            todo!()
+        }
+
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        fn setup_opener(
+            &self,
+            _enc: &EncapsulatedSecret,
+            _info: &[u8],
+            _secret_key: &crate::crypto::hpke::HpkePrivateKey,
+        ) -> Result<Box<dyn crate::crypto::hpke::HpkeOpener + 'static>, Error> {
+            todo!()
+        }
+
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        fn generate_key_pair(
+            &self,
+        ) -> Result<(HpkePublicKey, crate::crypto::hpke::HpkePrivateKey), Error> {
+            todo!()
+        }
+
+        fn suite(&self) -> HpkeSuite {
+            Self::SUITE
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockHpkeSealer;
+
+    impl HpkeSealer for MockHpkeSealer {
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        fn seal(&mut self, _aad: &[u8], _plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+            todo!()
+        }
     }
 }

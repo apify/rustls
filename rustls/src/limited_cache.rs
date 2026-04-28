@@ -1,5 +1,6 @@
 use alloc::collections::VecDeque;
 use core::borrow::Borrow;
+use core::fmt::Debug;
 use core::hash::Hash;
 
 use crate::hash_map::{Entry, HashMap};
@@ -12,53 +13,14 @@ use crate::hash_map::{Entry, HashMap};
 /// storage.
 ///
 /// This is inefficient: it stores keys twice.
-pub(crate) struct LimitedCache<K: Clone + Hash + Eq, V> {
+pub(crate) struct LimitedCache<K, V> {
     map: HashMap<K, V>,
 
     // first item is the oldest key
     oldest: VecDeque<K>,
 }
 
-impl<K, V> LimitedCache<K, V>
-where
-    K: Eq + Hash + Clone + core::fmt::Debug,
-    V: Default,
-{
-    pub(crate) fn get_or_insert_default_and_edit(&mut self, k: K, edit: impl FnOnce(&mut V)) {
-        let inserted_new_item = match self.map.entry(k) {
-            Entry::Occupied(value) => {
-                edit(value.into_mut());
-                false
-            }
-            entry @ Entry::Vacant(_) => {
-                self.oldest
-                    .push_back(entry.key().clone());
-                edit(entry.or_insert_with(V::default));
-                true
-            }
-        };
-
-        // ensure next insertion does not require a realloc
-        if inserted_new_item && self.oldest.capacity() == self.oldest.len() {
-            if let Some(oldest_key) = self.oldest.pop_front() {
-                self.map.remove(&oldest_key);
-            }
-        }
-    }
-
-    pub(crate) fn get_mut<Q: Hash + Eq + ?Sized>(&mut self, k: &Q) -> Option<&mut V>
-    where
-        K: Borrow<Q>,
-    {
-        self.map.get_mut(k)
-    }
-}
-
-impl<K, V> LimitedCache<K, V>
-where
-    K: Eq + Hash + Clone + core::fmt::Debug,
-    V: Default,
-{
+impl<K: Eq + Hash + Clone + Debug, V> LimitedCache<K, V> {
     /// Create a new LimitedCache with the given rough capacity.
     pub(crate) fn new(capacity_order_of_magnitude: usize) -> Self {
         Self {
@@ -91,6 +53,13 @@ where
         }
     }
 
+    pub(crate) fn get_mut<Q: Hash + Eq + ?Sized>(&mut self, k: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+    {
+        self.map.get_mut(k)
+    }
+
     pub(crate) fn get<Q: Hash + Eq + ?Sized>(&self, k: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
@@ -117,9 +86,33 @@ where
     }
 }
 
+impl<K: Eq + Hash + Clone + Debug, V: Default> LimitedCache<K, V> {
+    pub(crate) fn get_or_insert_default_and_edit(&mut self, k: K, edit: impl FnOnce(&mut V)) {
+        let inserted_new_item = match self.map.entry(k) {
+            Entry::Occupied(value) => {
+                edit(value.into_mut());
+                false
+            }
+            entry @ Entry::Vacant(_) => {
+                self.oldest
+                    .push_back(entry.key().clone());
+                edit(entry.or_insert_with(V::default));
+                true
+            }
+        };
+
+        // ensure next insertion does not require a realloc
+        if inserted_new_item && self.oldest.capacity() == self.oldest.len() {
+            if let Some(oldest_key) = self.oldest.pop_front() {
+                self.map.remove(&oldest_key);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::prelude::v1::*;
+    use alloc::string::String;
 
     type Test = super::LimitedCache<String, usize>;
 

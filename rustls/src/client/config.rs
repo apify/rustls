@@ -1,32 +1,33 @@
 use alloc::vec::Vec;
+use core::any::Any;
 use core::fmt;
+use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 
-use pki_types::{PrivateKeyDer, ServerName, UnixTime};
+#[cfg(feature = "webpki")]
+use pki_types::PrivateKeyDer;
+use pki_types::{FipsStatus, ServerName, UnixTime};
 
 use super::ech::EchMode;
-#[cfg(feature = "std")]
-use super::handy::ClientSessionMemoryCache;
-use super::handy::{FailResolveClientCert, NoClientSessionStorage};
+use super::handy::{ClientSessionMemoryCache, FailResolveClientCert, NoClientSessionStorage};
+use super::{Tls12Session, Tls13Session};
 use crate::builder::{ConfigBuilder, WantsVerifier};
+use crate::client::connection::ClientConnectionBuilder;
 #[cfg(doc)]
 use crate::crypto;
 use crate::crypto::kx::NamedGroup;
-use crate::crypto::{
-    CipherSuite, Credentials, CryptoProvider, Identity, SelectedCredential, SignatureScheme,
-    SingleCredential,
-};
-use crate::enums::{CertificateType, ProtocolVersion};
+use crate::crypto::{CipherSuite, CryptoProvider, SelectedCredential, SignatureScheme, hash};
+#[cfg(feature = "webpki")]
+use crate::crypto::{Credentials, Identity, SingleCredential};
+use crate::enums::{ApplicationProtocol, CertificateType, ProtocolVersion};
 use crate::error::{ApiMisuse, Error};
 use crate::key_log::NoKeyLog;
-use crate::msgs::persist;
 use crate::suites::SupportedCipherSuite;
 use crate::sync::Arc;
-#[cfg(feature = "std")]
-use crate::time_provider::DefaultTimeProvider;
-use crate::time_provider::TimeProvider;
+use crate::time_provider::{DefaultTimeProvider, TimeProvider};
+#[cfg(feature = "webpki")]
 use crate::webpki::{self, WebPkiServerVerifier};
-use crate::{DistinguishedName, KeyLog, compress, verify};
+use crate::{DistinguishedName, DynHasher, KeyLog, compress, verify};
 
 /// Common configuration for (typically) all connections made by a program.
 ///
@@ -60,7 +61,12 @@ use crate::{DistinguishedName, KeyLog, compress, verify};
 pub struct ClientConfig {
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.
-    pub alpn_protocols: Vec<Vec<u8>>,
+    pub alpn_protocols: Vec<ApplicationProtocol<'static>>,
+
+    /// Whether to check the selected ALPN was offered.
+    ///
+    /// The default is true.
+    pub check_selected_alpn: bool,
 
     /// How and when the client can resume a previous session.
     ///
@@ -71,31 +77,32 @@ pub struct ClientConfig {
     ///
     /// However, resumption is only allowed between two `ClientConfig`s if their
     /// `client_auth_cert_resolver` (ie, potential client authentication credentials)
-    /// and `verifier` (ie, server certificate verification settings) are
-    /// the same (according to `Arc::ptr_eq`).
+    /// and `verifier` (ie, server certificate verification settings):
+    ///
+    /// - are the same type (determined by hashing their `TypeId`), and
+    /// - input the same data into [`ServerVerifier::hash_config()`] and
+    ///   [`ClientCredentialResolver::hash_config()`].
     ///
     /// To illustrate, imagine two `ClientConfig`s `A` and `B`.  `A` fully validates
     /// the server certificate, `B` does not.  If `A` and `B` shared a resumption store,
     /// it would be possible for a session originated by `B` to be inserted into the
     /// store, and then resumed by `A`.  This would give a false impression to the user
     /// of `A` that the server certificate is fully validated.
+    ///
+    /// [`ServerVerifier::hash_config()`]: verify::ServerVerifier::hash_config()
     pub resumption: Resumption,
 
     /// The maximum size of plaintext input to be emitted in a single TLS record.
     /// A value of None is equivalent to the [TLS maximum] of 16 kB.
     ///
     /// rustls enforces an arbitrary minimum of 32 bytes for this field.
-    /// Out of range values are reported as errors from [ClientConnection::new].
+    /// Out of range values are reported as errors when initializing a connection.
     ///
     /// Setting this value to a little less than the TCP MSS may improve latency
     /// for stream-y workloads.
     ///
     /// [TLS maximum]: https://datatracker.ietf.org/doc/html/rfc8446#section-5.1
-    /// [ClientConnection::new]: crate::client::ClientConnection::new
     pub max_fragment_size: Option<usize>,
-
-    /// How to decide what client auth certificate/keys to use.
-    pub client_auth_cert_resolver: Arc<dyn ClientCredentialResolver>,
 
     /// Whether to send the Server Name Indication (SNI) extension
     /// during the client handshake.
@@ -120,8 +127,8 @@ pub struct ClientConfig {
     /// If set to `true`, requires the server to support the extended
     /// master secret extraction method defined in [RFC 7627].
     ///
-    /// The default is `true` if the `fips` crate feature is enabled,
-    /// `false` otherwise.
+    /// The default is `true` if the configured [`CryptoProvider`] is FIPS-compliant,
+    /// false otherwise.
     ///
     /// It must be set to `true` to meet FIPS requirement mentioned in section
     /// **D.Q Transition of the TLS 1.2 KDF to Support the Extended Master
@@ -131,14 +138,8 @@ pub struct ClientConfig {
     /// [FIPS 140-3 IG.pdf]: https://csrc.nist.gov/csrc/media/Projects/cryptographic-module-validation-program/documents/fips%20140-3/FIPS%20140-3%20IG.pdf
     pub require_ems: bool,
 
-    /// Provides the current system time
-    pub time_provider: Arc<dyn TimeProvider>,
-
-    /// Source of randomness and other crypto.
-    pub(crate) provider: Arc<CryptoProvider>,
-
-    /// How to verify the server certificate chain.
-    pub(super) verifier: Arc<dyn verify::ServerVerifier>,
+    /// Items that affect the fundamental security properties of a connection.
+    pub(super) domain: SecurityDomain,
 
     /// How to decompress the server's certificate chain.
     ///
@@ -180,7 +181,6 @@ impl ClientConfig {
     /// This will use the provider's configured ciphersuites.
     ///
     /// For more information, see the [`ConfigBuilder`] documentation.
-    #[cfg(feature = "std")]
     pub fn builder(provider: Arc<CryptoProvider>) -> ConfigBuilder<Self, WantsVerifier> {
         Self::builder_with_details(provider, Arc::new(DefaultTimeProvider))
     }
@@ -208,25 +208,16 @@ impl ClientConfig {
         }
     }
 
-    /// Return true if connections made with this `ClientConfig` will
-    /// operate in FIPS mode.
+    /// Create a new client connection builder for the given server name.
     ///
-    /// This is different from [`CryptoProvider::fips()`]: [`CryptoProvider::fips()`]
-    /// is concerned only with cryptography, whereas this _also_ covers TLS-level
-    /// configuration that NIST recommends, as well as ECH HPKE suites if applicable.
-    pub fn fips(&self) -> bool {
-        let mut is_fips = self.provider.fips() && self.require_ems;
-
-        if let Some(ech_mode) = &self.ech_mode {
-            is_fips = is_fips && ech_mode.fips();
+    /// The `ClientConfig` controls how the client behaves;
+    /// `name` is the name of server we want to talk to.
+    pub fn connect(self: &Arc<Self>, server_name: ServerName<'static>) -> ClientConnectionBuilder {
+        ClientConnectionBuilder {
+            config: self.clone(),
+            name: server_name,
+            alpn_protocols: None,
         }
-
-        is_fips
-    }
-
-    /// Return the crypto provider used to construct this client configuration.
-    pub fn crypto_provider(&self) -> &Arc<CryptoProvider> {
-        &self.provider
     }
 
     /// Access configuration options whose use is dangerous and requires
@@ -235,87 +226,152 @@ impl ClientConfig {
         danger::DangerousClientConfig { cfg: self }
     }
 
-    pub(super) fn needs_key_share(&self) -> bool {
-        self.supports_version(ProtocolVersion::TLSv1_3)
+    /// Return the FIPS validation status for connections made with this configuration.
+    ///
+    /// This is different from [`CryptoProvider::fips()`]: [`CryptoProvider::fips()`]
+    /// is concerned only with cryptography, whereas this _also_ covers TLS-level
+    /// configuration that NIST recommends, as well as ECH HPKE suites if applicable.
+    pub fn fips(&self) -> FipsStatus {
+        if !self.require_ems {
+            return FipsStatus::Unvalidated;
+        }
+
+        let status = self.domain.provider.fips();
+        match &self.ech_mode {
+            Some(ech) => Ord::min(status, ech.fips()),
+            None => status,
+        }
+    }
+
+    /// Return the crypto provider used to construct this client configuration.
+    pub fn provider(&self) -> &Arc<CryptoProvider> {
+        &self.domain.provider
+    }
+
+    /// Return the resolver for this client configuration.
+    ///
+    /// This is the object that determines which credentials to use for client
+    /// authentication.
+    pub fn resolver(&self) -> &Arc<dyn ClientCredentialResolver> {
+        &self.domain.client_auth_cert_resolver
+    }
+
+    /// Return the resolver for this client configuration.
+    ///
+    /// This is the object that determines which credentials to use for client
+    /// authentication.
+    pub fn verifier(&self) -> &Arc<dyn verify::ServerVerifier> {
+        &self.domain.verifier
     }
 
     pub(crate) fn supports_version(&self, v: ProtocolVersion) -> bool {
-        self.provider.supports_version(v)
+        self.domain.provider.supports_version(v)
     }
 
     pub(super) fn find_cipher_suite(&self, suite: CipherSuite) -> Option<SupportedCipherSuite> {
-        self.provider
+        self.domain
+            .provider
             .iter_cipher_suites()
             .find(|&scs| scs.suite() == suite)
     }
 
     pub(super) fn current_time(&self) -> Result<UnixTime, Error> {
-        self.time_provider
+        self.domain
+            .time_provider
             .current_time()
             .ok_or(Error::FailedToGetCurrentTime)
     }
+
+    /// A hash which partitions this config's use of the [`Self::resumption`] store.
+    pub(super) fn config_hash(&self) -> [u8; 32] {
+        self.domain.config_hash
+    }
 }
 
-/// A trait for the ability to store client session data, so that sessions
-/// can be resumed in future connections.
+struct HashAdapter<'a>(&'a mut dyn hash::Context);
+
+impl Hasher for HashAdapter<'_> {
+    fn finish(&self) -> u64 {
+        // SAFETY: this is private to `SecurityDomain::new`, which guarantees `hash::Output`
+        // is at least 32 bytes.
+        u64::from_be_bytes(
+            self.0.fork_finish().as_ref()[..8]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes)
+    }
+}
+
+/// Client session data store for possible future resumption.
 ///
-/// Generally all data in this interface should be treated as
-/// **highly sensitive**, containing enough key material to break all security
-/// of the corresponding session.
+/// All data in this interface should be treated as **highly sensitive**, containing enough key
+/// material to break all security of the corresponding session.
 ///
 /// `set_`, `insert_`, `remove_` and `take_` operations are mutating; this isn't
 /// expressed in the type system to allow implementations freedom in
 /// how to achieve interior mutability.  `Mutex` is a common choice.
 pub trait ClientSessionStore: fmt::Debug + Send + Sync {
     /// Remember what `NamedGroup` the given server chose.
-    fn set_kx_hint(&self, server_name: ServerName<'static>, group: NamedGroup);
+    fn set_kx_hint(&self, key: ClientSessionKey<'static>, group: NamedGroup);
 
-    /// This should return the value most recently passed to `set_kx_hint`
-    /// for the given `server_name`.
+    /// Value most recently passed to `set_kx_hint` for the given `key`.
     ///
-    /// If `None` is returned, the caller chooses the first configured group,
-    /// and an extra round trip might happen if that choice is unsatisfactory
-    /// to the server.
-    fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup>;
+    /// If `None` is returned, the caller chooses the first configured group, and an extra round
+    /// trip might happen if that choice is unsatisfactory to the server.
+    fn kx_hint(&self, key: &ClientSessionKey<'_>) -> Option<NamedGroup>;
 
-    /// Remember a TLS1.2 session.
+    /// Remember a TLS1.2 session, allowing resumption of this connection in the future.
     ///
-    /// At most one of these can be remembered at a time, per `server_name`.
-    fn set_tls12_session(
-        &self,
-        server_name: ServerName<'static>,
-        value: persist::Tls12ClientSessionValue,
-    );
+    /// At most one of these per session key can be remembered at a time.
+    fn set_tls12_session(&self, key: ClientSessionKey<'static>, value: Tls12Session);
 
-    /// Get the most recently saved TLS1.2 session for `server_name` provided to `set_tls12_session`.
-    fn tls12_session(
-        &self,
-        server_name: &ServerName<'_>,
-    ) -> Option<persist::Tls12ClientSessionValue>;
+    /// Get the most recently saved TLS1.2 session for `key` provided to `set_tls12_session`.
+    fn tls12_session(&self, key: &ClientSessionKey<'_>) -> Option<Tls12Session>;
 
-    /// Remove and forget any saved TLS1.2 session for `server_name`.
-    fn remove_tls12_session(&self, server_name: &ServerName<'static>);
+    /// Remove and forget any saved TLS1.2 session for `key`.
+    fn remove_tls12_session(&self, key: &ClientSessionKey<'static>);
 
-    /// Remember a TLS1.3 ticket that might be retrieved later from `take_tls13_ticket`, allowing
-    /// resumption of this session.
+    /// Remember a TLS1.3 ticket, allowing resumption of this connection in the future.
     ///
     /// This can be called multiple times for a given session, allowing multiple independent tickets
     /// to be valid at once.  The number of times this is called is controlled by the server, so
     /// implementations of this trait should apply a reasonable bound of how many items are stored
     /// simultaneously.
-    fn insert_tls13_ticket(
-        &self,
-        server_name: ServerName<'static>,
-        value: persist::Tls13ClientSessionValue,
-    );
+    fn insert_tls13_ticket(&self, key: ClientSessionKey<'static>, value: Tls13Session);
 
-    /// Return a TLS1.3 ticket previously provided to `add_tls13_ticket`.
+    /// Return a TLS1.3 ticket previously provided to `insert_tls13_ticket()`.
     ///
-    /// Implementations of this trait must return each value provided to `add_tls13_ticket` _at most once_.
-    fn take_tls13_ticket(
-        &self,
-        server_name: &ServerName<'static>,
-    ) -> Option<persist::Tls13ClientSessionValue>;
+    /// Implementations of this trait must return each value provided to `insert_tls13_ticket()` _at most once_.
+    fn take_tls13_ticket(&self, key: &ClientSessionKey<'static>) -> Option<Tls13Session>;
+}
+
+/// Identifies a security context and server in the [`ClientSessionStore`] interface.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub struct ClientSessionKey<'a> {
+    /// A hash to partition the client storage between different security domains.
+    pub config_hash: [u8; 32],
+
+    /// Transport-level identity of the server.
+    pub server_name: ServerName<'a>,
+}
+
+impl ClientSessionKey<'_> {
+    /// Copy the value to own its contents.
+    pub fn to_owned(&self) -> ClientSessionKey<'static> {
+        let Self {
+            config_hash,
+            server_name,
+        } = self;
+        ClientSessionKey {
+            config_hash: *config_hash,
+            server_name: server_name.to_owned(),
+        }
+    }
 }
 
 /// A trait for the ability to choose a certificate chain and
@@ -347,6 +403,9 @@ pub trait ClientCredentialResolver: fmt::Debug + Send + Sync {
     ///
     /// See [RFC 7250](https://tools.ietf.org/html/rfc7250) for more information.
     fn supported_certificate_types(&self) -> &'static [CertificateType];
+
+    /// Instance configuration should be input to `h`.
+    fn hash_config(&self, h: &mut dyn Hasher);
 }
 
 /// Context from the server to inform client credential selection.
@@ -386,6 +445,91 @@ impl CredentialRequest<'_> {
     }
 }
 
+/// Items that affect the fundamental security properties of a connection.
+///
+/// This is its own type because `config_hash` depends on the other fields:
+/// fields therefore should not be mutated, but an entire object created
+/// through [`Self::new`] for any edits.
+#[derive(Clone, Debug)]
+pub(super) struct SecurityDomain {
+    /// Provides the current system time
+    time_provider: Arc<dyn TimeProvider>,
+
+    /// Source of randomness and other crypto.
+    provider: Arc<CryptoProvider>,
+
+    /// How to verify the server certificate chain.
+    verifier: Arc<dyn verify::ServerVerifier>,
+
+    /// How to decide what client auth certificate/keys to use.
+    client_auth_cert_resolver: Arc<dyn ClientCredentialResolver>,
+
+    config_hash: [u8; 32],
+}
+
+impl SecurityDomain {
+    pub(crate) fn new(
+        provider: Arc<CryptoProvider>,
+        client_auth_cert_resolver: Arc<dyn ClientCredentialResolver + 'static>,
+        verifier: Arc<dyn verify::ServerVerifier + 'static>,
+        time_provider: Arc<dyn TimeProvider + 'static>,
+    ) -> Self {
+        // Use a hash function that outputs at least 32 bytes.
+        let hash = provider
+            .iter_cipher_suites()
+            .map(|cs| cs.hash_provider())
+            .find(|h| h.output_len() >= 32)
+            .expect("no suitable cipher suite available (with |H| >= 32)"); // this is -- in practice -- all cipher suites
+
+        let mut h = hash.start();
+        let mut adapter = HashAdapter(h.as_mut());
+
+        // Include TypeId of impl, so two different types with different non-configured
+        // behavior do not collide even if their `hash_config()`s are the same.
+        client_auth_cert_resolver
+            .type_id()
+            .hash(&mut DynHasher(&mut adapter));
+        client_auth_cert_resolver.hash_config(&mut adapter);
+
+        verifier
+            .type_id()
+            .hash(&mut DynHasher(&mut adapter));
+        verifier.hash_config(&mut adapter);
+
+        time_provider
+            .type_id()
+            .hash(&mut DynHasher(&mut adapter));
+
+        let config_hash = h.finish().as_ref()[..32]
+            .try_into()
+            .unwrap();
+
+        Self {
+            time_provider,
+            provider,
+            verifier,
+            client_auth_cert_resolver,
+            config_hash,
+        }
+    }
+
+    fn with_verifier(&self, verifier: Arc<dyn verify::ServerVerifier + 'static>) -> Self {
+        let Self {
+            time_provider,
+            provider,
+            verifier: _,
+            client_auth_cert_resolver,
+            config_hash: _,
+        } = self;
+        Self::new(
+            provider.clone(),
+            client_auth_cert_resolver.clone(),
+            verifier,
+            time_provider.clone(),
+        )
+    }
+}
+
 /// Configuration for how/when a client is allowed to resume a previous session.
 #[derive(Clone, Debug)]
 pub struct Resumption {
@@ -402,7 +546,6 @@ impl Resumption {
     ///
     /// This is the default `Resumption` choice, and enables resuming a TLS 1.2 session with
     /// a session id or RFC 5077 ticket.
-    #[cfg(feature = "std")]
     pub fn in_memory_sessions(num: usize) -> Self {
         Self {
             store: Arc::new(ClientSessionMemoryCache::new(num)),
@@ -442,13 +585,7 @@ impl Default for Resumption {
     /// Create an in-memory session store resumption with up to 256 server names, allowing
     /// a TLS 1.2 session to resume with a session id or RFC 5077 ticket.
     fn default() -> Self {
-        #[cfg(feature = "std")]
-        let ret = Self::in_memory_sessions(256);
-
-        #[cfg(not(feature = "std"))]
-        let ret = Self::disabled();
-
-        ret
+        Self::in_memory_sessions(256)
     }
 }
 
@@ -483,6 +620,7 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
     /// +   .build()?
     /// + )
     /// ```
+    #[cfg(feature = "webpki")]
     pub fn with_root_certificates(
         self,
         root_store: impl Into<Arc<webpki::RootCertStore>>,
@@ -499,6 +637,7 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
     ///
     /// See [`webpki::WebPkiServerVerifier::builder`] and
     /// [`webpki::WebPkiServerVerifier::builder`] for more information.
+    #[cfg(feature = "webpki")]
     pub fn with_webpki_verifier(
         self,
         verifier: Arc<WebPkiServerVerifier>,
@@ -556,6 +695,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
     /// all three encodings, but other `CryptoProviders` may not.
     ///
     /// This function fails if `key_der` is invalid.
+    #[cfg(feature = "webpki")]
     pub fn with_client_auth_cert(
         self,
         identity: Arc<Identity<'static>>,
@@ -592,22 +732,26 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             };
         }
 
+        let require_ems = !matches!(self.provider.fips(), FipsStatus::Unvalidated);
         Ok(ClientConfig {
-            provider: self.provider,
             alpn_protocols: Vec::new(),
+            check_selected_alpn: true,
             resumption: Resumption::default(),
             max_fragment_size: None,
-            client_auth_cert_resolver,
             enable_sni: true,
-            verifier: self.state.verifier,
             key_log: Arc::new(NoKeyLog {}),
             enable_secret_extraction: false,
             enable_early_data: false,
-            require_ems: cfg!(feature = "fips"),
-            time_provider: self.time_provider,
+            require_ems,
+            domain: SecurityDomain::new(
+                self.provider,
+                client_auth_cert_resolver,
+                self.state.verifier,
+                self.time_provider,
+            ),
+            cert_decompressors: compress::default_cert_decompressors().to_vec(),
             cert_compressors: compress::default_cert_compressors().to_vec(),
             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
-            cert_decompressors: compress::default_cert_decompressors().to_vec(),
             ech_mode: self.state.client_ech_mode,
         })
     }
@@ -633,7 +777,7 @@ pub(super) mod danger {
     impl DangerousClientConfig<'_> {
         /// Overrides the default `ServerVerifier` with something else.
         pub fn set_certificate_verifier(&mut self, verifier: Arc<dyn ServerVerifier>) {
-            self.cfg.verifier = verifier;
+            self.cfg.domain = self.cfg.domain.with_verifier(verifier);
         }
     }
 

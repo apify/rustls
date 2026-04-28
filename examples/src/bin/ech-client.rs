@@ -35,19 +35,20 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 
 use clap::Parser;
-use hickory_resolver::config::ResolverConfig;
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::config::{CLOUDFLARE, GOOGLE, ResolverConfig};
+use hickory_resolver::net::NetError;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
 use hickory_resolver::proto::rr::{RData, RecordType};
-use hickory_resolver::{ResolveError, Resolver, TokioResolver};
+use hickory_resolver::{Resolver, TokioResolver};
 use log::trace;
-use rustls::RootCertStore;
 use rustls::client::{EchConfig, EchGreaseConfig, EchMode, EchStatus};
-use rustls::crypto::aws_lc_rs;
-use rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES;
 use rustls::crypto::hpke::Hpke;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, EchConfigListBytes, ServerName};
+use rustls::{ClientConfig, Connection, RootCertStore};
+use rustls_aws_lc_rs::hpke::ALL_SUPPORTED_SUITES;
+use rustls_util::{KeyLogFile, Stream};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -55,22 +56,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let server_ech_configs = match (args.grease, args.ech_config) {
         (true, Some(_)) => return Err("cannot specify both --grease and --ech-config".into()),
-        (true, None) => {
-            Vec::new() // Force the use of the GREASE ext by skipping ECH config lookup
-        }
-        (false, Some(path)) => {
-            vec![read_ech(&path)?]
-        }
+        // Force the use of the GREASE ext by skipping ECH config lookup
+        (true, None) => Vec::new(),
+        (false, Some(path)) => vec![read_ech(&path)?],
+        // Find raw ECH configs using DNS-over-HTTPS with Hickory DNS.
         (false, None) => {
-            // Find raw ECH configs using DNS-over-HTTPS with Hickory DNS.
-            let resolver_config = if args.use_cloudflare_dns {
-                ResolverConfig::cloudflare_https()
-            } else {
-                ResolverConfig::google_https()
-            };
+            let resolver_config = ResolverConfig::https(match args.use_cloudflare_dns {
+                true => &CLOUDFLARE,
+                false => &GOOGLE,
+            });
+
             lookup_ech_configs(
-                &Resolver::builder_with_config(resolver_config, TokioConnectionProvider::default())
-                    .build(),
+                &Resolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
+                    .build()?,
                 &args.inner_hostname,
                 args.port,
             )
@@ -114,13 +112,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // Construct a rustls client config with a TLS1.3-only provider, and ECH enabled.
-    let mut config = rustls::ClientConfig::builder(aws_lc_rs::DEFAULT_TLS13_PROVIDER.into())
+    let mut config = ClientConfig::builder(rustls_aws_lc_rs::DEFAULT_TLS13_PROVIDER.into())
         .with_ech(ech_mode)
         .with_root_certificates(root_store)
         .with_no_client_auth()?;
 
     // Allow using SSLKEYLOGFILE.
-    config.key_log = Arc::new(rustls::KeyLogFile::new());
+    config.key_log = Arc::new(KeyLogFile::new());
     let config = Arc::new(config);
 
     // The "inner" SNI that we're really trying to reach.
@@ -128,18 +126,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     for i in 0..args.num_reqs {
         trace!("\nRequest {} of {}", i + 1, args.num_reqs);
-        let mut conn = rustls::ClientConnection::new(config.clone(), server_name.clone())?;
+        let mut conn = config
+            .connect(server_name.clone())
+            .build()?;
         // The "outer" server that we're connecting to.
         let sock_addr = (args.outer_hostname.as_str(), args.port)
             .to_socket_addrs()?
             .next()
             .ok_or("cannot resolve hostname")?;
         let mut sock = TcpStream::connect(sock_addr)?;
-        let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+        let mut tls = Stream::new(&mut conn, &mut sock);
 
+        // Trim a leading '/' from the user-supplied path so we never emit a request line
+        // like `GET //foo HTTP/1.1`.
+        let path = args.path.trim_start_matches('/');
         let request = format!(
-            "GET /{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept-Encoding: identity\r\n\r\n",
-            args.path,
+            "GET /{path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept-Encoding: identity\r\n\r\n",
             args.host
                 .as_ref()
                 .unwrap_or(&args.inner_hostname),
@@ -228,7 +230,7 @@ async fn lookup_ech_configs(
     resolver: &TokioResolver,
     domain: &str,
     port: u16,
-) -> Result<Vec<EchConfigListBytes<'static>>, ResolveError> {
+) -> Result<Vec<EchConfigListBytes<'static>>, NetError> {
     // For non-standard ports, lookup the ECHConfig using port-prefix naming
     // See: https://datatracker.ietf.org/doc/html/rfc9460#section-9.1
     let qname_to_lookup = match port {
@@ -241,13 +243,13 @@ async fn lookup_ech_configs(
         .await?;
 
     let mut ech_config_lists = Vec::new();
-    for r in lookup.record_iter() {
-        let RData::HTTPS(svcb) = r.data() else {
+    for r in lookup.answers() {
+        let RData::HTTPS(svcb) = &r.data else {
             continue;
         };
 
         ech_config_lists.extend(
-            svcb.svc_params()
+            svcb.svc_params
                 .iter()
                 .find_map(|sp| match sp {
                     (SvcParamKey::EchConfigList, SvcParamValue::EchConfigList(e)) => {
@@ -274,4 +276,4 @@ fn read_ech(path: &str) -> Result<EchConfigListBytes<'static>, Box<dyn Error>> {
 /// A HPKE suite to use for GREASE ECH.
 ///
 /// A real implementation should vary this suite across all of the suites that are supported.
-static GREASE_HPKE_SUITE: &dyn Hpke = aws_lc_rs::hpke::DH_KEM_X25519_HKDF_SHA256_AES_128;
+static GREASE_HPKE_SUITE: &dyn Hpke = rustls_aws_lc_rs::hpke::DH_KEM_X25519_HKDF_SHA256_AES_128;

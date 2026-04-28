@@ -7,26 +7,27 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
+use pki_types::FipsStatus;
 use rustls::client::Resumption;
 use rustls::crypto::kx::NamedGroup;
 use rustls::crypto::{CertificateIdentity, Identity};
 use rustls::enums::ProtocolVersion;
 use rustls::error::{ApiMisuse, Error, PeerMisbehaved};
-use rustls::{ClientConfig, ClientConnection, HandshakeKind, ServerConfig, ServerConnection};
+use rustls::server::ServerSessionKey;
+use rustls::{ClientConfig, Connection, HandshakeKind, ServerConfig, ServerConnection};
 use rustls_test::{
-    ClientStorage, ClientStorageOp, ErrorFromPeer, KeyType, ServerConfigExt, do_handshake,
-    do_handshake_until_error, make_client_config, make_client_config_with_auth, make_pair,
-    make_pair_for_arc_configs, make_pair_for_configs, make_server_config, transfer,
+    ClientConfigExt, ClientStorage, ClientStorageOp, ErrorFromPeer, KeyType, ServerConfigExt,
+    do_handshake, do_handshake_until_error, make_client_config, make_client_config_with_auth,
+    make_pair, make_pair_for_arc_configs, make_pair_for_configs, make_server_config, transfer,
+    webpki_server_verifier_builder,
 };
 
-use super::{ALL_VERSIONS, COUNTS, CountingLogger, provider};
+use super::{ALL_VERSIONS, provider};
 
 #[test]
 fn client_only_attempts_resumption_with_compatible_security() {
     let provider = provider::DEFAULT_PROVIDER;
     let kt = KeyType::Rsa2048;
-    CountingLogger::install();
-    CountingLogger::reset();
 
     let server_config = make_server_config(kt, &provider);
     for version_provider in ALL_VERSIONS {
@@ -50,41 +51,37 @@ fn client_only_attempts_resumption_with_compatible_security() {
         assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
 
         // disallowed case: unmatching `client_auth_cert_resolver`
-        let mut client_config = ClientConfig::clone(&base_client_config);
-        client_config.client_auth_cert_resolver =
-            make_client_config_with_auth(kt, &version_provider).client_auth_cert_resolver;
+        let client_config = ClientConfig::builder(Arc::new(version_provider.clone()))
+            .add_root_certs(kt)
+            .with_client_credential_resolver(
+                make_client_config_with_auth(KeyType::EcdsaP256, &version_provider)
+                    .resolver()
+                    .clone(),
+            )
+            .unwrap();
 
-        CountingLogger::reset();
         let (mut client, mut server) =
             make_pair_for_configs(client_config.clone(), server_config.clone());
         do_handshake(&mut client, &mut server);
         assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
-        #[cfg(feature = "log")]
-        assert!(COUNTS.with(|c| {
-            c.borrow().trace.iter().any(|item| {
-                item == "resumption not allowed between different ClientCredentialResolver values"
-            })
-        }));
 
         // disallowed case: unmatching `verifier`
-        let mut client_config = make_client_config_with_auth(kt, &version_provider);
+        let mut client_config = ClientConfig::builder(Arc::new(version_provider.clone()))
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(
+                webpki_server_verifier_builder(kt.client_root_store(), &version_provider)
+                    .allow_unknown_revocation_status()
+                    .build()
+                    .unwrap(),
+            ))
+            .with_client_credential_resolver(client_config.resolver().clone())
+            .unwrap();
         client_config.resumption = base_client_config.resumption.clone();
-        client_config.client_auth_cert_resolver = base_client_config
-            .client_auth_cert_resolver
-            .clone();
 
-        CountingLogger::reset();
         let (mut client, mut server) =
             make_pair_for_configs(client_config.clone(), server_config.clone());
         do_handshake(&mut client, &mut server);
         assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
-        #[cfg(feature = "log")]
-        assert!(COUNTS.with(|c| {
-            c.borrow()
-                .trace
-                .iter()
-                .any(|item| item == "resumption not allowed between different ServerVerifiers")
-        }));
     }
 }
 
@@ -97,9 +94,13 @@ fn resumption_combinations() {
             (ProtocolVersion::TLSv1_2, provider::DEFAULT_TLS12_PROVIDER),
             (ProtocolVersion::TLSv1_3, provider::DEFAULT_TLS13_PROVIDER),
         ] {
+            let resumption_data = format!("resumption data {kt:?} {version:?}");
             let client_config = make_client_config(*kt, &version_provider);
             let (mut client, mut server) =
                 make_pair_for_configs(client_config.clone(), server_config.clone());
+            server
+                .set_resumption_data(resumption_data.as_bytes())
+                .unwrap();
             do_handshake(&mut client, &mut server);
 
             let expected_kx = expected_kx_for_version(version);
@@ -127,6 +128,10 @@ fn resumption_combinations() {
 
             assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
             assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
+            assert_eq!(
+                server.received_resumption_data(),
+                Some(resumption_data.as_bytes())
+            );
             if version == ProtocolVersion::TLSv1_2 {
                 assert!(
                     client
@@ -159,11 +164,11 @@ fn resumption_combinations() {
 }
 
 fn expected_kx_for_version(version: ProtocolVersion) -> NamedGroup {
-    match (
-        version,
-        super::provider_is_aws_lc_rs(),
+    let is_fips = matches!(
         super::provider_is_fips(),
-    ) {
+        FipsStatus::Pending | FipsStatus::Certified { .. }
+    );
+    match (version, super::provider_is_aws_lc_rs(), is_fips) {
         (ProtocolVersion::TLSv1_3, true, _) => NamedGroup::X25519MLKEM768,
         (_, _, true) => NamedGroup::secp256r1,
         (_, _, _) => NamedGroup::X25519,
@@ -188,8 +193,10 @@ fn test_client_tls12_no_resume_after_server_downgrade() {
     server_config_2.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
 
     dbg!("handshake 1");
-    let mut client_1 =
-        ClientConnection::new(client_config.clone(), "localhost".try_into().unwrap()).unwrap();
+    let mut client_1 = client_config
+        .connect("localhost".try_into().unwrap())
+        .build()
+        .unwrap();
     let mut server_1 = ServerConnection::new(server_config_1).unwrap();
     do_handshake(&mut client_1, &mut server_1);
 
@@ -209,8 +216,10 @@ fn test_client_tls12_no_resume_after_server_downgrade() {
     ));
 
     dbg!("handshake 2");
-    let mut client_2 =
-        ClientConnection::new(client_config, "localhost".try_into().unwrap()).unwrap();
+    let mut client_2 = client_config
+        .connect("localhost".try_into().unwrap())
+        .build()
+        .unwrap();
     let mut server_2 = ServerConnection::new(Arc::new(server_config_2)).unwrap();
     do_handshake(&mut client_2, &mut server_2);
     println!("hs2 storage ops: {:#?}", client_storage.ops());
@@ -471,6 +480,14 @@ fn early_data_is_available_on_resumption() {
         client
             .early_data()
             .unwrap()
+            .write(b"")
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
             .write(b"hello")
             .unwrap(),
         5
@@ -532,41 +549,6 @@ fn early_data_not_available_on_server_before_client_hello() {
     )))
     .unwrap();
     assert!(server.early_data().is_none());
-}
-
-#[test]
-fn early_data_can_be_rejected_by_server() {
-    let (client_config, server_config) = early_data_configs();
-
-    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
-    do_handshake(&mut client, &mut server);
-
-    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
-    assert!(client.early_data().is_some());
-    assert_eq!(
-        client
-            .early_data()
-            .unwrap()
-            .bytes_left(),
-        1234
-    );
-    client
-        .early_data()
-        .unwrap()
-        .flush()
-        .unwrap();
-    assert_eq!(
-        client
-            .early_data()
-            .unwrap()
-            .write(b"hello")
-            .unwrap(),
-        5
-    );
-    server.reject_early_data();
-    do_handshake(&mut client, &mut server);
-
-    assert!(!client.is_early_data_accepted());
 }
 
 #[test]
@@ -761,19 +743,19 @@ impl fmt::Debug for ServerStorage {
 }
 
 impl rustls::server::StoresServerSessions for ServerStorage {
-    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+    fn put(&self, key: ServerSessionKey<'_>, value: Vec<u8>) -> bool {
         self.put_count
             .fetch_add(1, Ordering::SeqCst);
         self.storage.put(key, value)
     }
 
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn get(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
         self.get_count
             .fetch_add(1, Ordering::SeqCst);
         self.storage.get(key)
     }
 
-    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn take(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
         self.take_count
             .fetch_add(1, Ordering::SeqCst);
         self.storage.take(key)

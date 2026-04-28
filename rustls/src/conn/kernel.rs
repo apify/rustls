@@ -12,28 +12,6 @@
 //!
 //! That's it. Everything else you will need to implement yourself.
 //!
-//! # Entry Point
-//! The entry points into this API are
-//! [`UnbufferedClientConnection::dangerous_into_kernel_connection`][client-into]
-//! and
-//! [`UnbufferedServerConnection::dangerous_into_kernel_connection`][server-into].
-//!
-//! In order to actually create an [`KernelConnection`] all of the following
-//! must be true:
-//! - the connection must have completed its handshake,
-//! - the connection must have no buffered TLS data waiting to be sent, and,
-//! - the config used to create the connection must have `enable_extract_secrets`
-//!   set to true.
-//!
-//! This sounds fairly complicated to achieve at first glance. However, if you
-//! drive an unbuffered connection through the handshake until it returns
-//! [`WriteTraffic`] then it will end up in an appropriate state to convert
-//! into an external connection.
-//!
-//! [client-into]: crate::client::UnbufferedClientConnection::dangerous_into_kernel_connection
-//! [server-into]: crate::server::UnbufferedServerConnection::dangerous_into_kernel_connection
-//! [`WriteTraffic`]: crate::unbuffered::ConnectionState::WriteTraffic
-//!
 //! # Cipher Suite Confidentiality Limits
 //! Some cipher suites (notably AES-GCM) have vulnerabilities where they are no
 //! longer secure once a certain number of messages have been sent. Normally,
@@ -56,14 +34,12 @@
 use alloc::boxed::Box;
 use core::marker::PhantomData;
 
-use crate::client::ClientConnectionData;
-use crate::common_state::Protocol;
-use crate::crypto::Identity;
+use crate::client::ClientSide;
 use crate::enums::ProtocolVersion;
-use crate::msgs::codec::Codec;
-use crate::msgs::handshake::NewSessionTicketPayloadTls13;
-use crate::quic::Quic;
-use crate::{CommonState, ConnectionTrafficSecrets, Error, SupportedCipherSuite};
+use crate::error::ApiMisuse;
+use crate::msgs::{Codec, NewSessionTicketPayloadTls13};
+use crate::tls13::key_schedule::KeyScheduleTrafficSend;
+use crate::{ConnectionOutputs, ConnectionTrafficSecrets, Error, SupportedCipherSuite};
 
 /// A kernel connection.
 ///
@@ -74,31 +50,29 @@ use crate::{CommonState, ConnectionTrafficSecrets, Error, SupportedCipherSuite};
 /// See the [`crate::kernel`] module docs for more details.
 pub struct KernelConnection<Side> {
     state: Box<dyn KernelState>,
-
-    peer_identity: Option<Identity<'static>>,
-    quic: Quic,
+    tls13_key_schedule: Option<Box<KeyScheduleTrafficSend>>,
 
     negotiated_version: ProtocolVersion,
-    protocol: Protocol,
     suite: SupportedCipherSuite,
 
     _side: PhantomData<Side>,
 }
 
 impl<Side> KernelConnection<Side> {
-    pub(crate) fn new(state: Box<dyn KernelState>, common: CommonState) -> Result<Self, Error> {
+    pub(crate) fn new(
+        state: Box<dyn KernelState>,
+        outputs: ConnectionOutputs,
+        tls13_key_schedule: Option<Box<KeyScheduleTrafficSend>>,
+    ) -> Result<Self, Error> {
+        let (negotiated_version, suite) = outputs
+            .into_kernel_parts()
+            .ok_or(Error::HandshakeNotComplete)?;
         Ok(Self {
             state,
+            tls13_key_schedule,
 
-            peer_identity: common.peer_identity,
-            quic: common.quic,
-            negotiated_version: common
-                .negotiated_version
-                .ok_or(Error::HandshakeNotComplete)?,
-            protocol: common.protocol,
-            suite: common
-                .suite
-                .ok_or(Error::HandshakeNotComplete)?,
+            negotiated_version,
+            suite,
 
             _side: PhantomData,
         })
@@ -126,10 +100,13 @@ impl<Side> KernelConnection<Side> {
     /// connection. Attempting to do so on a non-TLS 1.3 connection will result
     /// in an error.
     pub fn update_tx_secret(&mut self) -> Result<(u64, ConnectionTrafficSecrets), Error> {
-        // The sequence number always starts at 0 after a key update.
-        self.state
-            .update_secrets(Direction::Transmit)
-            .map(|secret| (0, secret))
+        match &mut self.tls13_key_schedule {
+            // The sequence number always starts at 0 after a key update.
+            Some(ks) => ks
+                .refresh_traffic_secret()
+                .map(|secret| (0, secret)),
+            None => Err(ApiMisuse::KeyUpdateNotAvailableForTls12.into()),
+        }
     }
 
     /// Update the traffic secret used for decrypting messages received from the
@@ -146,12 +123,12 @@ impl<Side> KernelConnection<Side> {
     pub fn update_rx_secret(&mut self) -> Result<(u64, ConnectionTrafficSecrets), Error> {
         // The sequence number always starts at 0 after a key update.
         self.state
-            .update_secrets(Direction::Receive)
+            .update_rx_secret()
             .map(|secret| (0, secret))
     }
 }
 
-impl KernelConnection<ClientConnectionData> {
+impl KernelConnection<ClientSide> {
     /// Handle a `new_session_ticket` message from the peer.
     ///
     /// This will register the session ticket within with rustls so that it can
@@ -169,10 +146,10 @@ impl KernelConnection<ClientConnectionData> {
     /// ```no_run
     /// use rustls::enums::{ContentType, HandshakeType};
     /// use rustls::kernel::KernelConnection;
-    /// use rustls::client::ClientConnectionData;
+    /// use rustls::client::ClientSide;
     ///
-    /// # fn doctest(conn: &mut KernelConnection<ClientConnectionData>, typ: ContentType, message: &[u8]) -> Result<(), rustls::Error> {
-    /// let conn: &mut KernelConnection<ClientConnectionData> = // ...
+    /// # fn doctest(conn: &mut KernelConnection<ClientSide>, typ: ContentType, message: &[u8]) -> Result<(), rustls::Error> {
+    /// let conn: &mut KernelConnection<ClientSide> = // ...
     /// #   conn;
     /// let typ: ContentType = // ...
     /// #   typ;
@@ -226,45 +203,21 @@ impl KernelConnection<ClientConnectionData> {
         }
 
         let nst = NewSessionTicketPayloadTls13::read_bytes(payload)?;
-        let mut cx = KernelContext {
-            peer_identity: self.peer_identity.as_ref(),
-            protocol: self.protocol,
-            quic: &self.quic,
-        };
         self.state
-            .handle_new_session_ticket(&mut cx, &nst)
+            .handle_new_session_ticket(&nst)
     }
 }
 
 pub(crate) trait KernelState: Send + Sync {
     /// Update the traffic secret for the specified direction on the connection.
-    fn update_secrets(&mut self, dir: Direction) -> Result<ConnectionTrafficSecrets, Error>;
+    fn update_rx_secret(&mut self) -> Result<ConnectionTrafficSecrets, Error>;
 
     /// Handle a new session ticket.
     ///
     /// This will only ever be called for client connections, as [`KernelConnection`]
     /// only exposes the relevant API for client connections.
     fn handle_new_session_ticket(
-        &mut self,
-        cx: &mut KernelContext<'_>,
+        &self,
         message: &NewSessionTicketPayloadTls13,
     ) -> Result<(), Error>;
-}
-
-pub(crate) struct KernelContext<'a> {
-    pub(crate) peer_identity: Option<&'a Identity<'static>>,
-    pub(crate) protocol: Protocol,
-    pub(crate) quic: &'a Quic,
-}
-
-impl KernelContext<'_> {
-    pub(crate) fn is_quic(&self) -> bool {
-        self.protocol == Protocol::Quic
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Direction {
-    Transmit,
-    Receive,
 }

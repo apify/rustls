@@ -151,13 +151,13 @@ impl Debug for AeadTicketer {
         // Note: we deliberately omit the key from the debug output.
         f.debug_struct("AeadTicketer")
             .field("alg", &self.alg)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 static TICKETER_AEAD: &aead::Algorithm = &aead::CHACHA20_POLY1305;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use rustls::crypto::TicketerFactory;
 
@@ -198,7 +198,7 @@ mod tests {
 
         let t = AeadTicketer::new().unwrap();
 
-        let expect = format!("AeadTicketer {{ alg: {TICKETER_AEAD:?} }}");
+        let expect = format!("AeadTicketer {{ alg: {TICKETER_AEAD:?}, .. }}");
         assert_eq!(format!("{t:?}"), expect);
         assert_eq!(t.lifetime(), Duration::ZERO);
     }

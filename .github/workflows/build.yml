@@ -18,6 +18,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  RUSTFLAGS: --deny warnings
+  AWS_LC_SYS_NO_JITTER_ENTROPY: 1
+
 jobs:
   build:
     name: Build+test
@@ -68,7 +72,7 @@ jobs:
         if: runner.os == 'MacOS'
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25.4"
+          go-version: "stable"
 
       - name: cargo build (debug; default features)
         run: cargo build --locked
@@ -88,27 +92,11 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
-      - name: cargo test (debug; aws-lc-rs)
-        run: cargo test --locked --no-default-features --features aws-lc-rs,log,std --all-targets
-        env:
-          RUST_BACKTRACE: 1
-
-      - name: cargo test (release; fips)
-        run: cargo test --locked --release --no-default-features --features fips,log,std --all-targets
-        env:
-          RUST_BACKTRACE: 1
-
       - name: cargo build (debug; no-std)
-        run: cargo build --locked --lib -p rustls $(admin/all-features-except std,brotli rustls)
-
-      - name: cargo build (debug; rustls-provider-example)
-        run: cargo build --locked -p rustls-provider-example
-
-      - name: cargo build (debug; rustls-provider-example lib in no-std mode)
-        run: cargo build --locked -p rustls-provider-example --no-default-features
-
-      - name: cargo test (debug; rustls-provider-example; all features)
-        run: cargo test --locked --all-features -p rustls-provider-example
+        run: |
+          cargo build --locked --lib -p rustls $(admin/all-features-except std,brotli rustls)
+          cargo build --locked --lib -p rustls-ring --no-default-features
+          cargo build --locked --lib -p rustls-aws-lc-rs --no-default-features --features aws-lc-sys
 
       - name: cargo build (debug; rustls-provider-test)
         run: cargo build --locked -p rustls-provider-test
@@ -130,7 +118,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.83"
+          toolchain: "1.85"
 
       - run: cargo check --locked --lib --all-features -p rustls
 
@@ -149,24 +137,10 @@ jobs:
           target: x86_64-unknown-none
 
       - name: cargo build (debug; default features)
-        run: cargo build --locked
-        working-directory: rustls
-        env:
-          RUSTFLAGS: --deny warnings
-
-        # this target does _not_ include the libstd crate in its sysroot
-        # it will catch unwanted usage of libstd in _dependencies_
-      - name: cargo build (debug; no default features; no-std)
-        run: cargo build --locked --no-default-features --target x86_64-unknown-none
-        working-directory: rustls
-        env:
-          RUSTFLAGS: --deny warnings
-
-      - name: cargo build (debug; no default features; no-std, hashbrown)
-        run: cargo build --locked --no-default-features --features hashbrown --target x86_64-unknown-none
-        working-directory: rustls
-        env:
-          RUSTFLAGS: --deny warnings
+        run: |
+          cargo build --locked -p rustls
+          cargo build --locked -p rustls-ring
+          cargo build --locked -p rustls-aws-lc-rs
 
       - name: cargo test (debug; default features)
         run: cargo test --locked
@@ -175,20 +149,15 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: cargo test (debug; no default features)
-        run: cargo test --locked --no-default-features
-        working-directory: rustls
+        run: |
+          cargo test --locked -p rustls --no-default-features
+          cargo test --locked -p rustls-ring --no-default-features
+          cargo test --locked -p rustls-aws-lc-rs --no-default-features --features aws-lc-sys
 
       - name: cargo test (debug; no default features; std)
-        run: cargo test --locked --no-default-features --features std
-        working-directory: rustls
-
-      - name: cargo test (debug; no default features; std+aws-lc-rs)
-        run: cargo test --locked --no-default-features --features aws-lc-rs,std
-        working-directory: rustls
-
-      - name: cargo test (debug; no default features; std+fips)
-        run: cargo test --locked --no-default-features --features fips,std
-        working-directory: rustls
+        run: |
+          cargo test --locked -p rustls-ring --no-default-features --features std
+          cargo test --locked -p rustls-aws-lc-rs --no-default-features --features std --features aws-lc-sys
 
       - name: cargo test (release; no run)
         run: cargo test --locked --release --no-run
@@ -209,8 +178,7 @@ jobs:
       - name: Install golang toolchain
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25"
-          cache: false
+          go-version: "stable"
 
       - name: Run test suite (ring)
         working-directory: bogo
@@ -243,7 +211,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo fuzz
-        uses: taiki-e/cache-cargo-install-action@v2
+        uses: taiki-e/cache-cargo-install-action@v3
         with:
           tool: cargo-fuzz
 
@@ -331,7 +299,7 @@ jobs:
           components: llvm-tools
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/cache-cargo-install-action@v2
+        uses: taiki-e/cache-cargo-install-action@v3
         with:
           tool: cargo-llvm-cov
 
@@ -339,7 +307,7 @@ jobs:
         run: ./admin/coverage --lcov --output-path final.info
 
       - name: Report to codecov.io
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           files: final.info
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -382,7 +350,7 @@ jobs:
           - armv7-linux-androideabi
           - i686-linux-android
           - thumbv7neon-linux-androideabi
-          # Other standard 32-bit (Linux) targets (SKIP bindgen for i686 only)
+          # Other standard 32-bit (Linux) targets
           - i586-unknown-linux-gnu
           - i686-unknown-linux-gnu
           # exotic Linux targets:
@@ -401,20 +369,14 @@ jobs:
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Install cross
-        uses: taiki-e/cache-cargo-install-action@v2
+        uses: taiki-e/cache-cargo-install-action@v3
         with:
           tool: cross
           git: https://github.com/cross-rs/cross
           # known-working main in feb 2025, bump as needed
           rev: c7dee4d
-      - name: Install bindgen-cli
-        uses: taiki-e/cache-cargo-install-action@v2
-        with:
-          tool: bindgen-cli
-      - name: Enable bindgen feature for aws-lc-sys (as needed for many cross targets)
-        if: ${{ matrix.target != 'i686-unknown-linux-gnu' }}
-        run: cargo add --dev --features bindgen 'aws-lc-sys@>0.20' --package rustls --verbose
       - run: cross test --package rustls --target ${{ matrix.target }}
+      - run: cross test --package rustls-test --features aws-lc-rs --no-default-features --target ${{ matrix.target }}
 
   semver:
     name: Check semver compatibility
@@ -518,32 +480,15 @@ jobs:
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-08-06
+          toolchain: nightly-2025-10-18
           # ^ sync with https://github.com/awslabs/cargo-check-external-types/blob/main/rust-toolchain.toml
       - name: Install cargo-check-external-types
-        uses: taiki-e/cache-cargo-install-action@v2
+        uses: taiki-e/cache-cargo-install-action@v3
         with:
           tool: cargo-check-external-types
       - name: run cargo-check-external-types for rustls/
         working-directory: rustls/
         run: cargo check-external-types
-
-  taplo:
-    name: Taplo
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install taplo-cli
-        uses: taiki-e/cache-cargo-install-action@v2
-        with:
-          tool: taplo-cli
-      - run: taplo format --check
 
   openssl-tests:
     name: Run openssl-tests
@@ -560,7 +505,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache ${{ env.VERSION }}
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: cache-openssl
         with:
           path: ${{ env.VERSION }}

@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="460" height="300" src="https://raw.githubusercontent.com/rustls/rustls/main/admin/rustls-logo-web.png">
+  <img width="512" src="https://raw.githubusercontent.com/rustls/rustls/main/admin/logo/rustls.svg">
 </p>
 
 <p align="center">
@@ -50,25 +50,12 @@ While Rustls itself is platform independent, it requires the use of cryptography
 for implementing the cryptography algorithms used in TLS. In Rustls, a
 [`crypto::CryptoProvider`] represents a collection of crypto primitive implementations.
 
-The Rustls team recommends using the [`aws-lc-rs`] crate, which for its complete feature set
-and performance. See [the aws-lc-rs FAQ][aws-lc-rs-platforms-faq] for more details of the
-platform/architecture support constraints in aws-lc-rs.
-
-[`ring`] is also available via the `ring` crate feature: see
-[the supported `ring` target platforms][ring-target-platforms].
-
 By providing a custom instance of the [`crypto::CryptoProvider`] struct, you
 can replace all cryptography dependencies of rustls.  This is a route to being portable
 to a wider set of architectures and environments, or compliance requirements.  See the
 [`crypto::CryptoProvider`] documentation for more details.
 
-Rustls requires Rust 1.83 or later.
-
-[ring-target-platforms]: https://github.com/briansmith/ring/blob/2e8363b433fa3b3962c877d9ed2e9145612f3160/include/ring-core/target.h#L18-L64
 [`crypto::CryptoProvider`]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html
-[`ring`]: https://crates.io/crates/ring
-[aws-lc-rs-platforms-faq]: https://aws.github.io/aws-lc-rs/faq.html#can-i-run-aws-lc-rs-on-x-platform-or-architecture
-[`aws-lc-rs`]: https://crates.io/crates/aws-lc-rs
 
 ### Cryptography providers
 
@@ -79,15 +66,33 @@ requirements.
 From 0.24, users must explicitly provide a crypto provider when constructing `ClientConfig` or
 `ServerConfig` instances. See the [`crypto::CryptoProvider`] documentation for more details.
 
-#### Built-in providers
+#### First-party providers
 
-Rustls ships with two built-in providers controlled by associated crate features:
+The Rustls project currently maintains two cryptography providers:
 
-* [`aws-lc-rs`] - available with the `aws-lc-rs` crate feature enabled
-* [`ring`] - available with the `ring` crate feature enabled
+* [`rustls-aws-lc-rs`] - a provider that uses the [`aws-lc-rs`] crate for cryptography.
+While this provider can be harder to build on [some platforms][aws-lc-rs-platforms-faq], it provides excellent
+performance and a complete feature set (including post-quantum algorithms).
+* [`rustls-ring`] - a provider that uses the [`ring`] crate for cryptography. This
+provider is easier to build on a variety of platforms, but has a more limited feature set
+(for example, it does not support post-quantum algorithms).
+
+The Rustls team recommends using the [`rustls-aws-lc-rs`] crate for its complete feature set
+and performance. See [the aws-lc-rs FAQ][aws-lc-rs-platforms-faq] for more details of the
+platform/architecture support constraints in aws-lc-rs.
 
 See the documentation for [`crypto::CryptoProvider`] for details on how providers are
 selected.
+
+(For rustls versions prior to 0.24, both of these providers were shipped as part of the rustls
+crate, and Cargo features were used to select the preferred provider. The `aws-lc-rs` feature
+was enabled by default.)
+
+[`rustls-aws-lc-rs`]: https://crates.io/crates/rustls-aws-lc-rs
+[`aws-lc-rs`]: https://crates.io/crates/aws-lc-rs
+[aws-lc-rs-platforms-faq]: https://aws.github.io/aws-lc-rs/faq.html#can-i-run-aws-lc-rs-on-x-platform-or-architecture
+[`rustls-ring`]: https://crates.io/crates/rustls-ring
+[`ring`]: https://crates.io/crates/ring
 
 #### Third-party providers
 
@@ -95,6 +100,7 @@ The community has also started developing third-party providers for Rustls:
 
 * [`boring-rustls-provider`] - a work-in-progress provider that uses [`boringssl`] for
 cryptography.
+* [`rustls-ccm`] - adds AES-CCM cipher suites (TLS 1.2 and 1.3) using [`RustCrypto`], for IoT/constrained-device protocols (IEEE 2030.5, Matter, RFC 7925).
 * [`rustls-graviola`] - a provider that uses [`graviola`] for cryptography.
 * [`rustls-mbedtls-provider`] - a provider that uses [`mbedtls`] for cryptography.
 * [`rustls-openssl`] - a provider that uses [OpenSSL] for cryptography.
@@ -103,6 +109,7 @@ from [`RustCrypto`] for cryptography.
 * [`rustls-symcrypt`] - a provider that uses Microsoft's [SymCrypt] library.
 * [`rustls-wolfcrypt-provider`] - a work-in-progress provider that uses [`wolfCrypt`] for cryptography.
 
+[`rustls-ccm`]: https://github.com/jsulmont/rustls-ccm
 [`rustls-graviola`]: https://crates.io/crates/rustls-graviola
 [`graviola`]: https://github.com/ctz/graviola
 [`rustls-mbedtls-provider`]: https://github.com/fortanix/rustls-mbedtls-provider
@@ -118,16 +125,9 @@ from [`RustCrypto`] for cryptography.
 [`rustls-wolfcrypt-provider`]: https://github.com/wolfSSL/rustls-wolfcrypt-provider
 [`wolfCrypt`]: https://www.wolfssl.com/products/wolfcrypt
 
-#### Custom provider
-
-We also provide a simple example of writing your own provider in the [custom provider example].
-This example implements a minimal provider using parts of the [`RustCrypto`] ecosystem.
-
 See the [Making a custom CryptoProvider] section of the documentation for more information
 on this topic.
 
-[custom provider example]: https://github.com/rustls/rustls/tree/main/provider-example/
-[`RustCrypto`]: https://github.com/RustCrypto
 [Making a custom CryptoProvider]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html#making-a-custom-cryptoprovider
 
 # Example code

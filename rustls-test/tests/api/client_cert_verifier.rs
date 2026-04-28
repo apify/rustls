@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use rustls::error::{AlertDescription, CertificateError, Error, InvalidMessage, PeerMisbehaved};
 use rustls::server::danger::PeerVerified;
-use rustls::{ClientConnection, ServerConfig, ServerConnection};
+use rustls::{ServerConfig, ServerConnection};
 use rustls_test::{
     ErrorFromPeer, KeyType, MockClientVerifier, do_handshake, do_handshake_until_both_error,
     do_handshake_until_error, make_client_config, make_client_config_with_auth,
@@ -97,10 +97,13 @@ fn client_verifier_no_auth_yes_root() {
         let server_config = Arc::new(server_config);
 
         for version_provider in ALL_VERSIONS {
-            let client_config = make_client_config(*kt, &version_provider);
+            let client_config = Arc::new(make_client_config(*kt, &version_provider));
             let mut server = ServerConnection::new(server_config.clone()).unwrap();
-            let mut client =
-                ClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
+            let mut client = client_config
+                .connect(server_name("localhost"))
+                .build()
+                .unwrap();
+
             let errs = do_handshake_until_both_error(&mut client, &mut server);
             assert_eq!(
                 errs,
@@ -127,10 +130,12 @@ fn client_verifier_fails_properly() {
         let server_config = Arc::new(server_config);
 
         for version_provider in ALL_VERSIONS {
-            let client_config = make_client_config_with_auth(*kt, &version_provider);
+            let client_config = Arc::new(make_client_config_with_auth(*kt, &version_provider));
             let mut server = ServerConnection::new(server_config.clone()).unwrap();
-            let mut client =
-                ClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
+            let mut client = client_config
+                .connect(server_name("localhost"))
+                .build()
+                .unwrap();
             let err = do_handshake_until_error(&mut client, &mut server);
             assert_eq!(
                 err,
@@ -149,10 +154,12 @@ fn server_allow_any_anonymous_or_authenticated_client() {
     let provider = Arc::new(provider::DEFAULT_PROVIDER);
     let kt = KeyType::Rsa2048;
     for client_cert_chain in [None, Some(kt.client_identity())] {
-        let client_auth = webpki_client_verifier_builder(kt.client_root_store(), &provider)
-            .allow_unauthenticated()
-            .build()
-            .unwrap();
+        let client_auth = Arc::new(
+            webpki_client_verifier_builder(kt.client_root_store(), &provider)
+                .allow_unauthenticated()
+                .build()
+                .unwrap(),
+        );
 
         let server_config = ServerConfig::builder(provider.clone())
             .with_client_cert_verifier(client_auth)
@@ -259,8 +266,7 @@ fn client_mandatory_auth_client_revocation_works() {
             // if the server's verifier allows unknown revocation status.
             let (mut client, mut server) =
                 make_pair_for_arc_configs(&client_config, &allow_missing_client_crl_server_config);
-            let res = do_handshake_until_error(&mut client, &mut server);
-            assert!(res.is_ok());
+            do_handshake_until_error(&mut client, &mut server).unwrap();
         }
     }
 }
@@ -312,7 +318,7 @@ fn client_mandatory_auth_intermediate_revocation_works() {
             // revocation status should not be checked.
             let (mut client, mut server) =
                 make_pair_for_arc_configs(&client_config, &ee_server_config);
-            assert!(do_handshake_until_error(&mut client, &mut server).is_ok());
+            do_handshake_until_error(&mut client, &mut server).unwrap();
         }
     }
 }

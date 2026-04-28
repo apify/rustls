@@ -1,5 +1,7 @@
 use alloc::boxed::Box;
 
+use pki_types::FipsStatus;
+
 use super::hmac;
 use super::kx::ActiveKeyExchange;
 use crate::enums::ProtocolVersion;
@@ -76,9 +78,9 @@ pub trait Prf: Send + Sync {
     /// several `PRF(...)` calls.
     fn new_secret(&self, master_secret: &[u8; 48]) -> Box<dyn PrfSecret>;
 
-    /// Return `true` if this is backed by a FIPS-approved implementation.
-    fn fips(&self) -> bool {
-        false
+    /// Return the FIPS validation status of this implementation.
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated
     }
 }
 
@@ -110,30 +112,5 @@ pub fn prf(out: &mut [u8], hmac_key: &dyn hmac::Key, label: &[u8], seed: &[u8]) 
         chunk.copy_from_slice(&p_term.as_ref()[..chunk.len()]);
 
         previous_a = Some(a_i);
-    }
-}
-
-#[cfg(all(test, feature = "aws-lc-rs"))]
-pub(crate) struct FakePrf;
-
-#[cfg(all(test, feature = "aws-lc-rs"))]
-impl Prf for FakePrf {
-    fn for_key_exchange(
-        &self,
-        _: &mut [u8; 48],
-        _: Box<dyn ActiveKeyExchange>,
-        _: &[u8],
-        _: &[u8],
-        _: &[u8],
-    ) -> Result<(), Error> {
-        todo!()
-    }
-
-    fn new_secret(&self, _: &[u8; 48]) -> Box<dyn PrfSecret> {
-        todo!()
-    }
-
-    fn fips(&self) -> bool {
-        false
     }
 }

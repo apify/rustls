@@ -1,6 +1,6 @@
 use core::hint::black_box;
 use core::mem;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -16,19 +16,18 @@ use rayon::iter::Either;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use rustls::client::Resumption;
-use rustls::crypto::{
-    CipherSuite, CryptoProvider, GetRandomFailed, SecureRandom, TicketProducer, aws_lc_rs,
-};
+use rustls::crypto::{CipherSuite, CryptoProvider, GetRandomFailed, SecureRandom, TicketProducer};
 use rustls::enums::ProtocolVersion;
 use rustls::server::{NoServerSessionStorage, ServerSessionMemoryCache, WebPkiClientVerifier};
 use rustls::{
-    ClientConfig, ClientConnection, HandshakeKind, RootCertStore, ServerConfig, ServerConnection,
+    ClientConfig, ClientConnection, Connection, HandshakeKind, RootCertStore, ServerConfig,
+    ServerConnection,
 };
 use rustls_test::KeyType;
 
 use crate::benchmark::{
     AuthKeySource, Benchmark, BenchmarkKind, BenchmarkParams, ResumptionKind,
-    get_reported_instr_count, validate_benchmarks,
+    get_reported_instr_count,
 };
 use crate::util::async_io::{self, AsyncRead, AsyncWrite};
 use crate::util::transport::{
@@ -81,9 +80,16 @@ pub enum Command {
         #[arg(short, long, default_value = "target/ci-bench")]
         output_dir: PathBuf,
     },
-    /// Run a single benchmark at the provided index (used by the bench runner to start each benchmark in its own process)
+    /// Run a named benchmark and print the measured CPU instruction counts in CSV format
     RunSingle {
-        index: u32,
+        /// The name of the benchmark.
+        bench: String,
+        #[arg(short, long, default_value = "target/ci-bench")]
+        output_dir: PathBuf,
+    },
+    /// Run a single benchmark at the provided name (used by the bench runner to start each benchmark in its own process)
+    RunPipe {
+        name: String,
         side: Side,
         measurement_mode: Mode,
     },
@@ -158,36 +164,36 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::RunAll { output_dir } => {
             let executable = std::env::args().next().unwrap();
-            let results = run_all(executable, output_dir.clone(), &benchmarks)?;
-
-            // Output results in CSV (note: not using a library here to avoid extra dependencies)
-            let mut csv_file = File::create(output_dir.join(ICOUNTS_FILENAME))
-                .context("cannot create output csv file")?;
-            for (name, combined) in &results {
-                writeln!(csv_file, "{name},{}", combined.instructions)?;
-            }
-
-            let mut csv_file = File::create(output_dir.join(MEMORY_FILENAME))
-                .context("cannot create output csv file")?;
-            for (name, combined) in results {
-                writeln!(
-                    csv_file,
-                    "{name},{},{},{},{}",
-                    combined.memory.heap_total_bytes,
-                    combined.memory.heap_total_blocks,
-                    combined.memory.heap_peak_bytes,
-                    combined.memory.heap_peak_blocks,
-                )?;
-            }
+            let results = run_all(
+                executable,
+                output_dir.clone(),
+                &benchmarks.iter().collect::<Vec<_>>(),
+            )?;
+            output_csv(results, output_dir)?;
         }
-        Command::RunSingle {
-            index,
+        Command::RunSingle { bench, output_dir } => {
+            let executable = std::env::args().next().unwrap();
+            let Some(benchmark) = benchmarks.get(bench.as_str()) else {
+                let mut output = String::new();
+                for bench in all_benchmarks()? {
+                    output.push_str(&format!(" - {:?}\n", bench.name()));
+                }
+
+                return Err(anyhow::anyhow!(
+                    "Benchmark {bench:?} not found\n\nAvailable are:\n{output}"
+                ));
+            };
+            let results = run_all(executable, output_dir.clone(), &[benchmark])?;
+            output_csv(results, output_dir)?;
+        }
+        Command::RunPipe {
+            name,
             side,
             measurement_mode,
         } => {
             let bench = benchmarks
-                .get(index as usize)
-                .ok_or_else(|| anyhow::anyhow!("Benchmark not found: {index}"))?;
+                .get(name.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Benchmark not found: {name}"))?;
 
             if let Some(warm_up) = bench.params.warm_up {
                 warm_up();
@@ -263,9 +269,9 @@ fn main() -> anyhow::Result<()> {
         Command::Walltime {
             iterations_per_scenario,
         } => {
-            let mut timings = vec![Vec::with_capacity(iterations_per_scenario); benchmarks.len()];
+            let mut timings = BTreeMap::new();
             for _ in 0..iterations_per_scenario {
-                for (i, bench) in benchmarks.iter().enumerate() {
+                for bench in &benchmarks {
                     let start = Instant::now();
 
                     // The variables below are used to initialize the client and server configs. We
@@ -322,13 +328,16 @@ fn main() -> anyhow::Result<()> {
                     server_result
                         .with_context(|| format!("server side of {} crashed", bench.name()))?;
 
-                    timings[i].push(start.elapsed());
+                    timings
+                        .entry(bench.name().to_string())
+                        .or_insert_with(|| Vec::with_capacity(iterations_per_scenario))
+                        .push(start.elapsed());
                 }
             }
 
             // Output the results
-            for (i, bench_timings) in timings.into_iter().enumerate() {
-                print!("{}", benchmarks[i].name());
+            for (name, bench_timings) in timings.into_iter() {
+                print!("{}", name);
                 for timing in bench_timings {
                     print!(",{}", timing.as_nanos())
                 }
@@ -360,14 +369,40 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn output_csv(
+    results: Vec<(String, CombinedMeasurement)>,
+    output_dir: PathBuf,
+) -> anyhow::Result<()> {
+    // Output results in CSV (note: not using a library here to avoid extra dependencies)
+    let mut csv_file =
+        File::create(output_dir.join(ICOUNTS_FILENAME)).context("cannot create output csv file")?;
+    for (name, combined) in &results {
+        writeln!(csv_file, "{name},{}", combined.instructions)?;
+    }
+
+    let mut csv_file =
+        File::create(output_dir.join(MEMORY_FILENAME)).context("cannot create output csv file")?;
+    for (name, combined) in results {
+        writeln!(
+            csv_file,
+            "{name},{},{},{},{}",
+            combined.memory.heap_total_bytes,
+            combined.memory.heap_total_blocks,
+            combined.memory.heap_peak_bytes,
+            combined.memory.heap_peak_blocks,
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Returns all benchmarks
-fn all_benchmarks() -> anyhow::Result<Vec<Benchmark>> {
-    let mut benchmarks = Vec::new();
+fn all_benchmarks() -> anyhow::Result<BTreeSet<Benchmark>> {
+    let mut benchmarks = BTreeSet::new();
     for param in all_benchmarks_params() {
         add_benchmark_group(&mut benchmarks, param);
     }
 
-    validate_benchmarks(&benchmarks)?;
     Ok(benchmarks)
 }
 
@@ -383,7 +418,7 @@ fn all_benchmarks_params() -> Vec<BenchmarkParams> {
             None,
         ),
         (
-            derandomize(aws_lc_rs::DEFAULT_PROVIDER),
+            derandomize(rustls_aws_lc_rs::DEFAULT_PROVIDER),
             &(aws_lc_rs_ticketer as fn() -> Arc<dyn TicketProducer>),
             "aws_lc_rs",
             Some(warm_up_aws_lc_rs as fn()),
@@ -466,7 +501,7 @@ fn ring_ticketer() -> Arc<dyn TicketProducer> {
 }
 
 fn aws_lc_rs_ticketer() -> Arc<dyn TicketProducer> {
-    aws_lc_rs::DEFAULT_PROVIDER
+    rustls_aws_lc_rs::DEFAULT_PROVIDER
         .ticketer_factory
         .ticketer()
         .unwrap()
@@ -495,7 +530,7 @@ fn warm_up_aws_lc_rs() {
     // "Warm up" provider's actual entropy source.  aws-lc-rs particularly
     // has an expensive process here, which is one-time (per calling thread)
     // so not useful to include in benchmark measurements.
-    aws_lc_rs::DEFAULT_PROVIDER
+    rustls_aws_lc_rs::DEFAULT_PROVIDER
         .secure_random
         .fill(&mut [0u8])
         .unwrap();
@@ -519,7 +554,7 @@ impl SecureRandom for NotRandom {
 /// - Handshake with session id resumption
 /// - Handshake with ticket resumption
 /// - Transfer a 1MB data stream from the server to the client
-fn add_benchmark_group(benchmarks: &mut Vec<Benchmark>, params: BenchmarkParams) {
+fn add_benchmark_group(benchmarks: &mut BTreeSet<Benchmark>, params: BenchmarkParams) {
     let params_label = params.label.clone();
 
     // Create handshake benchmarks for all resumption kinds
@@ -530,22 +565,25 @@ fn add_benchmark_group(benchmarks: &mut Vec<Benchmark>, params: BenchmarkParams)
             params.clone(),
         );
 
-        benchmarks.push(handshake_bench);
+        assert!(benchmarks.insert(handshake_bench), "duplicate benchmark");
     }
 
     // Benchmark data transfer
-    benchmarks.push(Benchmark::new(
-        format!("transfer_no_resume_{params_label}"),
-        BenchmarkKind::Transfer,
-        params.clone(),
-    ));
+    assert!(
+        benchmarks.insert(Benchmark::new(
+            format!("transfer_no_resume_{params_label}"),
+            BenchmarkKind::Transfer,
+            params
+        )),
+        "duplicate benchmark"
+    );
 }
 
 /// Run all the provided benches under callgrind to retrieve their instruction count
 fn run_all(
     executable: String,
     output_dir: PathBuf,
-    benches: &[Benchmark],
+    benches: &[&Benchmark],
 ) -> anyhow::Result<Vec<(String, CombinedMeasurement)>> {
     for bench in benches {
         if let Some(warm_up) = bench.params.warm_up {
@@ -557,15 +595,13 @@ fn run_all(
     let cg_runner = CallgrindRunner::new(executable.clone(), output_dir.clone())?;
     let cg_results: Vec<_> = benches
         .par_iter()
-        .enumerate()
-        .map(|(i, bench)| (bench, cg_runner.run_bench(i as u32, bench)))
+        .map(|bench| (bench, cg_runner.run_bench(bench)))
         .collect();
 
     let dh_runner = DhatRunner::new(executable, output_dir)?;
     let dh_results: Vec<_> = benches
         .par_iter()
-        .enumerate()
-        .map(|(i, bench)| (bench, dh_runner.run_bench(i as u32, bench)))
+        .map(|bench| (bench, dh_runner.run_bench(bench)))
         .collect();
 
     // Report possible errors
@@ -691,7 +727,11 @@ impl BenchStepper for ClientSideStepper<'_> {
 
     async fn handshake(&mut self) -> anyhow::Result<Self::Endpoint> {
         let server_name = "localhost".try_into().unwrap();
-        let mut client = ClientConnection::new(self.config.clone(), server_name).unwrap();
+        let mut client = self
+            .config
+            .connect(server_name)
+            .build()
+            .unwrap();
         client.set_buffer_limit(None);
 
         loop {

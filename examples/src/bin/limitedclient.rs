@@ -7,24 +7,32 @@ use std::io::{Read, Write, stdout};
 use std::net::TcpStream;
 use std::sync::Arc;
 
-use rustls::crypto::{CryptoProvider, aws_lc_rs as provider};
+use rustls::crypto::CryptoProvider;
+use rustls::{ClientConfig, RootCertStore};
+use rustls_aws_lc_rs as provider;
+use rustls_util::Stream;
 
 fn main() {
-    let root_store = rustls::RootCertStore::from_iter(
+    let root_store = RootCertStore::from_iter(
         webpki_roots::TLS_SERVER_ROOTS
             .iter()
             .cloned(),
     );
 
-    let config = rustls::ClientConfig::builder(PROVIDER.into())
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
-        .unwrap();
+    let config = Arc::new(
+        ClientConfig::builder(PROVIDER.into())
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+            .unwrap(),
+    );
 
     let server_name = "www.rust-lang.org".try_into().unwrap();
-    let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
+    let mut conn = config
+        .connect(server_name)
+        .build()
+        .unwrap();
     let mut sock = TcpStream::connect("www.rust-lang.org:443").unwrap();
-    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+    let mut tls = Stream::new(&mut conn, &mut sock);
     tls.write_all(
         concat!(
             "GET / HTTP/1.1\r\n",

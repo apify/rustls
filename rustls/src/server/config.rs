@@ -3,27 +3,29 @@ use alloc::vec::Vec;
 use core::fmt::Debug;
 use core::marker::PhantomData;
 
-use pki_types::{DnsName, PrivateKeyDer, UnixTime};
+#[cfg(feature = "webpki")]
+use pki_types::PrivateKeyDer;
+use pki_types::{DnsName, FipsStatus, UnixTime};
 
-use super::handy;
 use super::hs::ClientHelloInput;
+use super::{ServerSessionKey, handy};
 use crate::builder::{ConfigBuilder, WantsVerifier};
 #[cfg(doc)]
 use crate::crypto;
 use crate::crypto::kx::NamedGroup;
 use crate::crypto::{
-    CipherSuite, Credentials, CryptoProvider, Identity, SelectedCredential, SignatureScheme,
-    SingleCredential, TicketProducer,
+    CipherSuite, CryptoProvider, SelectedCredential, SignatureScheme, TicketProducer,
 };
-use crate::enums::{CertificateType, ProtocolVersion};
+#[cfg(feature = "webpki")]
+use crate::crypto::{Credentials, Identity, SingleCredential};
+use crate::enums::{ApplicationProtocol, CertificateType, ProtocolVersion};
 use crate::error::{Error, PeerMisbehaved};
-use crate::msgs::handshake::{ProtocolName, ServerNamePayload};
+use crate::msgs::ServerNamePayload;
+use crate::suites::Suite;
 use crate::sync::Arc;
-#[cfg(feature = "std")]
-use crate::time_provider::DefaultTimeProvider;
-use crate::time_provider::TimeProvider;
+use crate::time_provider::{DefaultTimeProvider, TimeProvider};
 use crate::verify::{ClientVerifier, DistinguishedName, NoClientAuth};
-use crate::{KeyLog, NoKeyLog, compress};
+use crate::{KeyLog, NoKeyLog, Tls12CipherSuite, Tls13CipherSuite, compress};
 
 /// Common configuration for a set of server sessions.
 ///
@@ -81,10 +83,8 @@ pub struct ServerConfig {
     /// Source of randomness and other crypto.
     pub(crate) provider: Arc<CryptoProvider>,
 
-    /// Ignore the client's ciphersuite order. Instead,
-    /// choose the top ciphersuite in the server list
-    /// which is supported by the client.
-    pub ignore_client_order: bool,
+    /// How to select a cipher suite to use for a TLS session.
+    pub cipher_suite_selector: &'static dyn CipherSuiteSelector,
 
     /// The maximum size of plaintext input to be emitted in a single TLS record.
     /// A value of None is equivalent to the [TLS maximum] of 16 kB.
@@ -118,7 +118,7 @@ pub struct ServerConfig {
 
     /// Protocol names we support, most preferred first.
     /// If empty we don't do ALPN at all.
-    pub alpn_protocols: Vec<Vec<u8>>,
+    pub alpn_protocols: Vec<ApplicationProtocol<'static>>,
 
     /// How to verify client certificates.
     pub(super) verifier: Arc<dyn ClientVerifier>,
@@ -181,8 +181,8 @@ pub struct ServerConfig {
     /// If set to `true`, requires the client to support the extended
     /// master secret extraction method defined in [RFC 7627].
     ///
-    /// The default is `true` if the "fips" crate feature is enabled,
-    /// `false` otherwise.
+    /// The default is `true` if the configured [`CryptoProvider`] is FIPS-compliant,
+    /// false otherwise.
     ///
     /// It must be set to `true` to meet FIPS requirement mentioned in section
     /// **D.Q Transition of the TLS 1.2 KDF to Support the Extended Master
@@ -240,7 +240,6 @@ impl ServerConfig {
     /// are reported at the end of the builder process.
     ///
     /// For more information, see the [`ConfigBuilder`] documentation.
-    #[cfg(feature = "std")]
     pub fn builder(provider: Arc<CryptoProvider>) -> ConfigBuilder<Self, WantsVerifier> {
         Self::builder_with_details(provider, Arc::new(DefaultTimeProvider))
     }
@@ -274,14 +273,16 @@ impl ServerConfig {
         }
     }
 
-    /// Return `true` if connections made with this `ServerConfig` will
-    /// operate in FIPS mode.
+    /// Return the FIPS validation status for connections made with this configuration.
     ///
     /// This is different from [`CryptoProvider::fips()`]: [`CryptoProvider::fips()`]
     /// is concerned only with cryptography, whereas this _also_ covers TLS-level
     /// configuration that NIST recommends.
-    pub fn fips(&self) -> bool {
-        self.provider.fips() && self.require_ems
+    pub fn fips(&self) -> FipsStatus {
+        match self.require_ems {
+            true => self.provider.fips(),
+            false => FipsStatus::Unvalidated,
+        }
     }
 
     /// Return the crypto provider used to construct this client configuration.
@@ -326,15 +327,15 @@ pub trait StoresServerSessions: Debug + Send + Sync {
     /// Store session secrets encoded in `value` against `key`,
     /// overwrites any existing value against `key`.  Returns `true`
     /// if the value was stored.
-    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool;
+    fn put(&self, key: ServerSessionKey<'_>, value: Vec<u8>) -> bool;
 
     /// Find a value with the given `key`.  Return it, or None
     /// if it doesn't exist.
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
+    fn get(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>>;
 
     /// Find a value with the given `key`.  Return it and delete it;
     /// or None if it doesn't exist.
-    fn take(&self, key: &[u8]) -> Option<Vec<u8>>;
+    fn take(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>>;
 
     /// Whether the store can cache another session. This is used to indicate to clients
     /// whether their session can be resumed; the implementation is not required to remember
@@ -389,7 +390,7 @@ pub trait ServerCredentialResolver: Debug + Send + Sync {
 pub struct ClientHello<'a> {
     pub(super) server_name: Option<Cow<'a, DnsName<'a>>>,
     pub(super) signature_schemes: &'a [SignatureScheme],
-    pub(super) alpn: Option<&'a Vec<ProtocolName>>,
+    pub(super) alpn: Option<&'a Vec<ApplicationProtocol<'a>>>,
     pub(super) server_cert_types: Option<&'a [CertificateType]>,
     pub(super) client_cert_types: Option<&'a [CertificateType]>,
     pub(super) cipher_suites: &'a [CipherSuite],
@@ -403,20 +404,21 @@ pub struct ClientHello<'a> {
 impl<'a> ClientHello<'a> {
     pub(super) fn new(
         input: &'a ClientHelloInput<'a>,
+        signature_schemes: &'a [SignatureScheme],
         sni: Option<&'a DnsName<'static>>,
         version: ProtocolVersion,
     ) -> Self {
         Self {
             server_name: sni.map(Cow::Borrowed),
-            signature_schemes: &input.sig_schemes,
+            signature_schemes,
             alpn: input.client_hello.protocols.as_ref(),
-            client_cert_types: input
-                .client_hello
-                .client_certificate_types
-                .as_deref(),
             server_cert_types: input
                 .client_hello
                 .server_certificate_types
+                .as_deref(),
+            client_cert_types: input
+                .client_hello
+                .client_certificate_types
                 .as_deref(),
             cipher_suites: &input.client_hello.cipher_suites,
             // We adhere to the TLS 1.2 RFC by not exposing this to the cert resolver if TLS version is 1.2
@@ -625,6 +627,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
     /// This function fails if `key_der` is invalid, or if the
     /// `SubjectPublicKeyInfo` from the private key does not match the public
     /// key for the end-entity certificate from the `cert_chain`.
+    #[cfg(feature = "webpki")]
     pub fn with_single_cert(
         self,
         identity: Arc<Identity<'static>>,
@@ -647,6 +650,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
     /// This function fails if `key_der` is invalid, or if the
     /// `SubjectPublicKeyInfo` from the private key does not match the public
     /// key for the end-entity certificate from the `cert_chain`.
+    #[cfg(feature = "webpki")]
     pub fn with_single_cert_with_ocsp(
         self,
         identity: Arc<Identity<'static>>,
@@ -666,24 +670,22 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
         cert_resolver: Arc<dyn ServerCredentialResolver>,
     ) -> Result<ServerConfig, Error> {
         self.provider.consistency_check()?;
+        let require_ems = !matches!(self.provider.fips(), FipsStatus::Unvalidated);
         Ok(ServerConfig {
             provider: self.provider,
-            verifier: self.state.verifier,
-            cert_resolver,
-            ignore_client_order: false,
+            cipher_suite_selector: &PreferClientOrder,
             max_fragment_size: None,
-            #[cfg(feature = "std")]
             session_storage: handy::ServerSessionMemoryCache::new(256),
-            #[cfg(not(feature = "std"))]
-            session_storage: Arc::new(handy::NoServerSessionStorage {}),
             ticketer: None,
+            cert_resolver,
             alpn_protocols: Vec::new(),
+            verifier: self.state.verifier,
             key_log: Arc::new(NoKeyLog {}),
             enable_secret_extraction: false,
             max_early_data_size: 0,
             send_half_rtt_data: false,
             send_tls13_tickets: 2,
-            require_ems: cfg!(feature = "fips"),
+            require_ems,
             time_provider: self.time_provider,
             cert_compressors: compress::default_cert_compressors().to_vec(),
             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
@@ -691,4 +693,135 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
             invalid_sni_policy: InvalidSniPolicy::default(),
         })
     }
+}
+
+/// A [`CipherSuiteSelector`] implementation that prioritizes client order.
+#[expect(clippy::exhaustive_structs)]
+#[derive(Debug)]
+pub struct PreferClientOrder;
+
+impl CipherSuiteSelector for PreferClientOrder {
+    fn select_tls12_cipher_suite(
+        &self,
+        client: &mut dyn Iterator<Item = &'static Tls12CipherSuite>,
+        server: &[&'static Tls12CipherSuite],
+    ) -> Option<&'static Tls12CipherSuite> {
+        self.select(client, server)
+    }
+
+    fn select_tls13_cipher_suite(
+        &self,
+        client: &mut dyn Iterator<Item = &'static Tls13CipherSuite>,
+        server: &[&'static Tls13CipherSuite],
+    ) -> Option<&'static Tls13CipherSuite> {
+        self.select(client, server)
+    }
+}
+
+impl PreferClientOrder {
+    fn select<T: Suite>(
+        &self,
+        client: &mut dyn Iterator<Item = &'static T>,
+        _server: &[&'static T],
+    ) -> Option<&'static T> {
+        client.next()
+    }
+}
+
+/// A [`CipherSuiteSelector`] implementation that prioritizes server order.
+#[expect(clippy::exhaustive_structs)]
+#[derive(Debug)]
+pub struct PreferServerOrder;
+
+impl CipherSuiteSelector for PreferServerOrder {
+    fn select_tls12_cipher_suite(
+        &self,
+        client: &mut dyn Iterator<Item = &'static Tls12CipherSuite>,
+        server: &[&'static Tls12CipherSuite],
+    ) -> Option<&'static Tls12CipherSuite> {
+        client
+            .filter_map(|cs| {
+                server
+                    .iter()
+                    .position(|&ss| ss == cs)
+                    .map(|pos| (pos, cs))
+            })
+            .min_by_key(|&(pos, _)| pos)
+            .map(|(_, cs)| cs)
+    }
+
+    fn select_tls13_cipher_suite(
+        &self,
+        client: &mut dyn Iterator<Item = &'static Tls13CipherSuite>,
+        server: &[&'static Tls13CipherSuite],
+    ) -> Option<&'static Tls13CipherSuite> {
+        client
+            .filter_map(|cs| {
+                server
+                    .iter()
+                    .position(|&ss| ss == cs)
+                    .map(|pos| (pos, cs))
+            })
+            .min_by_key(|&(pos, _)| pos)
+            .map(|(_, cs)| cs)
+    }
+}
+
+impl<T: CipherSuiteSelector + ?Sized> VersionSuiteSelector<Tls12CipherSuite> for T {
+    fn select(
+        &self,
+        client: &mut dyn Iterator<Item = &'static Tls12CipherSuite>,
+        server: &[&'static Tls12CipherSuite],
+    ) -> Option<&'static Tls12CipherSuite> {
+        self.select_tls12_cipher_suite(client, server)
+    }
+}
+
+impl<T: CipherSuiteSelector + ?Sized> VersionSuiteSelector<Tls13CipherSuite> for T {
+    fn select(
+        &self,
+        client: &mut dyn Iterator<Item = &'static Tls13CipherSuite>,
+        server: &[&'static Tls13CipherSuite],
+    ) -> Option<&'static Tls13CipherSuite> {
+        self.select_tls13_cipher_suite(client, server)
+    }
+}
+
+pub(super) trait VersionSuiteSelector<T> {
+    fn select(
+        &self,
+        client: &mut dyn Iterator<Item = &'static T>,
+        server: &[&'static T],
+    ) -> Option<&'static T>;
+}
+
+/// A filter that chooses the cipher suite to use for a TLS session.
+pub trait CipherSuiteSelector: Debug + Send + Sync {
+    /// Choose a cipher suite, given the client's and server's options, in preference order.
+    ///
+    /// The `client` list is generated in order from the [`CipherSuite`] values received in the
+    /// `ClientHello`, filtered to only contain suites that the server supports. The `server`
+    /// list comes from the [`ServerConfig`]'s [`CryptoProvider`].
+    ///
+    /// Yields the chosen cipher suite supported by both sides, or `None` to indicate that no
+    /// mutually supported cipher suite could be agreed on.
+    fn select_tls12_cipher_suite(
+        &self,
+        client: &mut dyn Iterator<Item = &'static Tls12CipherSuite>,
+        server: &[&'static Tls12CipherSuite],
+    ) -> Option<&'static Tls12CipherSuite>;
+
+    /// Choose a cipher suite, given the client's and server's options, in preference order.
+    ///
+    /// The `client` list is generated in order from the [`CipherSuite`] values received in the
+    /// `ClientHello`, filtered to only contain suites that the server supports. The `server`
+    /// list comes from the [`ServerConfig`]'s [`CryptoProvider`].
+    ///
+    /// Yields the chosen cipher suite supported by both sides, or `None` to indicate that no
+    /// mutually supported cipher suite could be agreed on.
+    fn select_tls13_cipher_suite(
+        &self,
+        server: &mut dyn Iterator<Item = &'static Tls13CipherSuite>,
+        server: &[&'static Tls13CipherSuite],
+    ) -> Option<&'static Tls13CipherSuite>;
 }
