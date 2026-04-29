@@ -40,7 +40,7 @@ jobs:
 
       - name: cargo doc
         # keep features in sync with Cargo.toml `[package.metadata.docs.rs]` section
-        run: cargo doc --locked --features aws-lc-rs,brotli,custom-provider,hashbrown,log,std,zlib --no-deps --package rustls
+        run: cargo doc --locked --features brotli,hashbrown,log,zlib --no-deps --package rustls
         env:
           RUSTDOCFLAGS: -Dwarnings --cfg=rustls_docsrs --html-after-content tag.html
 
@@ -49,7 +49,7 @@ jobs:
           cd website && zola build --output-dir ../target/website/
 
       - name: Restore lychee cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .lycheecache
           key: cache-lychee-${{ github.sha }}
@@ -76,7 +76,7 @@ jobs:
           mv target/website/rustls target/website/docs
 
       - name: Package and upload artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: ./target/website/
 
@@ -94,4 +94,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

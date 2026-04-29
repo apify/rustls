@@ -2,35 +2,95 @@ use alloc::boxed::Box;
 use core::cmp::min;
 
 use crate::crypto::cipher::{
-    InboundOpaqueMessage, InboundPlainMessage, MessageDecrypter, MessageEncrypter,
-    OutboundOpaqueMessage, OutboundPlainMessage,
+    EncodedMessage, InboundOpaque, MessageDecrypter, MessageEncrypter, OutboundOpaque,
+    OutboundPlain,
 };
 use crate::error::Error;
 use crate::log::trace;
-use crate::msgs::deframer::HandshakeAlignedProof;
+use crate::msgs::HandshakeAlignedProof;
 
-#[derive(PartialEq)]
-enum DirectionState {
-    /// No keying material.
-    Invalid,
-
-    /// Keying material present, but not yet in use.
-    Prepared,
-
-    /// Keying material in use.
-    Active,
-}
-
-/// Record layer that tracks decryption and encryption keys.
-pub(crate) struct RecordLayer {
-    message_encrypter: Box<dyn MessageEncrypter>,
-    message_decrypter: Box<dyn MessageDecrypter>,
+/// Record layer that tracks encryption keys.
+pub(crate) struct EncryptionState {
+    message_encrypter: Option<Box<dyn MessageEncrypter>>,
     write_seq_max: u64,
     write_seq: u64,
+}
+
+impl EncryptionState {
+    /// Create new record layer with no keys.
+    pub(crate) fn new() -> Self {
+        Self {
+            message_encrypter: None,
+            write_seq_max: 0,
+            write_seq: 0,
+        }
+    }
+
+    /// Encrypt a TLS message.
+    ///
+    /// `plain` is a TLS message we'd like to send.  This function
+    /// panics if the requisite keying material hasn't been established yet.
+    pub(crate) fn encrypt_outgoing(
+        &mut self,
+        plain: EncodedMessage<OutboundPlain<'_>>,
+    ) -> EncodedMessage<OutboundOpaque> {
+        assert!(self.pre_encrypt_action(0) != Some(PreEncryptAction::Refuse));
+        let seq = self.write_seq;
+        self.write_seq += 1;
+        self.message_encrypter
+            .as_mut()
+            .unwrap()
+            .encrypt(plain, seq)
+            .unwrap()
+    }
+
+    /// Set and start using the given `MessageEncrypter` for future outgoing
+    /// message encryption.
+    pub(crate) fn set_message_encrypter(
+        &mut self,
+        cipher: Box<dyn MessageEncrypter>,
+        max_messages: u64,
+    ) {
+        *self = Self {
+            message_encrypter: Some(cipher),
+            write_seq_max: min(SEQ_SOFT_LIMIT, max_messages),
+            write_seq: 0,
+        };
+    }
+
+    /// Return a remedial action when we are near to encrypting too many messages.
+    ///
+    /// `add` is added to the current sequence number.  `add` as `0` means
+    /// "the next message processed by `encrypt_outgoing`"
+    pub(crate) fn pre_encrypt_action(&self, add: u64) -> Option<PreEncryptAction> {
+        match self.write_seq.saturating_add(add) {
+            v if v == self.write_seq_max => Some(PreEncryptAction::RefreshOrClose),
+            SEQ_HARD_LIMIT.. => Some(PreEncryptAction::Refuse),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn encrypted_len(&self, payload_len: usize) -> usize {
+        self.message_encrypter
+            .as_ref()
+            .map(|enc| enc.encrypted_payload_len(payload_len))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn is_encrypting(&self) -> bool {
+        self.message_encrypter.is_some()
+    }
+
+    pub(crate) fn write_seq(&self) -> u64 {
+        self.write_seq
+    }
+}
+
+/// Record layer that tracks decryption keys.
+pub(crate) struct DecryptionState {
+    message_decrypter: Option<Box<dyn MessageDecrypter>>,
     read_seq: u64,
     has_decrypted: bool,
-    encrypt_state: DirectionState,
-    decrypt_state: DirectionState,
 
     // Message encrypted with other keys may be encountered, so failures
     // should be swallowed by the caller.  This struct tracks the amount
@@ -38,18 +98,13 @@ pub(crate) struct RecordLayer {
     trial_decryption_len: Option<usize>,
 }
 
-impl RecordLayer {
+impl DecryptionState {
     /// Create new record layer with no keys.
     pub(crate) fn new() -> Self {
         Self {
-            message_encrypter: <dyn MessageEncrypter>::invalid(),
-            message_decrypter: <dyn MessageDecrypter>::invalid(),
-            write_seq_max: 0,
-            write_seq: 0,
+            message_decrypter: None,
             read_seq: 0,
             has_decrypted: false,
-            encrypt_state: DirectionState::Invalid,
-            decrypt_state: DirectionState::Invalid,
             trial_decryption_len: None,
         }
     }
@@ -61,14 +116,14 @@ impl RecordLayer {
     /// an error is returned.
     pub(crate) fn decrypt_incoming<'a>(
         &mut self,
-        encr: InboundOpaqueMessage<'a>,
+        encr: EncodedMessage<InboundOpaque<'a>>,
     ) -> Result<Option<Decrypted<'a>>, Error> {
-        if self.decrypt_state != DirectionState::Active {
+        let Some(decrypter) = &mut self.message_decrypter else {
             return Ok(Some(Decrypted {
                 want_close_before_decrypt: false,
                 plaintext: encr.into_plain_message(),
             }));
-        }
+        };
 
         // Set to `true` if the peer appears to getting close to encrypting
         // too many messages with this key.
@@ -81,10 +136,7 @@ impl RecordLayer {
         let want_close_before_decrypt = self.read_seq == SEQ_SOFT_LIMIT;
 
         let encrypted_len = encr.payload.len();
-        match self
-            .message_decrypter
-            .decrypt(encr, self.read_seq)
-        {
+        match decrypter.decrypt(encr, self.read_seq) {
             Ok(plaintext) => {
                 self.read_seq += 1;
                 if !self.has_decrypted {
@@ -103,78 +155,15 @@ impl RecordLayer {
         }
     }
 
-    /// Encrypt a TLS message.
-    ///
-    /// `plain` is a TLS message we'd like to send.  This function
-    /// panics if the requisite keying material hasn't been established yet.
-    pub(crate) fn encrypt_outgoing(
-        &mut self,
-        plain: OutboundPlainMessage<'_>,
-    ) -> OutboundOpaqueMessage {
-        debug_assert!(self.encrypt_state == DirectionState::Active);
-        assert!(self.next_pre_encrypt_action() != PreEncryptAction::Refuse);
-        let seq = self.write_seq;
-        self.write_seq += 1;
-        self.message_encrypter
-            .encrypt(plain, seq)
-            .unwrap()
-    }
-
-    /// Prepare to use the given `MessageEncrypter` for future message encryption.
-    /// It is not used until you call `start_encrypting`.
-    pub(crate) fn prepare_message_encrypter(
-        &mut self,
-        cipher: Box<dyn MessageEncrypter>,
-        max_messages: u64,
-    ) {
-        self.message_encrypter = cipher;
-        self.write_seq = 0;
-        self.write_seq_max = min(SEQ_SOFT_LIMIT, max_messages);
-        self.encrypt_state = DirectionState::Prepared;
-    }
-
-    /// Prepare to use the given `MessageDecrypter` for future message decryption.
-    /// It is not used until you call `start_decrypting`.
-    pub(crate) fn prepare_message_decrypter(&mut self, cipher: Box<dyn MessageDecrypter>) {
-        self.message_decrypter = cipher;
-        self.read_seq = 0;
-        self.decrypt_state = DirectionState::Prepared;
-    }
-
-    /// Start using the `MessageEncrypter` previously provided to the previous
-    /// call to `prepare_message_encrypter`.
-    pub(crate) fn start_encrypting(&mut self) {
-        debug_assert!(self.encrypt_state == DirectionState::Prepared);
-        self.encrypt_state = DirectionState::Active;
-    }
-
-    /// Start using the `MessageDecrypter` previously provided to the previous
-    /// call to `prepare_message_decrypter`.
-    pub(crate) fn start_decrypting(&mut self, _proof: &HandshakeAlignedProof) {
-        debug_assert!(self.decrypt_state == DirectionState::Prepared);
-        self.decrypt_state = DirectionState::Active;
-    }
-
-    /// Set and start using the given `MessageEncrypter` for future outgoing
-    /// message encryption.
-    pub(crate) fn set_message_encrypter(
-        &mut self,
-        cipher: Box<dyn MessageEncrypter>,
-        max_messages: u64,
-    ) {
-        self.prepare_message_encrypter(cipher, max_messages);
-        self.start_encrypting();
-    }
-
     /// Set and start using the given `MessageDecrypter` for future incoming
     /// message decryption.
     pub(crate) fn set_message_decrypter(
         &mut self,
         cipher: Box<dyn MessageDecrypter>,
-        proof: &HandshakeAlignedProof,
+        _proof: &HandshakeAlignedProof,
     ) {
-        self.prepare_message_decrypter(cipher);
-        self.start_decrypting(proof);
+        self.message_decrypter = Some(cipher);
+        self.read_seq = 0;
         self.trial_decryption_len = None;
     }
 
@@ -185,35 +174,15 @@ impl RecordLayer {
         &mut self,
         cipher: Box<dyn MessageDecrypter>,
         max_length: usize,
-        proof: &HandshakeAlignedProof,
+        _proof: &HandshakeAlignedProof,
     ) {
-        self.prepare_message_decrypter(cipher);
-        self.start_decrypting(proof);
+        self.message_decrypter = Some(cipher);
+        self.read_seq = 0;
         self.trial_decryption_len = Some(max_length);
     }
 
     pub(crate) fn finish_trial_decryption(&mut self) {
         self.trial_decryption_len = None;
-    }
-
-    pub(crate) fn next_pre_encrypt_action(&self) -> PreEncryptAction {
-        self.pre_encrypt_action(0)
-    }
-
-    /// Return a remedial action when we are near to encrypting too many messages.
-    ///
-    /// `add` is added to the current sequence number.  `add` as `0` means
-    /// "the next message processed by `encrypt_outgoing`"
-    pub(crate) fn pre_encrypt_action(&self, add: u64) -> PreEncryptAction {
-        match self.write_seq.saturating_add(add) {
-            v if v == self.write_seq_max => PreEncryptAction::RefreshOrClose,
-            SEQ_HARD_LIMIT.. => PreEncryptAction::Refuse,
-            _ => PreEncryptAction::Nothing,
-        }
-    }
-
-    pub(crate) fn is_encrypting(&self) -> bool {
-        self.encrypt_state == DirectionState::Active
     }
 
     /// Return true if we have ever decrypted a message. This is used in place
@@ -222,17 +191,8 @@ impl RecordLayer {
         self.has_decrypted
     }
 
-    pub(crate) fn write_seq(&self) -> u64 {
-        self.write_seq
-    }
-
     pub(crate) fn read_seq(&self) -> u64 {
         self.read_seq
-    }
-
-    pub(crate) fn encrypted_len(&self, payload_len: usize) -> usize {
-        self.message_encrypter
-            .encrypted_payload_len(payload_len)
     }
 
     fn doing_trial_decryption(&mut self, requested: usize) -> bool {
@@ -255,14 +215,11 @@ pub(crate) struct Decrypted<'a> {
     /// Whether the peer appears to be getting close to encrypting too many messages with this key.
     pub(crate) want_close_before_decrypt: bool,
     /// The decrypted message.
-    pub(crate) plaintext: InboundPlainMessage<'a>,
+    pub(crate) plaintext: EncodedMessage<&'a [u8]>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum PreEncryptAction {
-    /// No action is needed before calling `encrypt_outgoing`
-    Nothing,
-
     /// A `key_update` request should be sent ASAP.
     ///
     /// If that is not possible (for example, the connection is TLS1.2), a `close_notify`
@@ -274,14 +231,20 @@ pub(crate) enum PreEncryptAction {
     Refuse,
 }
 
-const SEQ_SOFT_LIMIT: u64 = 0xffff_ffff_ffff_0000u64;
-const SEQ_HARD_LIMIT: u64 = 0xffff_ffff_ffff_fffeu64;
+/// When to take action to avoid sequence space exhaustion.
+///
+/// This gives a margin in which any action can have an effect, prior to `SEQ_HARD_LIMIT`
+/// being reached.
+const SEQ_SOFT_LIMIT: u64 = u64::MAX - 0xffff;
+
+/// When to refuse further encryptions.
+const SEQ_HARD_LIMIT: u64 = u64::MAX - 1;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::enums::{ContentType, ProtocolVersion};
-    use crate::msgs::deframer::HandshakeDeframer;
+    use crate::msgs::Deframer;
 
     #[test]
     fn test_has_decrypted() {
@@ -289,49 +252,37 @@ mod tests {
         impl MessageDecrypter for PassThroughDecrypter {
             fn decrypt<'a>(
                 &mut self,
-                m: InboundOpaqueMessage<'a>,
+                m: EncodedMessage<InboundOpaque<'a>>,
                 _: u64,
-            ) -> Result<InboundPlainMessage<'a>, Error> {
+            ) -> Result<EncodedMessage<&'a [u8]>, Error> {
                 Ok(m.into_plain_message())
             }
         }
 
         // A record layer starts out invalid, having never decrypted.
-        let mut record_layer = RecordLayer::new();
-        assert!(matches!(
-            record_layer.decrypt_state,
-            DirectionState::Invalid
-        ));
+        let mut record_layer = DecryptionState::new();
+        assert!(record_layer.message_decrypter.is_none());
         assert_eq!(record_layer.read_seq, 0);
         assert!(!record_layer.has_decrypted());
 
-        // Preparing the record layer should update the decrypt state, but shouldn't affect whether it
+        // Initializing the record layer should update the decrypt state, but shouldn't affect whether it
         // has decrypted.
-        record_layer.prepare_message_decrypter(Box::new(PassThroughDecrypter));
-        assert!(matches!(
-            record_layer.decrypt_state,
-            DirectionState::Prepared
-        ));
-        assert_eq!(record_layer.read_seq, 0);
-        assert!(!record_layer.has_decrypted());
-
-        // Starting decryption should update the decrypt state, but not affect whether it has decrypted.
-        let deframer = HandshakeDeframer::default();
-        record_layer.start_decrypting(&deframer.aligned().unwrap());
-        assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
+        let deframer = Deframer::default();
+        record_layer
+            .set_message_decrypter(Box::new(PassThroughDecrypter), &deframer.aligned().unwrap());
+        assert!(record_layer.message_decrypter.is_some());
         assert_eq!(record_layer.read_seq, 0);
         assert!(!record_layer.has_decrypted());
 
         // Decrypting a message should update the read_seq and track that we have now performed
         // a decryption.
         record_layer
-            .decrypt_incoming(InboundOpaqueMessage::new(
+            .decrypt_incoming(EncodedMessage::new(
                 ContentType::Handshake,
                 ProtocolVersion::TLSv1_2,
-                &mut [0xC0, 0xFF, 0xEE],
+                InboundOpaque(&mut [0xC0, 0xFF, 0xEE]),
             ))
             .unwrap();
-        assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
         assert_eq!(record_layer.read_seq, 1);
         assert!(record_layer.has_decrypted());
 
@@ -339,7 +290,6 @@ mod tests {
         // the read_seq number, but not our knowledge of whether we have decrypted previously.
         record_layer
             .set_message_decrypter(Box::new(PassThroughDecrypter), &deframer.aligned().unwrap());
-        assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
         assert_eq!(record_layer.read_seq, 0);
         assert!(record_layer.has_decrypted());
     }

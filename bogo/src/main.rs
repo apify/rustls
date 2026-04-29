@@ -4,7 +4,9 @@
 // https://boringssl.googlesource.com/boringssl/+/master/ssl/test
 //
 
+use core::any::Any;
 use core::fmt::{Debug, Formatter};
+use core::hash::Hasher;
 use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
@@ -19,29 +21,33 @@ use rustls::client::danger::{
     HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
 };
 use rustls::client::{
-    self, ClientConfig, ClientConnection, CredentialRequest, EchConfig, EchGreaseConfig, EchMode,
-    EchStatus, Resumption, Tls12Resumption, WebPkiServerVerifier,
+    self, ClientConfig, ClientConnection, ClientSessionKey, CredentialRequest, EchConfig,
+    EchGreaseConfig, EchMode, EchStatus, Resumption, Tls12Resumption, Tls13Session,
+    WebPkiServerVerifier,
 };
-use rustls::crypto::aws_lc_rs::hpke;
 use rustls::crypto::hpke::{Hpke, HpkePublicKey};
 use rustls::crypto::kx::NamedGroup;
 use rustls::crypto::{
     Credentials, CryptoProvider, Identity, SelectedCredential, SignatureScheme, Signer, SigningKey,
-    SingleCredential, aws_lc_rs,
+    SingleCredential,
 };
-use rustls::enums::{CertificateCompressionAlgorithm, CertificateType, ProtocolVersion};
+use rustls::enums::{
+    ApplicationProtocol, CertificateCompressionAlgorithm, CertificateType, ProtocolVersion,
+};
 use rustls::error::{
     AlertDescription, CertificateError, Error, InvalidMessage, PeerIncompatible, PeerMisbehaved,
 };
-use rustls::internal::msgs::codec::Codec;
-use rustls::internal::msgs::persist::ServerSessionValue;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
     CertificateDer, EchConfigListBytes, PrivateKeyDer, ServerName, SubjectPublicKeyInfoDer,
 };
 use rustls::server::danger::{ClientIdentity, ClientVerifier, SignatureVerificationInput};
-use rustls::server::{self, ClientHello, ServerConfig, ServerConnection, WebPkiClientVerifier};
-use rustls::{Connection, DistinguishedName, HandshakeKind, RootCertStore, Side, compress};
+use rustls::server::{
+    self, ClientHello, PreferClientOrder, PreferServerOrder, ServerConfig, ServerConnection,
+    ServerSessionKey, WebPkiClientVerifier,
+};
+use rustls::{Connection, DistinguishedName, HandshakeKind, RootCertStore, compress};
+use rustls_aws_lc_rs::hpke;
 
 pub fn main() {
     let mut args: Vec<_> = env::args().collect();
@@ -97,12 +103,15 @@ pub fn main() {
                 let server_name = ServerName::try_from(opts.host_name.as_str())
                     .unwrap()
                     .to_owned();
-                let sess = ClientConnection::new(config.clone(), server_name).unwrap();
-                exec(&opts, Connection::Client(sess), &key_log, i);
+                let sess = config
+                    .connect(server_name)
+                    .build()
+                    .unwrap();
+                exec(&opts, sess, &key_log, i);
             }
             SideConfig::Server(config) => {
                 let sess = ServerConnection::new(config.clone()).unwrap();
-                exec(&opts, Connection::Server(sess), &key_log, i);
+                exec(&opts, sess, &key_log, i);
             }
         }
 
@@ -127,6 +136,338 @@ pub fn main() {
         opts.expect_handshake_kind
             .clone_from(&opts.expect_handshake_kind_resumed);
     }
+}
+
+fn exec(opts: &Options, mut sess: impl Connection + 'static, key_log: &KeyLogMemo, count: usize) {
+    let mut sent_message = false;
+
+    let addrs = [
+        net::SocketAddr::from((net::Ipv6Addr::LOCALHOST, opts.port)),
+        net::SocketAddr::from((net::Ipv4Addr::LOCALHOST, opts.port)),
+    ];
+    let mut conn = net::TcpStream::connect(&addrs[..]).expect("cannot connect");
+    let mut sent_shutdown = false;
+    let mut sent_exporter = false;
+    let mut sent_key_update = false;
+    let mut quench_writes = false;
+
+    conn.write_all(&opts.shim_id.to_le_bytes())
+        .unwrap();
+
+    loop {
+        if !sent_message && (opts.queue_data || (opts.queue_data_on_resume && count > 0)) {
+            if !opts
+                .queue_early_data_after_received_messages
+                .is_empty()
+            {
+                flush(&mut sess, &mut conn);
+                for message_size_estimate in &opts.queue_early_data_after_received_messages {
+                    read_n_bytes(opts, &mut sess, &mut conn, *message_size_estimate);
+                }
+                println!("now ready for early data");
+            }
+
+            if count > 0 && opts.enable_early_data {
+                let len = client(&mut sess)
+                    .early_data()
+                    .expect("0rtt not available")
+                    .write(b"hello")
+                    .expect("0rtt write failed");
+                sess.writer()
+                    .write_all(&b"hello"[len..])
+                    .unwrap();
+                sent_message = true;
+            } else if !opts.only_write_one_byte_after_handshake {
+                let _ = sess.writer().write_all(b"hello");
+                sent_message = true;
+            }
+        }
+
+        if !quench_writes {
+            flush(&mut sess, &mut conn);
+        }
+
+        if sess.wants_read() {
+            read_all_bytes(opts, &mut sess, &mut conn);
+        }
+
+        if opts.side == Side::Server && opts.enable_early_data {
+            if let Some(ed) = &mut server(&mut sess).early_data() {
+                let mut data = Vec::new();
+                let data_len = ed
+                    .read_to_end(&mut data)
+                    .expect("cannot read early_data");
+
+                for b in data.iter_mut() {
+                    *b ^= 0xff;
+                }
+
+                sess.writer()
+                    .write_all(&data[..data_len])
+                    .expect("cannot echo early_data in 1rtt data");
+            }
+        }
+
+        if !sess.is_handshaking() && opts.export_keying_material > 0 && !sent_exporter {
+            let mut export = vec![0; opts.export_keying_material];
+            sess.exporter()
+                .unwrap()
+                .derive(
+                    opts.export_keying_material_label
+                        .as_bytes(),
+                    if opts.export_keying_material_context_used {
+                        Some(
+                            opts.export_keying_material_context
+                                .as_bytes(),
+                        )
+                    } else {
+                        None
+                    },
+                    &mut export,
+                )
+                .unwrap();
+            sess.writer()
+                .write_all(&export)
+                .unwrap();
+            sent_exporter = true;
+        }
+
+        if !sess.is_handshaking() && opts.export_traffic_secrets && !sent_exporter {
+            let secrets = key_log.clone_inner();
+            assert_eq!(
+                secrets.client_traffic_secret.len(),
+                secrets.server_traffic_secret.len()
+            );
+            sess.writer()
+                .write_all(&(secrets.client_traffic_secret.len() as u16).to_le_bytes())
+                .unwrap();
+            sess.writer()
+                .write_all(&secrets.server_traffic_secret)
+                .unwrap();
+            sess.writer()
+                .write_all(&secrets.client_traffic_secret)
+                .unwrap();
+            sent_exporter = true;
+        }
+
+        if opts.send_key_update && !sent_key_update && !sess.is_handshaking() {
+            sess.refresh_traffic_keys().unwrap();
+            sent_key_update = true;
+        }
+
+        if !sess.is_handshaking() && opts.only_write_one_byte_after_handshake && !sent_message {
+            println!("writing message and then only one byte of its tls frame");
+            flush(&mut sess, &mut conn);
+
+            sess.writer()
+                .write_all(b"hello")
+                .unwrap();
+            sent_message = true;
+
+            let mut one_byte = [0u8];
+            let mut cursor = io::Cursor::new(&mut one_byte[..]);
+            sess.write_tls(&mut cursor).unwrap();
+            conn.write_all(&one_byte)
+                .expect("IO error");
+
+            quench_writes = true;
+        }
+
+        if opts.enable_early_data
+            && opts.side == Side::Client
+            && !sess.is_handshaking()
+            && count > 0
+        {
+            if opts.expect_accept_early_data && !client(&mut sess).is_early_data_accepted() {
+                quit_err("Early data was not accepted, but we expect the opposite");
+            } else if opts.expect_reject_early_data && client(&mut sess).is_early_data_accepted() {
+                quit_err("Early data was accepted, but we expect the opposite");
+            }
+            if opts.expect_version == 0x0304 {
+                match sess.protocol_version() {
+                    Some(ProtocolVersion::TLSv1_3) | Some(ProtocolVersion(0x7f17)) => {}
+                    _ => quit_err("wrong protocol version"),
+                }
+            }
+        }
+
+        if let (Some(expected_options), false) =
+            (opts.expect_handshake_kind.as_ref(), sess.is_handshaking())
+        {
+            let actual = sess.handshake_kind().unwrap();
+            assert!(
+                expected_options.contains(&actual),
+                "wanted to see {expected_options:?} but got {actual:?}"
+            );
+        }
+
+        if let Some(curve_id) = &opts.expect_curve_id {
+            // unlike openssl/boringssl's API, `negotiated_key_exchange_group`
+            // works for the connection, not session.  this means TLS1.2
+            // resumptions never have a value for `negotiated_key_exchange_group`
+            let tls12_resumed = sess.protocol_version() == Some(ProtocolVersion::TLSv1_2)
+                && sess.handshake_kind() == Some(HandshakeKind::Resumed);
+            let negotiated_key_exchange_group_ready = !(sess.is_handshaking() || tls12_resumed);
+
+            if negotiated_key_exchange_group_ready {
+                let actual = sess
+                    .negotiated_key_exchange_group()
+                    .expect("no kx with -expect-curve-id");
+                assert_eq!(curve_id, &actual.name());
+            }
+        }
+
+        if let Some(curve_id) = &opts.on_initial_expect_curve_id {
+            if !sess.is_handshaking() && count == 0 {
+                assert_eq!(sess.handshake_kind().unwrap(), HandshakeKind::Full);
+                assert_eq!(
+                    sess.negotiated_key_exchange_group()
+                        .expect("no kx with -on-initial-expect-curve-id")
+                        .name(),
+                    *curve_id
+                );
+            }
+        }
+
+        if let Some(curve_id) = &opts.on_resume_expect_curve_id {
+            if !sess.is_handshaking() && count > 0 {
+                assert!(matches!(
+                    sess.handshake_kind().unwrap(),
+                    HandshakeKind::Resumed | HandshakeKind::ResumedWithHelloRetryRequest
+                ));
+                assert_eq!(
+                    sess.negotiated_key_exchange_group()
+                        .expect("no kx with -on-resume-expect-curve-id")
+                        .name(),
+                    *curve_id
+                );
+            }
+        }
+
+        {
+            let ech_accept_required =
+                (count == 0 && opts.on_initial_expect_ech_accept) || opts.expect_ech_accept;
+            if ech_accept_required
+                && !sess.is_handshaking()
+                && client(&mut sess).ech_status() != EchStatus::Accepted
+            {
+                quit_err("ECH was not accepted, but we expect the opposite");
+            }
+        }
+
+        let mut buf = [0u8; 1024];
+        let len = match sess
+            .reader()
+            .read(&mut buf[..opts.read_size])
+        {
+            Ok(0) => {
+                if opts.check_close_notify {
+                    println!("close notify ok");
+                }
+                println!("EOF (tls)");
+                return;
+            }
+            Ok(len) => len,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => 0,
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                if opts.check_close_notify {
+                    quit_err(":CLOSE_WITHOUT_CLOSE_NOTIFY:");
+                }
+                println!("EOF (tcp)");
+                return;
+            }
+            Err(err) => panic!("unhandled read error {err:?}"),
+        };
+
+        if opts.shut_down_after_handshake && !sent_shutdown && !sess.is_handshaking() {
+            sess.send_close_notify();
+            sent_shutdown = true;
+        }
+
+        if quench_writes && len > 0 {
+            println!("unquenching writes after {len:?}");
+            quench_writes = false;
+        }
+
+        for b in buf.iter_mut() {
+            *b ^= 0xff;
+        }
+
+        sess.writer()
+            .write_all(&buf[..len])
+            .unwrap();
+    }
+}
+
+enum SideConfig {
+    Client(Arc<ClientConfig>),
+    Server(Arc<ServerConfig>),
+}
+
+fn client(conn: &mut dyn Any) -> &mut ClientConnection {
+    conn.downcast_mut::<ClientConnection>()
+        .unwrap()
+}
+
+fn server(conn: &mut dyn Any) -> &mut ServerConnection {
+    conn.downcast_mut::<ServerConnection>()
+        .unwrap()
+}
+
+fn read_n_bytes(opts: &Options, sess: &mut impl Connection, conn: &mut net::TcpStream, n: usize) {
+    let mut bytes = [0u8; MAX_MESSAGE_SIZE];
+    match conn.read(&mut bytes[..n]) {
+        Ok(count) => {
+            println!("read {count:?} bytes");
+            sess.read_tls(&mut io::Cursor::new(&mut bytes[..count]))
+                .expect("read_tls not expected to fail reading from buffer");
+        }
+        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+        Err(err) => panic!("invalid read: {err}"),
+    };
+
+    after_read(opts, sess, conn);
+}
+
+fn read_all_bytes(opts: &Options, sess: &mut impl Connection, conn: &mut net::TcpStream) {
+    match sess.read_tls(conn) {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+        Err(err) => panic!("invalid read: {err}"),
+    };
+
+    after_read(opts, sess, conn);
+}
+
+fn after_read(opts: &Options, sess: &mut impl Connection, conn: &mut net::TcpStream) {
+    if let Err(err) = sess.process_new_packets() {
+        flush(sess, conn); /* send any alerts before exiting */
+        orderly_close(conn);
+        handle_err(opts, err);
+    }
+}
+
+fn flush(sess: &mut impl Connection, conn: &mut net::TcpStream) {
+    while sess.wants_write() {
+        if let Err(err) = sess.write_tls(conn) {
+            println!("IO error: {err:?}");
+            process::exit(0);
+        }
+    }
+    conn.flush().unwrap();
+}
+
+fn orderly_close(conn: &mut net::TcpStream) {
+    // assuming we just flush()'d, we will write no more.
+    let _ = conn.shutdown(net::Shutdown::Write);
+
+    // wait for EOF
+    let mut buf = [0u8; 32];
+    while let Ok(p @ 1..) = conn.peek(&mut buf) {
+        let _ = conn.read(&mut buf[..p]).unwrap();
+    }
+
+    let _ = conn.shutdown(net::Shutdown::Read);
 }
 
 #[derive(Debug)]
@@ -346,11 +687,11 @@ impl Options {
             }
             "-min-version" => {
                 let min = args.remove(0).parse::<u16>().unwrap();
-                self.min_version = Some(ProtocolVersion::Unknown(min));
+                self.min_version = Some(ProtocolVersion(min));
             }
             "-max-version" => {
                 let max = args.remove(0).parse::<u16>().unwrap();
-                self.max_version = Some(ProtocolVersion::Unknown(max));
+                self.max_version = Some(ProtocolVersion(max));
             }
             "-max-send-fragment" => {
                 let max_fragment = args.remove(0).parse::<usize>().unwrap();
@@ -534,10 +875,10 @@ impl Options {
                 self.only_write_one_byte_after_handshake_on_resume = true;
             }
             "-on-resume-early-write-after-message" => {
-                self.queue_early_data_after_received_messages= match args.remove(0).parse::<u8>().unwrap() {
+                self.queue_early_data_after_received_messages = match args.remove(0).parse::<u8>().unwrap() {
                     // estimate where these messages appear in the server's first flight.
-                    2 => vec![5 + 128 + 5 + 32],
-                    8 => vec![5 + 128 + 5 + 32, 5 + 64],
+                    2 => vec![5 + 112 + 5 + 32],
+                    8 => vec![5 + 112 + 5 + 32, 5 + 64],
                     _ => {
                         panic!("unhandled -on-resume-early-write-after-message");
                     }
@@ -594,7 +935,7 @@ impl Options {
             }
             #[cfg(feature = "fips")]
             "-fips-202205" if self.selected_provider == SelectedProvider::AwsLcRsFips => {
-                self.provider = rustls::crypto::default_fips_provider();
+                self.provider = rustls_aws_lc_rs::DEFAULT_FIPS_PROVIDER.clone();
             }
             "-fips-202205" => {
                 println!("Not a FIPS build");
@@ -641,7 +982,7 @@ impl Options {
             "-wait-for-debugger" => {
                 #[cfg(windows)]
                 {
-                    panic("-wait-for-debugger not supported on Windows");
+                    panic!("-wait-for-debugger not supported on Windows");
                 }
                 #[cfg(unix)]
                 {
@@ -830,10 +1171,10 @@ impl SelectedProvider {
                 // this includes rustls-post-quantum, which just returns an altered
                 // version of `aws_lc_rs::default_provider()`
                 CryptoProvider {
-                    kx_groups: Cow::Borrowed(aws_lc_rs::ALL_KX_GROUPS),
-                    tls12_cipher_suites: Cow::Borrowed(aws_lc_rs::ALL_TLS12_CIPHER_SUITES),
-                    tls13_cipher_suites: Cow::Borrowed(aws_lc_rs::ALL_TLS13_CIPHER_SUITES),
-                    ..aws_lc_rs::DEFAULT_PROVIDER
+                    kx_groups: Cow::Borrowed(rustls_aws_lc_rs::ALL_KX_GROUPS),
+                    tls12_cipher_suites: Cow::Borrowed(rustls_aws_lc_rs::ALL_TLS12_CIPHER_SUITES),
+                    tls13_cipher_suites: Cow::Borrowed(rustls_aws_lc_rs::ALL_TLS13_CIPHER_SUITES),
+                    ..rustls_aws_lc_rs::DEFAULT_PROVIDER
                 }
             }
 
@@ -909,12 +1250,14 @@ impl DummyClientAuth {
         Self {
             mandatory,
             root_hint_subjects,
-            parent: WebPkiClientVerifier::builder(
-                load_root_certs(trusted_cert_file),
-                &SelectedProvider::from_env().provider(),
-            )
-            .build()
-            .unwrap(),
+            parent: Arc::new(
+                WebPkiClientVerifier::builder(
+                    load_root_certs(trusted_cert_file),
+                    &SelectedProvider::from_env().provider(),
+                )
+                .build()
+                .unwrap(),
+            ),
         }
     }
 }
@@ -966,12 +1309,14 @@ struct DummyServerAuth {
 impl DummyServerAuth {
     fn new(trusted_cert_file: &str, ocsp: OcspValidation) -> Self {
         Self {
-            parent: WebPkiServerVerifier::builder(
-                load_root_certs(trusted_cert_file),
-                &SelectedProvider::from_env().provider(),
-            )
-            .build()
-            .unwrap(),
+            parent: Arc::new(
+                WebPkiServerVerifier::builder(
+                    load_root_certs(trusted_cert_file),
+                    &SelectedProvider::from_env().provider(),
+                )
+                .build()
+                .unwrap(),
+            ),
             ocsp,
         }
     }
@@ -1007,6 +1352,10 @@ impl ServerVerifier for DummyServerAuth {
 
     fn request_ocsp_response(&self) -> bool {
         true
+    }
+
+    fn hash_config(&self, h: &mut dyn Hasher) {
+        self.parent.hash_config(h)
     }
 }
 
@@ -1131,6 +1480,8 @@ impl client::ClientCredentialResolver for MultipleClientCredentialResolver {
             false => &[],
         }
     }
+
+    fn hash_config(&self, _: &mut dyn Hasher) {}
 }
 
 #[derive(Debug)]
@@ -1237,24 +1588,20 @@ fn align_time() {
 }
 
 impl server::StoresServerSessions for ServerCacheWithResumptionDelay {
-    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
-        let mut ssv = ServerSessionValue::read_bytes(&value).unwrap();
-        match &mut ssv {
-            ServerSessionValue::Tls12(tls12) => &mut tls12.common,
-            ServerSessionValue::Tls13(tls13) => &mut tls13.common,
-            _ => todo!(),
-        }
-        .creation_time_sec -= self.delay as u64;
-
-        self.storage
-            .put(key, ssv.get_encoding())
+    fn put(&self, key: ServerSessionKey<'_>, mut value: Vec<u8>) -> bool {
+        // The creation time should be stored directly after the 2-byte version discriminant.
+        let creation_time_sec = &mut value[2..10];
+        let original = u64::from_be_bytes(creation_time_sec.try_into().unwrap());
+        let delayed = original - self.delay as u64;
+        creation_time_sec.copy_from_slice(&delayed.to_be_bytes());
+        self.storage.put(key, value)
     }
 
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn get(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
         self.storage.get(key)
     }
 
-    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn take(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
         self.storage.take(key)
     }
 
@@ -1301,7 +1648,11 @@ fn make_server_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ServerConfi
     cfg.max_fragment_size = opts.max_fragment;
     cfg.send_tls13_tickets = 1;
     cfg.require_ems = opts.require_ems;
-    cfg.ignore_client_order = opts.server_preference;
+    cfg.cipher_suite_selector = match opts.server_preference {
+        true => &PreferServerOrder,
+        false => &PreferClientOrder,
+    };
+
     if opts.export_traffic_secrets {
         cfg.key_log = key_log.clone();
     }
@@ -1321,12 +1672,12 @@ fn make_server_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ServerConfi
         cfg.alpn_protocols = opts
             .protocols
             .iter()
-            .map(|proto| proto.as_bytes().to_vec())
+            .map(|proto| ApplicationProtocol::from(proto.as_bytes()).to_owned())
             .collect::<Vec<_>>();
     }
 
     if opts.reject_alpn {
-        cfg.alpn_protocols = vec![b"invalid".to_vec()];
+        cfg.alpn_protocols = vec![ApplicationProtocol::from(b"invalid")];
     }
 
     if opts.enable_early_data {
@@ -1369,49 +1720,33 @@ impl ClientCacheWithSpecificKxHints {
 }
 
 impl client::ClientSessionStore for ClientCacheWithSpecificKxHints {
-    fn set_kx_hint(&self, _: ServerName<'static>, _: NamedGroup) {}
-    fn kx_hint(&self, _: &ServerName<'_>) -> Option<NamedGroup> {
+    fn set_kx_hint(&self, _: ClientSessionKey<'static>, _: NamedGroup) {}
+    fn kx_hint(&self, _: &ClientSessionKey<'_>) -> Option<NamedGroup> {
         self.kx_hint
     }
 
-    fn set_tls12_session(
-        &self,
-        server_name: ServerName<'static>,
-        mut value: client::Tls12ClientSessionValue,
-    ) {
+    fn set_tls12_session(&self, key: ClientSessionKey<'static>, mut value: client::Tls12Session) {
         value.rewind_epoch(self.delay);
         self.storage
-            .set_tls12_session(server_name, value);
+            .set_tls12_session(key, value);
     }
 
-    fn tls12_session(
-        &self,
-        server_name: &ServerName<'_>,
-    ) -> Option<client::Tls12ClientSessionValue> {
-        self.storage.tls12_session(server_name)
+    fn tls12_session(&self, key: &ClientSessionKey<'_>) -> Option<client::Tls12Session> {
+        self.storage.tls12_session(key)
     }
 
-    fn remove_tls12_session(&self, server_name: &ServerName<'static>) {
-        self.storage
-            .remove_tls12_session(server_name);
+    fn remove_tls12_session(&self, key: &ClientSessionKey<'static>) {
+        self.storage.remove_tls12_session(key);
     }
 
-    fn insert_tls13_ticket(
-        &self,
-        server_name: ServerName<'static>,
-        mut value: client::Tls13ClientSessionValue,
-    ) {
+    fn insert_tls13_ticket(&self, key: ClientSessionKey<'static>, mut value: Tls13Session) {
         value.rewind_epoch(self.delay);
         self.storage
-            .insert_tls13_ticket(server_name, value)
+            .insert_tls13_ticket(key, value)
     }
 
-    fn take_tls13_ticket(
-        &self,
-        server_name: &ServerName<'static>,
-    ) -> Option<client::Tls13ClientSessionValue> {
-        self.storage
-            .take_tls13_ticket(server_name)
+    fn take_tls13_ticket(&self, key: &ClientSessionKey<'static>) -> Option<Tls13Session> {
+        self.storage.take_tls13_ticket(key)
     }
 }
 
@@ -1420,7 +1755,7 @@ impl Debug for ClientCacheWithSpecificKxHints {
         // Note: we omit self.storage here as it may contain sensitive data.
         f.debug_struct("ClientCacheWithoutKxHints")
             .field("delay", &self.delay)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1505,7 +1840,7 @@ fn make_client_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ClientConfi
         cfg.alpn_protocols = opts
             .protocols
             .iter()
-            .map(|proto| proto.as_bytes().to_vec())
+            .map(|proto| ApplicationProtocol::from(proto.as_bytes()).to_owned())
             .collect();
     }
 
@@ -1565,7 +1900,6 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         Error::InvalidMessage(
             InvalidMessage::EmptyTicketValue | InvalidMessage::IllegalEmptyList(_),
         ) => quit(":DECODE_ERROR:"),
-        Error::InvalidMessage(InvalidMessage::IllegalEmptyValue) => quit(":ILLEGAL_EMPTY_VALUE:"),
         Error::InvalidMessage(
             InvalidMessage::InvalidKeyUpdate
             | InvalidMessage::MissingData(_)
@@ -1580,7 +1914,9 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         Error::InvalidMessage(InvalidMessage::InvalidContentType)
         | Error::InvalidMessage(InvalidMessage::InvalidEmptyPayload)
         | Error::InvalidMessage(InvalidMessage::UnknownProtocolVersion)
-        | Error::InvalidMessage(InvalidMessage::MessageTooLarge) => quit(":GARBAGE:"),
+        | Error::InvalidMessage(
+            InvalidMessage::MessageTooLarge | InvalidMessage::CertificatePayloadTooLarge,
+        ) => quit(":GARBAGE:"),
         Error::InvalidMessage(InvalidMessage::MessageTooShort)
             if opts.enable_ech_grease || opts.ech_config_list.is_some() =>
         {
@@ -1643,9 +1979,9 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         Error::PeerMisbehaved(PeerMisbehaved::TooManyWarningAlertsReceived) => {
             quit(":TOO_MANY_WARNING_ALERTS:")
         }
-        Error::PeerMisbehaved(PeerMisbehaved::TooManyKeyUpdateRequests) => {
-            quit(":TOO_MANY_KEY_UPDATES:")
-        }
+        Error::PeerMisbehaved(
+            PeerMisbehaved::TooManyConsecutiveHandshakeMessagesAfterHandshake,
+        ) => quit(":TOO_MANY_KEY_UPDATES:"),
         Error::PeerMisbehaved(PeerMisbehaved::MissingKeyShare) => quit(":MISSING_KEY_SHARE:"),
         Error::PeerMisbehaved(PeerMisbehaved::OfferedDuplicateKeyShares) => {
             quit(":DUPLICATE_KEY_SHARE:")
@@ -1740,9 +2076,9 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         Error::PeerMisbehaved(PeerMisbehaved::PskExtensionMustBeLast) => {
             quit(":PRE_SHARED_KEY_MUST_BE_LAST:")
         }
-        Error::PeerMisbehaved(PeerMisbehaved::IncorrectBinder) => {
-            quit(":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:")
-        }
+        Error::PeerMisbehaved(
+            PeerMisbehaved::IncorrectBinder | PeerMisbehaved::IncorrectFinished,
+        ) => quit(":DIGEST_CHECK_FAILED:"),
         Error::PeerMisbehaved(PeerMisbehaved::ServerHelloMustOfferUncompressedEcPoints) => {
             quit(":SERVER_HELLO_MUST_OFFER_UNCOMPRESSED_EC_POINTS:")
         }
@@ -1752,6 +2088,9 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         Error::PeerMisbehaved(PeerMisbehaved::RejectedEarlyDataInterleavedWithHandshakeMessage) => {
             quit(":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:")
         }
+        Error::PeerMisbehaved(
+            PeerMisbehaved::IllegalAlertLevel(_, _) | PeerMisbehaved::IllegalWarningAlert(_),
+        ) => quit(":BAD_ALERT:"),
         Error::PeerMisbehaved(_) => panic!("!!! please add error mapping for {err:?}"),
         Error::AlertReceived(AlertDescription::UnexpectedMessage) => quit(":BAD_ALERT:"),
         Error::AlertReceived(AlertDescription::DecompressionFailure) => {
@@ -1776,342 +2115,6 @@ fn handle_err(opts: &Options, err: Error) -> ! {
             quit(":FIXME:")
         }
     }
-}
-
-fn flush(sess: &mut Connection, conn: &mut net::TcpStream) {
-    while sess.wants_write() {
-        if let Err(err) = sess.write_tls(conn) {
-            println!("IO error: {err:?}");
-            process::exit(0);
-        }
-    }
-    conn.flush().unwrap();
-}
-
-fn client(conn: &mut Connection) -> &mut ClientConnection {
-    conn.try_into().unwrap()
-}
-
-fn server(conn: &mut Connection) -> &mut ServerConnection {
-    match conn {
-        Connection::Server(s) => s,
-        _ => panic!("Connection is not a ServerConnection"),
-    }
-}
-
-const MAX_MESSAGE_SIZE: usize = 0xffff + 5;
-
-fn after_read(opts: &Options, sess: &mut Connection, conn: &mut net::TcpStream) {
-    if let Err(err) = sess.process_new_packets() {
-        flush(sess, conn); /* send any alerts before exiting */
-        orderly_close(conn);
-        handle_err(opts, err);
-    }
-}
-
-fn orderly_close(conn: &mut net::TcpStream) {
-    // assuming we just flush()'d, we will write no more.
-    conn.shutdown(net::Shutdown::Write)
-        .unwrap();
-
-    // wait for EOF
-    let mut buf = [0u8; 32];
-    while let Ok(p @ 1..) = conn.peek(&mut buf) {
-        let _ = conn.read(&mut buf[..p]).unwrap();
-    }
-
-    let _ = conn.shutdown(net::Shutdown::Read);
-}
-
-fn read_n_bytes(opts: &Options, sess: &mut Connection, conn: &mut net::TcpStream, n: usize) {
-    let mut bytes = [0u8; MAX_MESSAGE_SIZE];
-    match conn.read(&mut bytes[..n]) {
-        Ok(count) => {
-            println!("read {count:?} bytes");
-            sess.read_tls(&mut io::Cursor::new(&mut bytes[..count]))
-                .expect("read_tls not expected to fail reading from buffer");
-        }
-        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
-        Err(err) => panic!("invalid read: {err}"),
-    };
-
-    after_read(opts, sess, conn);
-}
-
-fn read_all_bytes(opts: &Options, sess: &mut Connection, conn: &mut net::TcpStream) {
-    match sess.read_tls(conn) {
-        Ok(_) => {}
-        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
-        Err(err) => panic!("invalid read: {err}"),
-    };
-
-    after_read(opts, sess, conn);
-}
-
-fn exec(opts: &Options, mut sess: Connection, key_log: &KeyLogMemo, count: usize) {
-    let mut sent_message = false;
-
-    let addrs = [
-        net::SocketAddr::from((net::Ipv6Addr::LOCALHOST, opts.port)),
-        net::SocketAddr::from((net::Ipv4Addr::LOCALHOST, opts.port)),
-    ];
-    let mut conn = net::TcpStream::connect(&addrs[..]).expect("cannot connect");
-    let mut sent_shutdown = false;
-    let mut sent_exporter = false;
-    let mut sent_key_update = false;
-    let mut quench_writes = false;
-
-    conn.write_all(&opts.shim_id.to_le_bytes())
-        .unwrap();
-
-    loop {
-        if !sent_message && (opts.queue_data || (opts.queue_data_on_resume && count > 0)) {
-            if !opts
-                .queue_early_data_after_received_messages
-                .is_empty()
-            {
-                flush(&mut sess, &mut conn);
-                for message_size_estimate in &opts.queue_early_data_after_received_messages {
-                    read_n_bytes(opts, &mut sess, &mut conn, *message_size_estimate);
-                }
-                println!("now ready for early data");
-            }
-
-            if count > 0 && opts.enable_early_data {
-                let len = client(&mut sess)
-                    .early_data()
-                    .expect("0rtt not available")
-                    .write(b"hello")
-                    .expect("0rtt write failed");
-                sess.writer()
-                    .write_all(&b"hello"[len..])
-                    .unwrap();
-                sent_message = true;
-            } else if !opts.only_write_one_byte_after_handshake {
-                let _ = sess.writer().write_all(b"hello");
-                sent_message = true;
-            }
-        }
-
-        if !quench_writes {
-            flush(&mut sess, &mut conn);
-        }
-
-        if sess.wants_read() {
-            read_all_bytes(opts, &mut sess, &mut conn);
-        }
-
-        if opts.side == Side::Server && opts.enable_early_data {
-            if let Some(ed) = &mut server(&mut sess).early_data() {
-                let mut data = Vec::new();
-                let data_len = ed
-                    .read_to_end(&mut data)
-                    .expect("cannot read early_data");
-
-                for b in data.iter_mut() {
-                    *b ^= 0xff;
-                }
-
-                sess.writer()
-                    .write_all(&data[..data_len])
-                    .expect("cannot echo early_data in 1rtt data");
-            }
-        }
-
-        if !sess.is_handshaking() && opts.export_keying_material > 0 && !sent_exporter {
-            let mut export = vec![0; opts.export_keying_material];
-            sess.exporter()
-                .unwrap()
-                .derive(
-                    opts.export_keying_material_label
-                        .as_bytes(),
-                    if opts.export_keying_material_context_used {
-                        Some(
-                            opts.export_keying_material_context
-                                .as_bytes(),
-                        )
-                    } else {
-                        None
-                    },
-                    &mut export,
-                )
-                .unwrap();
-            sess.writer()
-                .write_all(&export)
-                .unwrap();
-            sent_exporter = true;
-        }
-
-        if !sess.is_handshaking() && opts.export_traffic_secrets && !sent_exporter {
-            let secrets = key_log.clone_inner();
-            assert_eq!(
-                secrets.client_traffic_secret.len(),
-                secrets.server_traffic_secret.len()
-            );
-            sess.writer()
-                .write_all(&(secrets.client_traffic_secret.len() as u16).to_le_bytes())
-                .unwrap();
-            sess.writer()
-                .write_all(&secrets.server_traffic_secret)
-                .unwrap();
-            sess.writer()
-                .write_all(&secrets.client_traffic_secret)
-                .unwrap();
-            sent_exporter = true;
-        }
-
-        if opts.send_key_update && !sent_key_update && !sess.is_handshaking() {
-            sess.refresh_traffic_keys().unwrap();
-            sent_key_update = true;
-        }
-
-        if !sess.is_handshaking() && opts.only_write_one_byte_after_handshake && !sent_message {
-            println!("writing message and then only one byte of its tls frame");
-            flush(&mut sess, &mut conn);
-
-            sess.writer()
-                .write_all(b"hello")
-                .unwrap();
-            sent_message = true;
-
-            let mut one_byte = [0u8];
-            let mut cursor = io::Cursor::new(&mut one_byte[..]);
-            sess.write_tls(&mut cursor).unwrap();
-            conn.write_all(&one_byte)
-                .expect("IO error");
-
-            quench_writes = true;
-        }
-
-        if opts.enable_early_data
-            && opts.side == Side::Client
-            && !sess.is_handshaking()
-            && count > 0
-        {
-            if opts.expect_accept_early_data && !client(&mut sess).is_early_data_accepted() {
-                quit_err("Early data was not accepted, but we expect the opposite");
-            } else if opts.expect_reject_early_data && client(&mut sess).is_early_data_accepted() {
-                quit_err("Early data was accepted, but we expect the opposite");
-            }
-            if opts.expect_version == 0x0304 {
-                match sess.protocol_version() {
-                    Some(ProtocolVersion::TLSv1_3) | Some(ProtocolVersion::Unknown(0x7f17)) => {}
-                    _ => quit_err("wrong protocol version"),
-                }
-            }
-        }
-
-        if let (Some(expected_options), false) =
-            (opts.expect_handshake_kind.as_ref(), sess.is_handshaking())
-        {
-            let actual = sess.handshake_kind().unwrap();
-            assert!(
-                expected_options.contains(&actual),
-                "wanted to see {expected_options:?} but got {actual:?}"
-            );
-        }
-
-        if let Some(curve_id) = &opts.expect_curve_id {
-            // unlike openssl/boringssl's API, `negotiated_key_exchange_group`
-            // works for the connection, not session.  this means TLS1.2
-            // resumptions never have a value for `negotiated_key_exchange_group`
-            let tls12_resumed = sess.protocol_version() == Some(ProtocolVersion::TLSv1_2)
-                && sess.handshake_kind() == Some(HandshakeKind::Resumed);
-            let negotiated_key_exchange_group_ready = !(sess.is_handshaking() || tls12_resumed);
-
-            if negotiated_key_exchange_group_ready {
-                let actual = sess
-                    .negotiated_key_exchange_group()
-                    .expect("no kx with -expect-curve-id");
-                assert_eq!(curve_id, &actual.name());
-            }
-        }
-
-        if let Some(curve_id) = &opts.on_initial_expect_curve_id {
-            if !sess.is_handshaking() && count == 0 {
-                assert_eq!(sess.handshake_kind().unwrap(), HandshakeKind::Full);
-                assert_eq!(
-                    sess.negotiated_key_exchange_group()
-                        .expect("no kx with -on-initial-expect-curve-id")
-                        .name(),
-                    *curve_id
-                );
-            }
-        }
-
-        if let Some(curve_id) = &opts.on_resume_expect_curve_id {
-            if !sess.is_handshaking() && count > 0 {
-                assert!(matches!(
-                    sess.handshake_kind().unwrap(),
-                    HandshakeKind::Resumed | HandshakeKind::ResumedWithHelloRetryRequest
-                ));
-                assert_eq!(
-                    sess.negotiated_key_exchange_group()
-                        .expect("no kx with -on-resume-expect-curve-id")
-                        .name(),
-                    *curve_id
-                );
-            }
-        }
-
-        {
-            let ech_accept_required =
-                (count == 0 && opts.on_initial_expect_ech_accept) || opts.expect_ech_accept;
-            if ech_accept_required
-                && !sess.is_handshaking()
-                && client(&mut sess).ech_status() != EchStatus::Accepted
-            {
-                quit_err("ECH was not accepted, but we expect the opposite");
-            }
-        }
-
-        let mut buf = [0u8; 1024];
-        let len = match sess
-            .reader()
-            .read(&mut buf[..opts.read_size])
-        {
-            Ok(0) => {
-                if opts.check_close_notify {
-                    println!("close notify ok");
-                }
-                println!("EOF (tls)");
-                return;
-            }
-            Ok(len) => len,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => 0,
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
-                if opts.check_close_notify {
-                    quit_err(":CLOSE_WITHOUT_CLOSE_NOTIFY:");
-                }
-                println!("EOF (tcp)");
-                return;
-            }
-            Err(err) => panic!("unhandled read error {err:?}"),
-        };
-
-        if opts.shut_down_after_handshake && !sent_shutdown && !sess.is_handshaking() {
-            sess.send_close_notify();
-            sent_shutdown = true;
-        }
-
-        if quench_writes && len > 0 {
-            println!("unquenching writes after {len:?}");
-            quench_writes = false;
-        }
-
-        for b in buf.iter_mut() {
-            *b ^= 0xff;
-        }
-
-        sess.writer()
-            .write_all(&buf[..len])
-            .unwrap();
-    }
-}
-
-enum SideConfig {
-    Client(Arc<ClientConfig>),
-    Server(Arc<ServerConfig>),
 }
 
 #[derive(Debug, Default)]
@@ -2154,6 +2157,12 @@ struct KeyLogMemoInner {
 }
 
 #[derive(Debug, PartialEq)]
+enum Side {
+    Client,
+    Server,
+}
+
+#[derive(Debug, PartialEq)]
 enum CompressionAlgs {
     None,
     All,
@@ -2169,7 +2178,7 @@ impl ShrinkingAlgorithm {
 
 impl compress::CertDecompressor for ShrinkingAlgorithm {
     fn algorithm(&self) -> CertificateCompressionAlgorithm {
-        CertificateCompressionAlgorithm::Unknown(Self::ALGORITHM)
+        CertificateCompressionAlgorithm(Self::ALGORITHM)
     }
 
     fn decompress(
@@ -2188,7 +2197,7 @@ impl compress::CertDecompressor for ShrinkingAlgorithm {
 
 impl compress::CertCompressor for ShrinkingAlgorithm {
     fn algorithm(&self) -> CertificateCompressionAlgorithm {
-        CertificateCompressionAlgorithm::Unknown(Self::ALGORITHM)
+        CertificateCompressionAlgorithm(Self::ALGORITHM)
     }
 
     fn compress(
@@ -2207,7 +2216,7 @@ struct ExpandingAlgorithm;
 
 impl compress::CertDecompressor for ExpandingAlgorithm {
     fn algorithm(&self) -> CertificateCompressionAlgorithm {
-        CertificateCompressionAlgorithm::Unknown(0xff02)
+        CertificateCompressionAlgorithm(0xff02)
     }
 
     fn decompress(
@@ -2228,7 +2237,7 @@ impl compress::CertDecompressor for ExpandingAlgorithm {
 
 impl compress::CertCompressor for ExpandingAlgorithm {
     fn algorithm(&self) -> CertificateCompressionAlgorithm {
-        CertificateCompressionAlgorithm::Unknown(0xff02)
+        CertificateCompressionAlgorithm(0xff02)
     }
 
     fn compress(
@@ -2249,7 +2258,7 @@ struct RandomAlgorithm;
 
 impl compress::CertDecompressor for RandomAlgorithm {
     fn algorithm(&self) -> CertificateCompressionAlgorithm {
-        CertificateCompressionAlgorithm::Unknown(0xff03)
+        CertificateCompressionAlgorithm(0xff03)
     }
 
     fn decompress(
@@ -2267,7 +2276,7 @@ impl compress::CertDecompressor for RandomAlgorithm {
 
 impl compress::CertCompressor for RandomAlgorithm {
     fn algorithm(&self) -> CertificateCompressionAlgorithm {
-        CertificateCompressionAlgorithm::Unknown(0xff03)
+        CertificateCompressionAlgorithm(0xff03)
     }
 
     fn compress(
@@ -2315,3 +2324,5 @@ static ALL_HPKE_SUITES: &[&dyn Hpke] = &[
 ];
 
 static BOGO_NACK: i32 = 89;
+
+const MAX_MESSAGE_SIZE: usize = 0xffff + 5;

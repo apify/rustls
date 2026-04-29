@@ -15,10 +15,11 @@ use std::{fs, thread};
 use clap::Parser;
 use rcgen::{Issuer, KeyPair, SerialNumber};
 use rustls::RootCertStore;
-use rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 use rustls::crypto::{CryptoProvider, Identity};
 use rustls::pki_types::{CertificateRevocationListDer, PrivatePkcs8KeyDer};
 use rustls::server::{Acceptor, ClientHello, ServerConfig, WebPkiClientVerifier};
+use rustls_aws_lc_rs::DEFAULT_PROVIDER;
+use rustls_util::{KeyLogFile, complete_io};
 
 fn main() {
     let args = Args::parse();
@@ -106,7 +107,7 @@ fn main() {
 
         // Proceed with handling the ServerConnection
         // Important: We do no error handling here, but you should!
-        _ = conn.complete_io(&mut stream);
+        _ = complete_io(&mut stream, &mut conn);
     }
 }
 
@@ -159,7 +160,7 @@ impl TestPki {
         client_ee_params.is_ca = rcgen::IsCa::NoCa;
         client_ee_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
         let client_serial = SerialNumber::from(vec![0xC0, 0xFF, 0xEE]);
-        client_ee_params.serial_number = Some(client_serial.clone());
+        client_ee_params.serial_number = Some(client_serial);
         let client_key = KeyPair::generate_for(alg).unwrap();
         let client_cert = client_ee_params
             .signed_by(&client_key, &ca)
@@ -203,10 +204,12 @@ impl TestPki {
         crl_file.read_to_end(&mut crl).unwrap();
 
         // Construct a fresh verifier using the test PKI roots, and the updated CRL.
-        let verifier = WebPkiClientVerifier::builder(self.roots.clone(), &self.provider)
-            .with_crls([CertificateRevocationListDer::from(crl)])
-            .build()
-            .unwrap();
+        let verifier = Arc::new(
+            WebPkiClientVerifier::builder(self.roots.clone(), &self.provider)
+                .with_crls([CertificateRevocationListDer::from(crl)])
+                .build()
+                .unwrap(),
+        );
 
         // Build a server config using the fresh verifier. If necessary, this could be customized
         // based on the ClientHello (e.g. selecting a different certificate, or customizing
@@ -227,7 +230,7 @@ impl TestPki {
             .unwrap();
 
         // Allow using SSLKEYLOGFILE.
-        server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+        server_config.key_log = Arc::new(KeyLogFile::new());
 
         Arc::new(server_config)
     }

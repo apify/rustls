@@ -1,6 +1,7 @@
 upper-case-acronyms-aggressive = true
+check-inconsistent-struct-field-initializers = true
 
 disallowed-types = [
   { path = "std::sync::Arc", reason = "must use Arc from sync module to support downstream forks targeting architectures without atomic ptrs" },
-  { path = "std::sync::Weak", reason = "must use Weak from sync module to support downstream forks targeting architectures without atomic ptrs" },
+  { path = "alloc::sync::Arc", reason = "must use Arc from sync module to support downstream forks targeting architectures without atomic ptrs" },
 ]

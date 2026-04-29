@@ -13,12 +13,12 @@ use rustls::crypto::kx::{
 };
 use rustls::enums::{ContentType, ProtocolVersion};
 use rustls::error::{AlertDescription, Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
-use rustls::internal::msgs::enums::ExtensionType;
-use rustls::{ClientConfig, HandshakeKind, ServerConfig};
+use rustls::{ClientConfig, Connection, HandshakeKind, ServerConfig};
 use rustls_test::{
-    ClientConfigExt, ClientStorage, ClientStorageOp, KeyType, OtherSession, ServerConfigExt,
-    do_handshake, do_handshake_until_error, encoding, make_client_config_with_kx_groups, make_pair,
-    make_pair_for_configs, make_server_config, make_server_config_with_kx_groups, transfer,
+    ClientConfigExt, ClientStorage, ClientStorageOp, ErrorFromPeer, KeyType, OtherSession,
+    ServerConfigExt, do_handshake, do_handshake_until_error, encoding,
+    make_client_config_with_kx_groups, make_pair, make_pair_for_configs, make_server_config,
+    make_server_config_with_kx_groups, transfer,
 };
 
 use super::{ALL_VERSIONS, provider};
@@ -48,7 +48,12 @@ fn test_client_config_keyshare_mismatch() {
         &provider,
     );
     let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
-    assert!(do_handshake_until_error(&mut client, &mut server).is_err());
+    assert_eq!(
+        do_handshake_until_error(&mut client, &mut server).err(),
+        Some(ErrorFromPeer::Server(
+            PeerIncompatible::NoKxGroupsInCommon.into()
+        ))
+    );
 }
 
 #[test]
@@ -76,7 +81,7 @@ fn exercise_all_key_exchange_methods() {
                 &version_provider,
             );
             let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
-            assert!(do_handshake_until_error(&mut client, &mut server).is_ok());
+            do_handshake_until_error(&mut client, &mut server).unwrap();
             println!("kx_group {:?} is self-consistent", kx_group.name());
         }
     }
@@ -117,10 +122,7 @@ fn test_client_sends_helloretryrequest() {
     }
 
     assert_eq!(client.handshake_kind(), None);
-    assert_eq!(
-        server.handshake_kind(),
-        Some(HandshakeKind::FullWithHelloRetryRequest)
-    );
+    assert_eq!(server.handshake_kind(), None);
 
     // server sends HRR
     {
@@ -131,14 +133,8 @@ fn test_client_sends_helloretryrequest() {
         assert!(pipe.writevs[0].len() == 2); // hello retry request and CCS
     }
 
-    assert_eq!(
-        client.handshake_kind(),
-        Some(HandshakeKind::FullWithHelloRetryRequest)
-    );
-    assert_eq!(
-        server.handshake_kind(),
-        Some(HandshakeKind::FullWithHelloRetryRequest)
-    );
+    assert_eq!(client.handshake_kind(), None);
+    assert_eq!(server.handshake_kind(), None);
 
     // client sends fixed hello
     {
@@ -312,6 +308,7 @@ fn test_client_sends_share_for_less_preferred_group() {
     ));
 
     // second handshake; HRR'd from secp384r1 to X25519
+    // (but resuming is possible, since the session storage is shared)
     let (mut client_2, mut server) = make_pair_for_configs(client_config_2, server_config);
     do_handshake(&mut client_2, &mut server);
     assert_eq!(
@@ -322,7 +319,7 @@ fn test_client_sends_share_for_less_preferred_group() {
     );
     assert_eq!(
         client_2.handshake_kind(),
-        Some(HandshakeKind::FullWithHelloRetryRequest)
+        Some(HandshakeKind::ResumedWithHelloRetryRequest)
     );
 }
 
@@ -337,11 +334,11 @@ fn test_server_rejects_clients_without_any_kx_groups() {
                 encoding::client_hello_with_extensions(vec![
                     encoding::Extension::new_sig_algs(),
                     encoding::Extension {
-                        typ: ExtensionType::EllipticCurves,
+                        typ: encoding::Extension::ELLIPTIC_CURVES,
                         body: encoding::len_u16(vec![]),
                     },
                     encoding::Extension {
-                        typ: ExtensionType::KeyShare,
+                        typ: encoding::Extension::KEY_SHARE,
                         body: encoding::len_u16(vec![]),
                     },
                 ]),

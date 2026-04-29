@@ -1,17 +1,14 @@
 use alloc::vec::Vec;
 use core::fmt::Debug;
-#[cfg(feature = "impit")]
-use std::vec;
+use core::hash::Hasher;
 
 use pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 
-#[cfg(feature = "impit")]
-use crate::client::client_emulator::BrowserEmulator;
+use crate::crypto::cipher::Payload;
 use crate::crypto::{Identity, SignatureScheme};
 use crate::enums::CertificateType;
 use crate::error::{Error, InvalidMessage};
-use crate::msgs::base::{NonEmpty, PayloadU16};
-use crate::msgs::codec::{Codec, ListLength, Reader, TlsListElement};
+use crate::msgs::{Codec, ListLength, MaybeEmpty, NonEmpty, Reader, SizedPayload, TlsListElement};
 use crate::sync::Arc;
 use crate::x509::wrap_in_sequence;
 
@@ -24,74 +21,6 @@ use crate::x509::wrap_in_sequence;
 // These types are public, but cannot be directly constructed.  This
 // means their origins can be precisely determined by looking
 // for their `assertion` constructors.
-
-/// Disables all server certificate verification.
-/// Note that this can be potentially dangerous!
-///
-/// Used for the `ignore_tls_errors` option in `impit`.
-#[cfg(feature = "impit")]
-#[derive(Debug)]
-pub struct NoVerifier(Option<BrowserEmulator>);
-
-#[cfg(feature = "impit")]
-impl NoVerifier {
-    /// Create a new `NoVerifier` instance.
-    pub fn new(browser_emulator: Option<BrowserEmulator>) -> Self {
-        Self(browser_emulator)
-    }
-}
-
-#[cfg(feature = "impit")]
-impl ServerVerifier for NoVerifier {
-    fn verify_identity(&self, _identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
-        Ok(PeerVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _input: &SignatureVerificationInput<'_>,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _input: &SignatureVerificationInput<'_>,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        use crate::client::client_emulator::BrowserType;
-        use crate::crypto::emulation::{CHROME_SIGNATURE_SCHEMES, FIREFOX_SIGNATURE_SCHEMES};
-
-        match &self.0 {
-            Some(browser_emulator) => match browser_emulator.browser_type {
-                BrowserType::Chrome => CHROME_SIGNATURE_SCHEMES.to_vec(),
-                BrowserType::Firefox => FIREFOX_SIGNATURE_SCHEMES.to_vec(),
-            },
-            None => vec![
-                SignatureScheme::RSA_PKCS1_SHA1,
-                SignatureScheme::ECDSA_SHA1_Legacy,
-                SignatureScheme::RSA_PKCS1_SHA256,
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::RSA_PKCS1_SHA384,
-                SignatureScheme::ECDSA_NISTP384_SHA384,
-                SignatureScheme::RSA_PKCS1_SHA512,
-                SignatureScheme::ECDSA_NISTP521_SHA512,
-                SignatureScheme::RSA_PSS_SHA256,
-                SignatureScheme::RSA_PSS_SHA384,
-                SignatureScheme::RSA_PSS_SHA512,
-                SignatureScheme::ED25519,
-                SignatureScheme::ED448,
-            ],
-        }
-    }
-
-    fn request_ocsp_response(&self) -> bool {
-        false
-    }
-}
 
 /// Something that can verify a server certificate chain, and verify
 /// signatures made by certificates.
@@ -168,6 +97,9 @@ pub trait ServerVerifier: Debug + Send + Sync {
     fn root_hint_subjects(&self) -> Option<Arc<[DistinguishedName]>> {
         None
     }
+
+    /// Instance configuration should be input to `h`.
+    fn hash_config(&self, h: &mut dyn Hasher);
 }
 
 /// Data required to verify a server's identity.
@@ -185,6 +117,18 @@ pub struct ServerIdentity<'a> {
     pub ocsp_response: &'a [u8],
     /// Current time against which time-sensitive inputs should be validated.
     pub now: UnixTime,
+}
+
+impl<'a> ServerIdentity<'a> {
+    /// Create a new `ServerIdentity` instance with empty OCSP response.
+    pub fn new(identity: &'a Identity<'a>, server_name: &'a ServerName<'a>, now: UnixTime) -> Self {
+        Self {
+            identity,
+            server_name,
+            ocsp_response: &[],
+            now,
+        }
+    }
 }
 
 /// Something that can verify a client certificate chain
@@ -370,20 +314,20 @@ impl ClientVerifier for NoClientAuth {
 pub struct DigitallySignedStruct {
     /// The [`SignatureScheme`] used to produce the signature.
     pub scheme: SignatureScheme,
-    sig: PayloadU16,
+    sig: SizedPayload<'static, u16, MaybeEmpty>,
 }
 
 impl DigitallySignedStruct {
     pub(crate) fn new(scheme: SignatureScheme, sig: Vec<u8>) -> Self {
         Self {
             scheme,
-            sig: PayloadU16::new(sig),
+            sig: SizedPayload::from(Payload::new(sig)),
         }
     }
 
     /// Get the signature.
     pub fn signature(&self) -> &[u8] {
-        &self.sig.0
+        self.sig.bytes()
     }
 }
 
@@ -394,10 +338,10 @@ impl Codec<'_> for DigitallySignedStruct {
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
-        let scheme = SignatureScheme::read(r)?;
-        let sig = PayloadU16::read(r)?;
-
-        Ok(Self { scheme, sig })
+        Ok(Self {
+            scheme: SignatureScheme::read(r)?,
+            sig: SizedPayload::read(r)?.into_owned(),
+        })
     }
 }
 
@@ -417,7 +361,7 @@ wrapped_payload!(
     ///
     /// The TLS encoding is defined in RFC5246: `opaque DistinguishedName<1..2^16-1>;`
     pub struct DistinguishedName,
-    PayloadU16<NonEmpty>,
+    SizedPayload<u16, NonEmpty>,
 );
 
 impl DistinguishedName {
@@ -430,13 +374,13 @@ impl DistinguishedName {
     /// println!("{}", x509_parser::x509::X509Name::from_der(dn.as_ref())?.1);
     /// ```
     pub fn in_sequence(bytes: &[u8]) -> Self {
-        Self(PayloadU16::new(wrap_in_sequence(bytes)))
+        Self(SizedPayload::from(Payload::new(wrap_in_sequence(bytes))))
     }
 }
 
 impl PartialEq for DistinguishedName {
     fn eq(&self, other: &Self) -> bool {
-        self.0.0 == other.0.0
+        self.0.bytes() == other.0.bytes()
     }
 }
 

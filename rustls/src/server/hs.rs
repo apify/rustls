@@ -4,93 +4,266 @@ use alloc::vec::Vec;
 use core::borrow::Borrow;
 use core::fmt;
 
-use super::connection::ServerConnectionData;
-use super::{ClientHello, ServerConfig};
+use pki_types::DnsName;
+
+use super::config::{CipherSuiteSelector, VersionSuiteSelector};
+use super::{ClientHello, CommonServerSessionValue, ServerConfig, tls12, tls13};
 use crate::SupportedCipherSuite;
-use crate::common_state::{KxState, State};
-use crate::conn::ConnectionRandoms;
+use crate::common_state::{Event, Output, OutputEvent, Protocol};
+use crate::conn::{ConnectionRandoms, Input};
 use crate::crypto::hash::Hash;
 use crate::crypto::kx::{KeyExchangeAlgorithm, NamedGroup, SupportedKxGroup};
 use crate::crypto::{CipherSuite, CryptoProvider, SelectedCredential, SignatureScheme};
-use crate::enums::{CertificateType, HandshakeType, ProtocolVersion};
-use crate::error::{AlertDescription, ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
+use crate::enums::{ApplicationProtocol, CertificateType, HandshakeType, ProtocolVersion};
+use crate::error::{ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
+use crate::kernel::KernelState;
 use crate::log::{debug, trace};
-use crate::msgs::deframer::HandshakeAlignedProof;
-use crate::msgs::enums::Compression;
-use crate::msgs::handshake::{
-    ClientHelloPayload, HandshakePayload, ProtocolName, Random, ServerExtensions,
-    ServerExtensionsInput, ServerNamePayload, SessionId, SingleProtocolName, TransportParameters,
+use crate::msgs::{
+    ClientHelloPayload, Compression, HandshakeAlignedProof, HandshakePayload, Message,
+    MessagePayload, Random, ServerExtensions, ServerExtensionsInput, ServerNamePayload, SessionId,
+    SingleProtocolName, TransportParameters,
 };
-use crate::msgs::message::{Message, MessagePayload};
-use crate::msgs::persist;
 use crate::sealed::Sealed;
-use crate::suites::Suite;
+use crate::suites::{PartiallyExtractedSecrets, Suite};
 use crate::sync::Arc;
 use crate::tls12::Tls12CipherSuite;
 use crate::tls13::Tls13CipherSuite;
+use crate::tls13::key_schedule::KeyScheduleTrafficSend;
 
-pub(super) type NextState = Box<dyn State<ServerConnectionData>>;
-pub(super) type NextStateOrError = Result<NextState, Error>;
-pub(super) type ServerContext<'a> = crate::common_state::Context<'a, ServerConnectionData>;
+pub(crate) enum ServerState {
+    /// Reading an entire ClientHello
+    ///
+    /// Validations that do not rely on a config can be performed here, but most are
+    /// deferred until [`ServerState::ClientHello`].
+    ReadClientHello(ReadClientHello),
 
-#[derive(Default)]
-pub(super) struct ExtensionProcessing {
-    // extensions to reply with
-    pub(super) extensions: Box<ServerExtensions<'static>>,
+    /// Choose a [`ServerConfig`] based on the received ClientHello.
+    ChooseConfig(Box<ChooseConfig>),
+
+    /// Processing the received ClientHello.
+    ClientHello(Box<ExpectClientHello>),
+    Tls12(tls12::Tls12State),
+    Tls13(tls13::Tls13State),
+}
+
+impl ServerState {
+    pub(crate) fn set_resumption_data(&mut self, resumption_data: &[u8]) -> Result<(), Error> {
+        match self {
+            Self::ReadClientHello(e) => e.set_resumption_data(resumption_data),
+            Self::ChooseConfig(e) => e.set_resumption_data(resumption_data),
+            Self::ClientHello(e) => e.set_resumption_data(resumption_data),
+            _ => Err(ApiMisuse::ResumptionDataProvidedTooLate.into()),
+        }
+    }
+}
+
+impl crate::conn::StateMachine for ServerState {
+    fn handle<'m>(self, input: Input<'m>, output: &mut dyn Output<'m>) -> Result<Self, Error> {
+        match self {
+            Self::ReadClientHello(r) => r.handle(input, output),
+            Self::ChooseConfig(_) => {
+                Err(Error::Unreachable("ChooseConfig cannot process a message"))
+            }
+            Self::ClientHello(e) => e.handle(input, output),
+            Self::Tls12(sm) => sm.handle(input, output),
+            Self::Tls13(sm) => sm.handle(input, output),
+        }
+    }
+
+    fn wants_input(&self) -> bool {
+        !matches!(self, Self::ChooseConfig(_))
+    }
+
+    fn handle_decrypt_error(&mut self) {}
+
+    fn into_external_state(
+        self,
+        send_keys: &Option<Box<KeyScheduleTrafficSend>>,
+    ) -> Result<(PartiallyExtractedSecrets, Box<dyn KernelState + 'static>), Error> {
+        match self {
+            Self::Tls13(tls13::Tls13State::Traffic(e)) => e.into_external_state(send_keys),
+            Self::Tls12(tls12::Tls12State::Traffic(e)) => e.into_external_state(send_keys),
+            _ => Err(Error::HandshakeNotComplete),
+        }
+    }
+}
+
+pub(super) struct Tls12Extensions {
+    pub(super) alpn_protocol: Option<ApplicationProtocol<'static>>,
     pub(super) send_ticket: bool,
 }
 
-impl ExtensionProcessing {
-    pub(super) fn new(extra_exts: ServerExtensionsInput<'static>) -> Self {
+impl Tls12Extensions {
+    pub(super) fn new(
+        extra_exts: ServerExtensionsInput,
+        ocsp_response: &mut Option<&[u8]>,
+        resumedata: Option<&CommonServerSessionValue<'_>>,
+        hello: &ClientHelloPayload,
+        output: &mut dyn Output<'_>,
+        using_ems: bool,
+        config: &ServerConfig,
+    ) -> Result<(Self, Box<ServerExtensions<'static>>), Error> {
+        let ep = ExtensionProcessing::new(hello, config);
+        let (alpn_protocol, mut extensions) =
+            ep.process_common(extra_exts, output, ocsp_response, resumedata)?;
+
+        // Renegotiation.
+        // (We don't do reneg at all, but would support the secure version if we did.)
+        if hello.renegotiation_info.is_some()
+            || hello
+                .cipher_suites
+                .contains(&CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV)
+        {
+            extensions.renegotiation_info = Some(Vec::new().into());
+        }
+
+        // Tickets:
+        // If we get any SessionTicket extension and have tickets enabled,
+        // we send an ack.
+        let send_ticket = if hello.session_ticket.is_some() && config.ticketer.is_some() {
+            extensions.session_ticket_ack = Some(());
+            true
+        } else {
+            false
+        };
+
+        // Confirm use of EMS if offered.
+        if using_ems {
+            extensions.extended_master_secret_ack = Some(());
+        }
+
+        // Send confirmation of OCSP staple request if we will send one.
+        if let Some([_, ..]) = ocsp_response {
+            extensions.certificate_status_request_ack = Some(());
+        }
+
+        let out = Self {
+            alpn_protocol,
+            send_ticket,
+        };
+
+        Ok((out, extensions))
+    }
+}
+
+pub(super) struct Tls13Extensions {
+    pub(super) certificate_types: CertificateTypes,
+    pub(super) alpn_protocol: Option<ApplicationProtocol<'static>>,
+}
+
+impl Tls13Extensions {
+    pub(super) fn new(
+        extra_exts: ServerExtensionsInput,
+        ocsp_response: &mut Option<&[u8]>,
+        resumedata: Option<&CommonServerSessionValue<'_>>,
+        hello: &ClientHelloPayload,
+        output: &mut dyn Output<'_>,
+        config: &ServerConfig,
+    ) -> Result<(Self, Box<ServerExtensions<'static>>), Error> {
+        let ep = ExtensionProcessing::new(hello, config);
+        let (alpn_protocol, mut extensions) =
+            ep.process_common(extra_exts, output, ocsp_response, resumedata)?;
+
+        let expected_client_type = select_cert_type(
+            hello
+                .client_certificate_types
+                .as_deref(),
+            config
+                .verifier
+                .supported_certificate_types(),
+        )?;
+
+        let expected_server_type = select_cert_type(
+            hello
+                .server_certificate_types
+                .as_deref(),
+            config
+                .cert_resolver
+                .supported_certificate_types(),
+        )?;
+
+        if hello.client_certificate_types.is_some() && config.verifier.offer_client_auth() {
+            extensions.client_certificate_type = Some(expected_client_type);
+        }
+        if hello.server_certificate_types.is_some() {
+            extensions.server_certificate_type = Some(expected_server_type);
+        }
+
+        let out = Self {
+            certificate_types: CertificateTypes {
+                client: expected_client_type,
+            },
+            alpn_protocol,
+        };
+
+        Ok((out, extensions))
+    }
+}
+
+struct ExtensionProcessing<'a> {
+    config: &'a ServerConfig,
+    hello: &'a ClientHelloPayload,
+}
+
+impl<'a> ExtensionProcessing<'a> {
+    fn new(client_hello: &'a ClientHelloPayload, config: &'a ServerConfig) -> Self {
+        Self {
+            config,
+            hello: client_hello,
+        }
+    }
+
+    fn process_common(
+        self,
+        extra_exts: ServerExtensionsInput,
+        output: &mut dyn Output<'_>,
+        ocsp_response: &mut Option<&[u8]>,
+        resumedata: Option<&CommonServerSessionValue<'_>>,
+    ) -> Result<
+        (
+            Option<ApplicationProtocol<'static>>,
+            Box<ServerExtensions<'static>>,
+        ),
+        Error,
+    > {
+        let Self { config, hello } = self;
+        let mut extensions = Box::new(ServerExtensions::default());
+
         let ServerExtensionsInput {
             transport_parameters,
         } = extra_exts;
-
-        let mut extensions = Box::new(ServerExtensions::default());
         if let Some(TransportParameters::Quic(v)) = transport_parameters {
             extensions.transport_parameters = Some(v);
         }
 
-        Self {
-            extensions,
-            send_ticket: false,
-        }
-    }
-
-    pub(super) fn process_common(
-        &mut self,
-        config: &ServerConfig,
-        cx: &mut ServerContext<'_>,
-        ocsp_response: &mut Option<&[u8]>,
-        hello: &ClientHelloPayload,
-        resumedata: Option<&persist::CommonServerSessionValue>,
-    ) -> Result<CertificateTypes, Error> {
         // ALPN
         let our_protocols = &config.alpn_protocols;
-        if let Some(their_protocols) = &hello.protocols {
-            cx.common.alpn_protocol = our_protocols
-                .iter()
-                .find(|ours| {
-                    their_protocols
-                        .iter()
-                        .any(|theirs| theirs.as_ref() == ours.as_slice())
-                })
-                .map(|bytes| ProtocolName::from(bytes.clone()));
-            if let Some(selected_protocol) = &cx.common.alpn_protocol {
+        let chosen_protocol = if let Some(their_protocols) = &hello.protocols {
+            if let Some(selected_protocol) = our_protocols.iter().find(|ours| {
+                their_protocols
+                    .iter()
+                    .any(|theirs| theirs.as_ref() == ours.as_ref())
+            }) {
                 debug!("Chosen ALPN protocol {selected_protocol:?}");
 
-                self.extensions.selected_protocol =
-                    Some(SingleProtocolName::new(selected_protocol.clone()));
+                Some(selected_protocol)
             } else if !our_protocols.is_empty() {
-                return Err(cx.common.send_fatal_alert(
-                    AlertDescription::NoApplicationProtocol,
-                    Error::NoApplicationProtocol,
-                ));
+                return Err(Error::NoApplicationProtocol);
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        // Enact ALPN selection by telling peer and high-level API.
+        if let Some(protocol) = &chosen_protocol {
+            extensions.selected_protocol = Some(SingleProtocolName::new((*protocol).to_owned()));
+            output.output(OutputEvent::ApplicationProtocol((*protocol).to_owned()));
         }
 
-        if cx.common.is_quic() {
+        if let Some(quic) = output.quic() {
             // QUIC has strict ALPN, unlike TLS's more backwards-compatible behavior. RFC 9001
             // says: "The server MUST treat the inability to select a compatible application
             // protocol as a connection error of type 0x0178". We judge that ALPN was desired
@@ -98,21 +271,15 @@ impl ExtensionProcessing {
             // protocols were configured locally or offered by the client. This helps prevent
             // successful establishment of connections between peers that can't understand
             // each other.
-            if cx.common.alpn_protocol.is_none()
-                && (!our_protocols.is_empty() || hello.protocols.is_some())
+            if chosen_protocol.is_none() && (!our_protocols.is_empty() || hello.protocols.is_some())
             {
-                return Err(cx.common.send_fatal_alert(
-                    AlertDescription::NoApplicationProtocol,
-                    Error::NoApplicationProtocol,
-                ));
+                return Err(Error::NoApplicationProtocol);
             }
 
             match hello.transport_parameters.as_ref() {
-                Some(params) => cx.common.quic.params = Some(params.to_owned().into_vec()),
+                Some(params) => quic.transport_parameters(params.to_owned().into_vec()),
                 None => {
-                    return Err(cx
-                        .common
-                        .missing_extension(PeerMisbehaved::MissingQuicTransportParameters));
+                    return Err(PeerMisbehaved::MissingQuicTransportParameters.into());
                 }
             }
         }
@@ -121,152 +288,154 @@ impl ExtensionProcessing {
         // SNI
         if let (false, Some(ServerNamePayload::SingleDnsName(_))) = (for_resume, &hello.server_name)
         {
-            self.extensions.server_name_ack = Some(());
+            extensions.server_name_ack = Some(());
         }
 
-        // Send status_request response if we have one.  This is not allowed
-        // if we're resuming, and is only triggered if we have an OCSP response
-        // to send.
-        if !for_resume
-            && hello
+        // Discard OCSP response if it is not necessary.
+        if for_resume
+            || hello
                 .certificate_status_request
-                .is_some()
+                .is_none()
         {
-            if let (Some([_, ..]), false) = (ocsp_response, cx.common.is_tls13()) {
-                // Only TLS1.2 sends confirmation in ServerHello
-                self.extensions
-                    .certificate_status_request_ack = Some(());
-            }
-        } else {
-            // Throw away any OCSP response so we don't try to send it later.
             ocsp_response.take();
         }
 
-        let expected_client_type = self.process_cert_type_extension(
-            hello
-                .client_certificate_types
-                .as_deref(),
-            config
-                .verifier
-                .supported_certificate_types(),
-            cx,
-        )?;
+        Ok((chosen_protocol.map(|p| p.to_owned()), extensions))
+    }
+}
 
-        let expected_server_type = self.process_cert_type_extension(
-            hello
-                .server_certificate_types
-                .as_deref(),
-            config
-                .cert_resolver
-                .supported_certificate_types(),
-            cx,
-        )?;
-
-        if hello.client_certificate_types.is_some() && config.verifier.offer_client_auth() {
-            self.extensions.client_certificate_type = Some(expected_client_type);
-        }
-        if hello.server_certificate_types.is_some() {
-            self.extensions.server_certificate_type = Some(expected_server_type);
-        }
-        Ok(CertificateTypes {
-            client: expected_client_type,
-        })
+fn select_cert_type(
+    client: Option<&[CertificateType]>,
+    server: &[CertificateType],
+) -> Result<CertificateType, Error> {
+    if server.is_empty() {
+        return Err(ApiMisuse::NoSupportedCertificateTypes.into());
     }
 
-    pub(super) fn process_tls12(
-        &mut self,
-        config: &ServerConfig,
-        hello: &ClientHelloPayload,
-        using_ems: bool,
-    ) {
-        // Renegotiation.
-        // (We don't do reneg at all, but would support the secure version if we did.)
+    // https://www.rfc-editor.org/rfc/rfc7250#section-4.1
+    // If the client has no remaining certificate types to send in
+    // the client hello, other than the default X.509 type, it MUST omit the
+    // client_certificate_type extension in the client hello.
 
-        use crate::msgs::base::PayloadU8;
-        let secure_reneg_offered = hello.renegotiation_info.is_some()
-            || hello
-                .cipher_suites
-                .contains(&CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
-
-        if secure_reneg_offered {
-            self.extensions.renegotiation_info = Some(PayloadU8::new(Vec::new()));
+    // If the client has no remaining certificate types to send in
+    // the client hello, other than the default X.509 certificate type, it
+    // MUST omit the entire server_certificate_type extension from the
+    // client hello.
+    let client = match client {
+        Some([]) => {
+            return Err(PeerIncompatible::IncorrectCertificateTypeExtension.into());
         }
-
-        // Tickets:
-        // If we get any SessionTicket extension and have tickets enabled,
-        // we send an ack.
-        if hello.session_ticket.is_some() && config.ticketer.is_some() {
-            self.send_ticket = true;
-            self.extensions.session_ticket_ack = Some(());
+        Some(c) => c,
+        None => {
+            return match server.contains(&CertificateType::X509) {
+                true => Ok(CertificateType::X509),
+                false => Err(PeerIncompatible::IncorrectCertificateTypeExtension.into()),
+            };
         }
+    };
 
-        // Confirm use of EMS if offered.
-        if using_ems {
-            self.extensions
-                .extended_master_secret_ack = Some(());
+    for &ct in client {
+        if server.contains(&ct) {
+            return Ok(ct);
         }
     }
 
-    fn process_cert_type_extension(
-        &mut self,
-        client: Option<&[CertificateType]>,
-        server: &[CertificateType],
-        cx: &mut ServerContext<'_>,
-    ) -> Result<CertificateType, Error> {
-        if server.is_empty() {
-            return Err(ApiMisuse::NoSupportedCertificateTypes.into());
-        }
-
-        // https://www.rfc-editor.org/rfc/rfc7250#section-4.1
-        // If the client has no remaining certificate types to send in
-        // the client hello, other than the default X.509 type, it MUST omit the
-        // client_certificate_type extension in the client hello.
-
-        // If the client has no remaining certificate types to send in
-        // the client hello, other than the default X.509 certificate type, it
-        // MUST omit the entire server_certificate_type extension from the
-        // client hello.
-        let client = match client {
-            Some([]) => {
-                return Err(cx.common.send_fatal_alert(
-                    AlertDescription::HandshakeFailure,
-                    PeerIncompatible::IncorrectCertificateTypeExtension,
-                ));
-            }
-            Some(c) => c,
-            None => {
-                return match server.contains(&CertificateType::X509) {
-                    true => Ok(CertificateType::X509),
-                    false => Err(cx.common.send_fatal_alert(
-                        AlertDescription::HandshakeFailure,
-                        PeerIncompatible::IncorrectCertificateTypeExtension,
-                    )),
-                };
-            }
-        };
-
-        for &ct in client {
-            if server.contains(&ct) {
-                return Ok(ct);
-            }
-        }
-
-        Err(cx.common.send_fatal_alert(
-            AlertDescription::UnsupportedCertificate,
-            PeerIncompatible::IncorrectCertificateTypeExtension,
-        ))
-    }
+    Err(PeerIncompatible::IncorrectCertificateTypeExtension.into())
 }
 
 pub(super) struct CertificateTypes {
     pub(super) client: CertificateType,
 }
 
+pub(crate) struct ReadClientHello {
+    protocol: Protocol,
+    resumption_data: Vec<u8>,
+}
+
+impl ReadClientHello {
+    pub(crate) fn new(protocol: Protocol) -> Self {
+        Self {
+            protocol,
+            resumption_data: Vec::new(),
+        }
+    }
+
+    pub(crate) fn handle<'m>(
+        self,
+        input: Input<'m>,
+        _output: &mut dyn Output<'_>,
+    ) -> Result<ServerState, Error> {
+        ClientHelloInput::from_input(&input)?;
+        Ok(Box::new(ChooseConfig {
+            client_hello: Input {
+                message: input.message.into_owned(),
+                aligned_handshake: input.aligned_handshake,
+            },
+            resumption_data: self.resumption_data,
+            protocol: self.protocol,
+        })
+        .into())
+    }
+
+    fn set_resumption_data(&mut self, resumption_data: &[u8]) -> Result<(), Error> {
+        self.resumption_data = resumption_data.to_vec();
+        Ok(())
+    }
+}
+
+impl From<ReadClientHello> for ServerState {
+    fn from(value: ReadClientHello) -> Self {
+        Self::ReadClientHello(value)
+    }
+}
+
+pub(crate) struct ChooseConfig {
+    protocol: Protocol,
+    resumption_data: Vec<u8>,
+    client_hello: Input<'static>,
+}
+
+impl ChooseConfig {
+    pub(crate) fn use_config(
+        self,
+        config: Arc<ServerConfig>,
+        extra_exts: ServerExtensionsInput,
+        output: &mut dyn Output<'_>,
+    ) -> Result<ServerState, Error> {
+        ExpectClientHello::new(config, extra_exts, self.resumption_data, self.protocol)
+            .with_input(ClientHelloInput::from_input(&self.client_hello)?, output)
+    }
+
+    pub(crate) fn client_hello(&self) -> &ClientHelloPayload {
+        match &self.client_hello.message.payload {
+            MessagePayload::Handshake { parsed, .. } => match &parsed.0 {
+                HandshakePayload::ClientHello(ch) => ch,
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    fn set_resumption_data(&mut self, resumption_data: &[u8]) -> Result<(), Error> {
+        self.resumption_data = resumption_data.to_vec();
+        Ok(())
+    }
+}
+
+impl From<Box<ChooseConfig>> for ServerState {
+    fn from(value: Box<ChooseConfig>) -> Self {
+        Self::ChooseConfig(value)
+    }
+}
+
 pub(crate) struct ExpectClientHello {
     pub(super) config: Arc<ServerConfig>,
-    pub(super) extra_exts: ServerExtensionsInput<'static>,
+    pub(super) protocol: Protocol,
+    pub(super) extra_exts: ServerExtensionsInput,
     pub(super) transcript: HandshakeHashOrBuffer,
     pub(super) session_id: SessionId,
+    pub(super) sni: Option<DnsName<'static>>,
+    pub(super) resumption_data: Vec<u8>,
     pub(super) using_ems: bool,
     pub(super) done_retry: bool,
     pub(super) send_tickets: usize,
@@ -275,7 +444,9 @@ pub(crate) struct ExpectClientHello {
 impl ExpectClientHello {
     pub(super) fn new(
         config: Arc<ServerConfig>,
-        extra_exts: ServerExtensionsInput<'static>,
+        extra_exts: ServerExtensionsInput,
+        resumption_data: Vec<u8>,
+        protocol: Protocol,
     ) -> Self {
         let mut transcript_buffer = HandshakeHashBuffer::new();
 
@@ -285,9 +456,12 @@ impl ExpectClientHello {
 
         Self {
             config,
+            protocol,
             extra_exts,
             transcript: HandshakeHashOrBuffer::Buffer(transcript_buffer),
             session_id: SessionId::empty(),
+            sni: None,
+            resumption_data,
             using_ems: false,
             done_retry: false,
             send_tickets: 0,
@@ -298,8 +472,8 @@ impl ExpectClientHello {
     pub(super) fn with_input(
         self,
         input: ClientHelloInput<'_>,
-        cx: &mut ServerContext<'_>,
-    ) -> NextStateOrError {
+        output: &mut dyn Output<'_>,
+    ) -> Result<ServerState, Error> {
         let tls13_enabled = self
             .config
             .supports_version(ProtocolVersion::TLSv1_3);
@@ -307,63 +481,57 @@ impl ExpectClientHello {
             .config
             .supports_version(ProtocolVersion::TLSv1_2);
 
-        cx.data.sni = self
-            .config
-            .invalid_sni_policy
-            .accept(input.client_hello.server_name.as_ref())
-            .map_err(|e| {
-                cx.common
-                    .send_fatal_alert(AlertDescription::IllegalParameter, e)
-            })?;
-
         // Are we doing TLS1.3?
         if let Some(versions) = &input.client_hello.supported_versions {
             if versions.tls13 && tls13_enabled {
-                self.with_version::<Tls13CipherSuite>(input, cx)
+                self.with_version::<Tls13CipherSuite>(input, output)
             } else if !versions.tls12 || !tls12_enabled {
-                Err(cx.common.send_fatal_alert(
-                    AlertDescription::ProtocolVersion,
-                    PeerIncompatible::Tls12NotOfferedOrEnabled,
-                ))
-            } else if cx.common.is_quic() {
-                Err(cx.common.send_fatal_alert(
-                    AlertDescription::ProtocolVersion,
-                    PeerIncompatible::Tls13RequiredForQuic,
-                ))
+                Err(PeerIncompatible::Tls12NotOfferedOrEnabled.into())
+            } else if self.protocol.is_quic() {
+                Err(PeerIncompatible::Tls13RequiredForQuic.into())
             } else {
-                self.with_version::<Tls12CipherSuite>(input, cx)
+                self.with_version::<Tls12CipherSuite>(input, output)
             }
         } else if u16::from(input.client_hello.client_version) < u16::from(ProtocolVersion::TLSv1_2)
         {
-            Err(cx.common.send_fatal_alert(
-                AlertDescription::ProtocolVersion,
-                PeerIncompatible::Tls12NotOffered,
-            ))
+            Err(PeerIncompatible::Tls12NotOffered.into())
         } else if !tls12_enabled && tls13_enabled {
-            Err(cx.common.send_fatal_alert(
-                AlertDescription::ProtocolVersion,
-                PeerIncompatible::SupportedVersionsExtensionRequired,
-            ))
-        } else if cx.common.is_quic() {
-            Err(cx.common.send_fatal_alert(
-                AlertDescription::ProtocolVersion,
-                PeerIncompatible::Tls13RequiredForQuic,
-            ))
+            Err(PeerIncompatible::SupportedVersionsExtensionRequired.into())
+        } else if self.protocol.is_quic() {
+            Err(PeerIncompatible::Tls13RequiredForQuic.into())
         } else {
-            self.with_version::<Tls12CipherSuite>(input, cx)
+            self.with_version::<Tls12CipherSuite>(input, output)
         }
     }
 
     fn with_version<T: Suite + 'static>(
-        self,
-        mut input: ClientHelloInput<'_>,
-        cx: &mut ServerContext<'_>,
-    ) -> NextStateOrError
+        mut self,
+        input: ClientHelloInput<'_>,
+        output: &mut dyn Output<'_>,
+    ) -> Result<ServerState, Error>
     where
         CryptoProvider: Borrow<[&'static T]>,
         SupportedCipherSuite: From<&'static T>,
+        dyn CipherSuiteSelector: VersionSuiteSelector<T>,
     {
-        cx.common.negotiated_version = Some(T::VERSION);
+        output.output(OutputEvent::ProtocolVersion(T::VERSION));
+
+        let sni = self
+            .config
+            .invalid_sni_policy
+            .accept(input.client_hello.server_name.as_ref())?;
+        output.emit(Event::ReceivedServerName(sni.clone()));
+
+        if self.done_retry {
+            let ch_sni = input
+                .client_hello
+                .server_name
+                .as_ref()
+                .and_then(ServerNamePayload::to_dns_name_normalized);
+            if self.sni != ch_sni {
+                return Err(PeerMisbehaved::ServerNameDifferedOnRetry.into());
+            }
+        }
 
         // We communicate to the upper layer what kind of key they should choose
         // via the sigschemes value.  Clients tend to treat this extension
@@ -381,51 +549,46 @@ impl ExpectClientHello {
             })
             .collect::<Vec<_>>();
 
+        let mut sig_schemes = input.sig_schemes.clone();
         if T::VERSION == ProtocolVersion::TLSv1_2 {
-            input.sig_schemes.retain(|scheme| {
+            sig_schemes.retain(|scheme| {
                 client_suites
                     .iter()
                     .any(|&suite| suite.usable_for_signature_scheme(*scheme))
             });
         } else if T::VERSION == ProtocolVersion::TLSv1_3 {
-            input
-                .sig_schemes
-                .retain(SignatureScheme::supported_in_tls13);
+            sig_schemes.retain(SignatureScheme::supported_in_tls13);
         }
 
         // Choose a certificate.
         let credentials = self
             .config
             .cert_resolver
-            .resolve(&ClientHello::new(&input, cx.data.sni.as_ref(), T::VERSION))
-            .map_err(|err| {
-                cx.common
-                    .send_fatal_alert(AlertDescription::HandshakeFailure, err)
-            })?;
+            .resolve(&ClientHello::new(
+                &input,
+                &sig_schemes,
+                sni.as_ref(),
+                T::VERSION,
+            ))?;
+        self.sni = sni;
 
-        let (suite, skxg) = self
-            .choose_suite_and_kx_group(
-                suites,
-                credentials.signer.scheme(),
-                input
-                    .client_hello
-                    .named_groups
-                    .as_deref()
-                    .unwrap_or_default(),
-                &input.client_hello.cipher_suites,
-            )
-            .map_err(|incompat| {
-                cx.common
-                    .send_fatal_alert(AlertDescription::HandshakeFailure, incompat)
-            })?;
+        let (suite, skxg) = self.choose_suite_and_kx_group(
+            suites,
+            credentials.signer.scheme(),
+            input
+                .client_hello
+                .named_groups
+                .as_deref()
+                .unwrap_or_default(),
+            &input.client_hello.cipher_suites,
+        )?;
 
         debug!("decided upon suite {suite:?}");
-        cx.common.suite = Some(suite.into());
-        cx.common.kx_state = KxState::Start(skxg);
+        output.output(OutputEvent::CipherSuite(suite.into()));
 
         suite
             .server_handler()
-            .handle_client_hello(suite, skxg, credentials, input, self, cx)
+            .handle_client_hello(suite, skxg, credentials, input, self, output)
     }
 
     fn choose_suite_and_kx_group<T: Suite + 'static>(
@@ -434,7 +597,11 @@ impl ExpectClientHello {
         sig_scheme: SignatureScheme,
         client_groups: &[NamedGroup],
         client_suites: &[CipherSuite],
-    ) -> Result<(&'static T, &'static dyn SupportedKxGroup), PeerIncompatible> {
+    ) -> Result<(&'static T, &'static dyn SupportedKxGroup), PeerIncompatible>
+    where
+        SupportedCipherSuite: From<&'static T>,
+        dyn CipherSuiteSelector: VersionSuiteSelector<T>,
+    {
         // Determine which `KeyExchangeAlgorithm`s are theoretically possible, based
         // on the offered and supported groups.
         let mut ecdhe_possible = false;
@@ -483,34 +650,32 @@ impl ExpectClientHello {
             return Err(PeerIncompatible::NoKxGroupsInCommon);
         }
 
-        let mut suitable_suites_iter = suites.iter().filter(|suite| {
-            // Reduce our supported ciphersuites by the certified key's algorithm.
-            suite.usable_for_signature_scheme(sig_scheme)
-                // And support for one of the key exchange groups
-                && (ecdhe_possible && suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::ECDHE)
-                || ffdhe_possible && suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::DHE))
-        });
-
         // RFC 7919 (https://datatracker.ietf.org/doc/html/rfc7919#section-4) requires us to send
         // the InsufficientSecurity alert in case we don't recognize client's FFDHE groups (i.e.,
         // `suitable_suites` becomes empty). But that does not make a lot of sense (e.g., client
         // proposes FFDHE4096 and we only support FFDHE2048), so we ignore that requirement here,
         // and continue to send HandshakeFailure.
 
-        let suite = if self.config.ignore_client_order {
-            suitable_suites_iter.find(|suite| client_suites.contains(&suite.suite()))
-        } else {
-            let suitable_suites = suitable_suites_iter.collect::<Vec<_>>();
-            client_suites
-                .iter()
-                .find_map(|client_suite| {
-                    suitable_suites
-                        .iter()
-                        .find(|x| *client_suite == x.suite())
-                })
-                .copied()
-        }
-        .ok_or(PeerIncompatible::NoCipherSuitesInCommon)?;
+        let mut client_suites = client_suites
+            .iter()
+            .filter_map(|&suite| {
+                let &suite = suites
+                    .iter()
+                    .find(|ss| ss.suite() == suite)?;
+
+                // Reduce our supported ciphersuites by the certified key's algorithm.
+                (suite.usable_for_signature_scheme(sig_scheme)
+                // And support for one of the key exchange groups
+                && (ecdhe_possible && suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::ECDHE)
+                || ffdhe_possible && suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::DHE)))
+                .then_some(suite)
+            });
+
+        let suite = self
+            .config
+            .cipher_suite_selector
+            .select(&mut client_suites, suites)
+            .ok_or(PeerIncompatible::NoCipherSuitesInCommon)?;
 
         // Finally, choose a key exchange group that is compatible with the selected cipher
         // suite.
@@ -550,10 +715,25 @@ impl ExpectClientHello {
     }
 }
 
-impl State<ServerConnectionData> for ExpectClientHello {
-    fn handle<'m>(self: Box<Self>, cx: &mut ServerContext<'_>, m: Message<'m>) -> NextStateOrError {
-        let input = ClientHelloInput::from_message(&m, self.done_retry, cx)?;
-        self.with_input(input, cx)
+impl ExpectClientHello {
+    pub(crate) fn handle<'m>(
+        self,
+        input: Input<'m>,
+        output: &mut dyn Output<'_>,
+    ) -> Result<ServerState, Error> {
+        let input = ClientHelloInput::from_input(&input)?;
+        self.with_input(input, output)
+    }
+
+    fn set_resumption_data(&mut self, resumption_data: &[u8]) -> Result<(), Error> {
+        self.resumption_data = resumption_data.to_vec();
+        Ok(())
+    }
+}
+
+impl From<Box<ExpectClientHello>> for ServerState {
+    fn from(value: Box<ExpectClientHello>) -> Self {
+        Self::ClientHello(value)
     }
 }
 
@@ -565,14 +745,14 @@ pub(crate) trait ServerHandler<T>: fmt::Debug + Sealed + Send + Sync {
         credentials: SelectedCredential,
         input: ClientHelloInput<'_>,
         st: ExpectClientHello,
-        cx: &mut ServerContext<'_>,
-    ) -> NextStateOrError;
+        output: &mut dyn Output<'_>,
+    ) -> Result<ServerState, Error>;
 }
 
 pub(crate) struct ClientHelloInput<'a> {
     pub(super) message: &'a Message<'a>,
     pub(super) client_hello: &'a ClientHelloPayload,
-    pub(super) sig_schemes: Vec<SignatureScheme>,
+    pub(super) sig_schemes: &'a Vec<SignatureScheme>,
     pub(super) proof: HandshakeAlignedProof,
 }
 
@@ -584,13 +764,9 @@ impl<'a> ClientHelloInput<'a> {
     /// [`ClientHello`] value for a [`ServerCredentialResolver`].
     ///
     /// [`ServerCredentialResolver`]: crate::server::ServerCredentialResolver
-    pub(super) fn from_message(
-        message: &'a Message<'a>,
-        done_retry: bool,
-        cx: &mut ServerContext<'_>,
-    ) -> Result<Self, Error> {
+    pub(super) fn from_input(input: &'a Input<'a>) -> Result<Self, Error> {
         let client_hello = require_handshake_msg!(
-            message,
+            input.message,
             HandshakeType::ClientHello,
             HandshakePayload::ClientHello
         )?;
@@ -600,41 +776,21 @@ impl<'a> ClientHelloInput<'a> {
             .compression_methods
             .contains(&Compression::Null)
         {
-            return Err(cx.common.send_fatal_alert(
-                AlertDescription::IllegalParameter,
-                PeerIncompatible::NullCompressionRequired,
-            ));
+            return Err(PeerIncompatible::NullCompressionRequired.into());
         }
 
         // No handshake messages should follow this one in this flight.
-        let proof = cx.common.check_aligned_handshake()?;
-
-        if done_retry {
-            let ch_sni = client_hello
-                .server_name
-                .as_ref()
-                .and_then(ServerNamePayload::to_dns_name_normalized);
-            if cx.data.sni != ch_sni {
-                return Err(PeerMisbehaved::ServerNameDifferedOnRetry.into());
-            }
-        } else {
-            assert!(cx.data.sni.is_none())
-        }
+        let proof = input.check_aligned_handshake()?;
 
         let sig_schemes = client_hello
             .signature_schemes
             .as_ref()
-            .ok_or_else(|| {
-                cx.common.send_fatal_alert(
-                    AlertDescription::HandshakeFailure,
-                    PeerIncompatible::SignatureAlgorithmsExtensionRequired,
-                )
-            })?;
+            .ok_or(PeerIncompatible::SignatureAlgorithmsExtensionRequired)?;
 
         Ok(ClientHelloInput {
-            message,
+            message: &input.message,
             client_hello,
-            sig_schemes: sig_schemes.to_owned(),
+            sig_schemes,
             proof,
         })
     }
@@ -646,18 +802,11 @@ pub(crate) enum HandshakeHashOrBuffer {
 }
 
 impl HandshakeHashOrBuffer {
-    pub(super) fn start(
-        self,
-        hash: &'static dyn Hash,
-        cx: &mut ServerContext<'_>,
-    ) -> Result<HandshakeHash, Error> {
+    pub(super) fn start(self, hash: &'static dyn Hash) -> Result<HandshakeHash, Error> {
         match self {
             Self::Buffer(inner) => Ok(inner.start_hash(hash)),
             Self::Hash(inner) if inner.algorithm() == hash.algorithm() => Ok(inner),
-            _ => Err(cx.common.send_fatal_alert(
-                AlertDescription::IllegalParameter,
-                PeerMisbehaved::HandshakeHashVariedAfterRetry,
-            )),
+            _ => Err(PeerMisbehaved::HandshakeHashVariedAfterRetry.into()),
         }
     }
 }

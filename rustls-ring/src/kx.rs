@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use core::fmt;
 
+use pki_types::FipsStatus;
 use ring::agreement;
 use ring::rand::SystemRandom;
 use rustls::crypto::GetRandomFailed;
@@ -61,8 +62,11 @@ impl SupportedKxGroup for KxGroup {
         self.name
     }
 
-    fn fips(&self) -> bool {
-        self.fips_allowed && super::fips()
+    fn fips(&self) -> FipsStatus {
+        match self.fips_allowed {
+            true => super::fips(),
+            false => FipsStatus::Unvalidated,
+        }
     }
 }
 
@@ -152,7 +156,7 @@ mod tests {
     }
 }
 
-#[cfg(bench)]
+#[cfg(all(test, bench))]
 mod benchmarks {
     #[bench]
     fn bench_x25519(b: &mut test::Bencher) {

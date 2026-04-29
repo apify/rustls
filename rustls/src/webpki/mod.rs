@@ -17,8 +17,8 @@ pub use anchors::RootCertStore;
 pub use client_verifier::{ClientVerifierBuilder, WebPkiClientVerifier};
 pub use server_verifier::{ServerVerifierBuilder, WebPkiServerVerifier};
 pub use verify::{
-    ParsedCertificate, WebPkiSupportedAlgorithms, verify_identity_signed_by_trust_anchor,
-    verify_server_name, verify_tls12_signature, verify_tls13_signature,
+    ParsedCertificate, verify_identity_signed_by_trust_anchor, verify_server_name,
+    verify_tls12_signature, verify_tls13_signature,
 };
 
 /// An error that can occur when building a certificate verifier.
@@ -46,7 +46,6 @@ impl fmt::Display for VerifierBuilderError {
     }
 }
 
-#[cfg(feature = "std")]
 impl core::error::Error for VerifierBuilderError {}
 
 fn pki_error(error: webpki::Error) -> Error {

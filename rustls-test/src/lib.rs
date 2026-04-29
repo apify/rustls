@@ -1,4 +1,4 @@
-use core::ops::{Deref, DerefMut};
+use core::hash::Hasher;
 use core::{fmt, mem};
 use std::borrow::Cow;
 use std::io;
@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rustls::client::danger::{
     HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
 };
-use rustls::client::{ServerVerifierBuilder, UnbufferedClientConnection, WebPkiServerVerifier};
+use rustls::client::{
+    ClientSessionKey, ServerVerifierBuilder, Tls13Session, WantsClientCert, WebPkiServerVerifier,
+};
 use rustls::crypto::cipher::{
-    InboundOpaqueMessage, MessageDecrypter, MessageEncrypter, OutboundOpaqueMessage, PlainMessage,
+    EncodedMessage, InboundOpaque, MessageDecrypter, MessageEncrypter, Payload,
 };
 use rustls::crypto::kx::{NamedGroup, SupportedKxGroup};
 use rustls::crypto::{
@@ -19,8 +21,6 @@ use rustls::crypto::{
 };
 use rustls::enums::{CertificateType, ContentType, ProtocolVersion};
 use rustls::error::{CertificateError, Error};
-use rustls::internal::msgs::codec::{Codec, Reader};
-use rustls::internal::msgs::message::Message;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
     CertificateDer, CertificateRevocationListDer, DnsName, PrivateKeyDer, PrivatePkcs8KeyDer,
@@ -28,15 +28,12 @@ use rustls::pki_types::{
 };
 use rustls::server::danger::{ClientIdentity, ClientVerifier, SignatureVerificationInput};
 use rustls::server::{
-    ClientHello, ClientVerifierBuilder, ServerCredentialResolver, UnbufferedServerConnection,
-    WebPkiClientVerifier,
-};
-use rustls::unbuffered::{
-    ConnectionState, EncodeError, UnbufferedConnectionCommon, UnbufferedStatus,
+    ClientHello, ClientVerifierBuilder, ServerCredentialResolver, WebPkiClientVerifier,
 };
 use rustls::{
-    ClientConfig, ClientConnection, Connection, ConnectionCommon, DistinguishedName, RootCertStore,
-    ServerConfig, ServerConnection, SideData, SupportedCipherSuite,
+    ClientConfig, ClientConnection, ConfigBuilder, Connection, ConnectionTrafficSecrets,
+    DistinguishedName, RootCertStore, ServerConfig, ServerConnection, SupportedCipherSuite,
+    WantsVerifier,
 };
 
 macro_rules! embed_files {
@@ -203,10 +200,7 @@ embed_files! {
     (RSA_4096_INTER_KEY, "rsa-4096", "inter.key");
 }
 
-pub fn transfer(
-    left: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
-    right: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
-) -> usize {
+pub fn transfer(left: &mut impl Connection, right: &mut impl Connection) -> usize {
     let mut buf = [0u8; 262144];
     let mut total = 0;
 
@@ -233,7 +227,7 @@ pub fn transfer(
     total
 }
 
-pub fn transfer_eof(conn: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>) {
+pub fn transfer_eof(conn: &mut impl Connection) {
     let empty_buf = [0u8; 0];
     let empty_cursor: &mut dyn io::Read = &mut &empty_buf[..];
     let sz = conn.read_tls(empty_cursor).unwrap();
@@ -247,9 +241,13 @@ pub enum Altered {
     Raw(Vec<u8>),
 }
 
-pub fn transfer_altered<F>(left: &mut Connection, filter: F, right: &mut Connection) -> usize
+pub fn transfer_altered<F>(
+    left: &mut impl Connection,
+    filter: F,
+    right: &mut impl Connection,
+) -> usize
 where
-    F: Fn(&mut Message<'_>) -> Altered,
+    F: Fn(&mut EncodedMessage<Vec<u8>>) -> Altered,
 {
     let mut buf = [0u8; 262144];
     let mut total = 0;
@@ -264,22 +262,37 @@ where
             return total;
         }
 
-        let mut reader = Reader::init(&buf[..sz]);
-        while reader.any_left() {
-            // this is a bit of a falsehood: we don't know whether message
-            // is encrypted.  it is quite unlikely that a genuine encrypted
-            // message can be decoded by `Message::try_from`.
-            let plain = PlainMessage::read(&mut reader).unwrap();
+        let mut offset = 0;
+        while offset < sz {
+            assert!(
+                offset + 5 <= sz,
+                "incomplete TLS record header at offset {offset}"
+            );
 
-            let message_enc = match Message::try_from(plain.clone()) {
-                Ok(mut message) => match filter(&mut message) {
-                    Altered::InPlace => PlainMessage::from(message)
-                        .into_unencrypted_opaque()
-                        .encode(),
-                    Altered::Raw(data) => data,
-                },
-                // pass through encrypted/undecodable messages
-                Err(_) => plain.into_unencrypted_opaque().encode(),
+            let typ = ContentType::from(buf[offset]);
+            let version =
+                ProtocolVersion::from(u16::from_be_bytes([buf[offset + 1], buf[offset + 2]]));
+            let payload_len = u16::from_be_bytes([buf[offset + 3], buf[offset + 4]]) as usize;
+
+            assert!(
+                offset + 5 + payload_len <= sz,
+                "incomplete TLS record payload at offset {offset}"
+            );
+
+            let payload = buf[offset + 5..offset + 5 + payload_len].to_vec();
+            offset += 5 + payload_len;
+
+            let mut encoded = EncodedMessage {
+                typ,
+                version,
+                payload,
+            };
+
+            let message_enc = match filter(&mut encoded) {
+                Altered::InPlace => {
+                    encoding::message_framing(encoded.typ, encoded.version, encoded.payload.clone())
+                }
+                Altered::Raw(data) => data,
             };
 
             let message_enc_reader: &mut dyn io::Read = &mut &message_enc[..];
@@ -497,7 +510,7 @@ pub trait ServerConfigExt {
     fn finish(self, kt: KeyType) -> ServerConfig;
 }
 
-impl ServerConfigExt for rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier> {
+impl ServerConfigExt for ConfigBuilder<ServerConfig, WantsVerifier> {
     fn finish(self, kt: KeyType) -> ServerConfig {
         self.with_no_client_auth()
             .with_single_cert(kt.identity(), kt.key())
@@ -568,7 +581,7 @@ pub fn make_server_config_with_client_verifier(
     provider: &CryptoProvider,
 ) -> ServerConfig {
     ServerConfig::builder(provider.clone().into())
-        .with_client_cert_verifier(verifier_builder.build().unwrap())
+        .with_client_cert_verifier(Arc::new(verifier_builder.build().unwrap()))
         .with_single_cert(kt.identity(), kt.key())
         .unwrap()
 }
@@ -611,29 +624,29 @@ pub fn make_client_config_with_raw_key_support(
 pub trait ClientConfigExt {
     fn finish(self, kt: KeyType) -> ClientConfig;
     fn finish_with_creds(self, kt: KeyType) -> ClientConfig;
+    fn add_root_certs(self, kt: KeyType) -> ConfigBuilder<ClientConfig, WantsClientCert>;
 }
 
-impl ClientConfigExt for rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
+impl ClientConfigExt for ConfigBuilder<ClientConfig, WantsVerifier> {
     fn finish(self, kt: KeyType) -> ClientConfig {
-        let mut root_store = RootCertStore::empty();
-        root_store.add_parsable_certificates(
-            CertificateDer::pem_slice_iter(kt.bytes_for("ca.cert")).map(|result| result.unwrap()),
-        );
-
-        self.with_root_certificates(root_store)
+        self.add_root_certs(kt)
             .with_no_client_auth()
             .unwrap()
     }
 
     fn finish_with_creds(self, kt: KeyType) -> ClientConfig {
+        self.add_root_certs(kt)
+            .with_client_auth_cert(kt.client_identity(), kt.client_key())
+            .unwrap()
+    }
+
+    fn add_root_certs(self, kt: KeyType) -> ConfigBuilder<ClientConfig, WantsClientCert> {
         let mut root_store = RootCertStore::empty();
         root_store.add_parsable_certificates(
             CertificateDer::pem_slice_iter(kt.bytes_for("ca.cert")).map(|result| result.unwrap()),
         );
 
         self.with_root_certificates(root_store)
-            .with_client_auth_cert(kt.client_identity(), kt.client_key())
-            .unwrap()
     }
 }
 
@@ -666,7 +679,7 @@ pub fn make_client_config_with_verifier(
 ) -> ClientConfig {
     ClientConfig::builder(provider.clone().into())
         .dangerous()
-        .with_custom_certificate_verifier(verifier_builder.build().unwrap())
+        .with_custom_certificate_verifier(Arc::new(verifier_builder.build().unwrap()))
         .with_no_client_auth()
         .unwrap()
 }
@@ -704,7 +717,10 @@ pub fn make_pair_for_arc_configs(
     server_config: &Arc<ServerConfig>,
 ) -> (ClientConnection, ServerConnection) {
     (
-        ClientConnection::new(client_config.clone(), server_name("localhost")).unwrap(),
+        client_config
+            .connect(server_name("localhost"))
+            .build()
+            .unwrap(),
         ServerConnection::new(server_config.clone()).unwrap(),
     )
 }
@@ -737,10 +753,7 @@ pub fn make_disjoint_suite_configs(provider: CryptoProvider) -> (ClientConfig, S
     (client_config, server_config)
 }
 
-pub fn do_handshake(
-    client: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
-    server: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
-) -> (usize, usize) {
+pub fn do_handshake(client: &mut impl Connection, server: &mut impl Connection) -> (usize, usize) {
     let (mut to_client, mut to_server) = (0, 0);
     while server.is_handshaking() || client.is_handshaking() {
         to_server += transfer(client, server);
@@ -749,89 +762,6 @@ pub fn do_handshake(
         client.process_new_packets().unwrap();
     }
     (to_server, to_client)
-}
-
-// Drive a handshake using unbuffered connections.
-//
-// Note that this drives the connection beyond the handshake until both
-// connections are idle and there is no pending data waiting to be processed
-// by either. In practice this just means that session tickets are processed
-// by the client.
-pub fn do_unbuffered_handshake(
-    client: &mut UnbufferedClientConnection,
-    server: &mut UnbufferedServerConnection,
-) {
-    fn is_idle<Side: SideData>(conn: &UnbufferedConnectionCommon<Side>, data: &[u8]) -> bool {
-        !conn.is_handshaking() && !conn.wants_write() && data.is_empty()
-    }
-
-    let mut client_data = Vec::with_capacity(1024);
-    let mut server_data = Vec::with_capacity(1024);
-
-    while !is_idle(client, &client_data) || !is_idle(server, &server_data) {
-        loop {
-            let UnbufferedStatus { discard, state, .. } =
-                client.process_tls_records(&mut client_data);
-            let state = state.unwrap();
-
-            match state {
-                ConnectionState::BlockedHandshake | ConnectionState::WriteTraffic(_) => {
-                    client_data.drain(..discard);
-                    break;
-                }
-                ConnectionState::Closed | ConnectionState::PeerClosed => unreachable!(),
-                ConnectionState::ReadEarlyData(_) => (),
-                ConnectionState::EncodeTlsData(mut data) => {
-                    let required = match data.encode(&mut []) {
-                        Err(EncodeError::InsufficientSize(err)) => err.required_size,
-                        _ => unreachable!(),
-                    };
-
-                    let old_len = server_data.len();
-                    server_data.resize(old_len + required, 0);
-                    data.encode(&mut server_data[old_len..])
-                        .unwrap();
-                }
-                ConnectionState::TransmitTlsData(data) => data.done(),
-                st => unreachable!("unexpected connection state: {st:?}"),
-            }
-
-            client_data.drain(..discard);
-        }
-
-        loop {
-            let UnbufferedStatus { discard, state, .. } =
-                server.process_tls_records(&mut server_data);
-            let state = state.unwrap();
-
-            match state {
-                ConnectionState::BlockedHandshake | ConnectionState::WriteTraffic(_) => {
-                    server_data.drain(..discard);
-                    break;
-                }
-                ConnectionState::Closed | ConnectionState::PeerClosed => unreachable!(),
-                ConnectionState::ReadEarlyData(_) => unreachable!(),
-                ConnectionState::EncodeTlsData(mut data) => {
-                    let required = match data.encode(&mut []) {
-                        Err(EncodeError::InsufficientSize(err)) => err.required_size,
-                        _ => unreachable!(),
-                    };
-
-                    let old_len = client_data.len();
-                    client_data.resize(old_len + required, 0);
-                    data.encode(&mut client_data[old_len..])
-                        .unwrap();
-                }
-                ConnectionState::TransmitTlsData(data) => data.done(),
-                _ => unreachable!(),
-            }
-
-            server_data.drain(..discard);
-        }
-    }
-
-    assert!(server_data.is_empty());
-    assert!(client_data.is_empty());
 }
 
 #[derive(PartialEq, Debug)]
@@ -859,14 +789,11 @@ pub fn do_handshake_until_error(
 }
 
 pub fn do_handshake_altered(
-    client: ClientConnection,
-    alter_server_message: impl Fn(&mut Message<'_>) -> Altered,
-    alter_client_message: impl Fn(&mut Message<'_>) -> Altered,
-    server: ServerConnection,
+    mut client: ClientConnection,
+    alter_server_message: impl Fn(&mut EncodedMessage<Vec<u8>>) -> Altered,
+    alter_client_message: impl Fn(&mut EncodedMessage<Vec<u8>>) -> Altered,
+    mut server: ServerConnection,
 ) -> Result<(), ErrorFromPeer> {
-    let mut client: Connection = Connection::Client(client);
-    let mut server: Connection = Connection::Server(server);
-
     while server.is_handshaking() || client.is_handshaking() {
         transfer_altered(&mut client, &alter_client_message, &mut server);
 
@@ -1161,6 +1088,8 @@ impl ServerVerifier for MockServerVerifier {
             true => &[CertificateType::RawPublicKey],
         }
     }
+
+    fn hash_config(&self, _: &mut dyn Hasher) {}
 }
 
 impl MockServerVerifier {
@@ -1254,9 +1183,11 @@ impl MockClientVerifier {
         provider: &CryptoProvider,
     ) -> Self {
         Self {
-            parent: webpki_client_verifier_builder(kt.client_root_store(), provider)
-                .build()
-                .unwrap(),
+            parent: Arc::new(
+                webpki_client_verifier_builder(kt.client_root_store(), provider)
+                    .build()
+                    .unwrap(),
+            ),
             verified,
             subjects: Arc::from(kt.client_root_store().subjects()),
             mandatory: true,
@@ -1365,12 +1296,16 @@ impl RawTls {
 
         let encrypter = match (tx_keys, suite) {
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls13(tls13),
             ) => tls13.aead_alg.encrypter(key, iv),
 
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls12(tls12),
             ) => tls12
                 .aead_alg
@@ -1381,12 +1316,16 @@ impl RawTls {
 
         let decrypter = match (rx_keys, suite) {
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls13(tls13),
             ) => tls13.aead_alg.decrypter(key, iv),
 
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls12(tls12),
             ) => tls12
                 .aead_alg
@@ -1405,8 +1344,8 @@ impl RawTls {
 
     pub fn encrypt_and_send(
         &mut self,
-        msg: &PlainMessage,
-        peer: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
+        msg: &EncodedMessage<Payload<'_>>,
+        peer: &mut impl Connection,
     ) {
         let data = self
             .encrypter
@@ -1420,28 +1359,33 @@ impl RawTls {
 
     pub fn receive_and_decrypt(
         &mut self,
-        peer: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
-        f: impl Fn(Message<'_>),
+        peer: &mut impl Connection,
+        f: impl Fn(EncodedMessage<&[u8]>),
     ) {
         let mut data = vec![];
         peer.write_tls(&mut io::Cursor::new(&mut data))
             .unwrap();
 
-        let mut reader = Reader::init(&data);
-        let content_type = ContentType::read(&mut reader).unwrap();
-        let version = ProtocolVersion::read(&mut reader).unwrap();
-        let len = u16::read(&mut reader).unwrap();
+        // Parse TLS record header: 1 byte type, 2 bytes version, 2 bytes length
+        assert!(data.len() >= 5, "incomplete TLS record header");
+        let typ = ContentType::from(data[0]);
+        let version = ProtocolVersion::from(u16::from_be_bytes([data[1], data[2]]));
+        let len = u16::from_be_bytes([data[3], data[4]]) as usize;
         let left = &mut data[5..];
-        assert_eq!(len as usize, left.len());
+        assert_eq!(len, left.len());
 
-        let inbound = InboundOpaqueMessage::new(content_type, version, left);
-        let plain = self
+        let inbound = EncodedMessage {
+            typ,
+            version,
+            payload: InboundOpaque(left),
+        };
+
+        let msg = self
             .decrypter
             .decrypt(inbound, self.dec_seq)
             .unwrap();
         self.dec_seq += 1;
 
-        let msg = Message::try_from(plain).unwrap();
         println!("receive_and_decrypt: {msg:?}");
 
         f(msg);
@@ -1613,14 +1557,11 @@ impl ServerCredentialResolver for ServerCheckCertResolve {
     }
 }
 
-pub struct OtherSession<'a, C, S>
-where
-    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
-    S: SideData,
-{
+pub struct OtherSession<'a, C: Connection> {
     sess: &'a mut C,
     pub reads: usize,
-    pub writevs: Vec<Vec<usize>>,
+    /// Writevs(Chunks(Bytes))
+    pub writevs: Vec<Vec<Vec<u8>>>,
     fail_ok: bool,
     pub short_writes: bool,
     pub last_error: Option<Error>,
@@ -1628,11 +1569,7 @@ where
     buffer: Vec<Vec<u8>>,
 }
 
-impl<'a, C, S> OtherSession<'a, C, S>
-where
-    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
-    S: SideData,
-{
+impl<'a, C: Connection> OtherSession<'a, C> {
     pub fn new(sess: &'a mut C) -> Self {
         OtherSession {
             sess,
@@ -1660,7 +1597,7 @@ where
 
     fn flush_vectored(&mut self, b: &[io::IoSlice<'_>]) -> io::Result<usize> {
         let mut total = 0;
-        let mut lengths = vec![];
+        let mut chunks = vec![];
         for bytes in b {
             let write_len = if self.short_writes {
                 if bytes.len() > 5 {
@@ -1675,7 +1612,7 @@ where
             let l = self
                 .sess
                 .read_tls(&mut io::Cursor::new(&bytes[..write_len]))?;
-            lengths.push(l);
+            chunks.push(bytes[..write_len].to_vec());
             total += l;
             if bytes.len() != l {
                 break;
@@ -1689,27 +1626,57 @@ where
             self.last_error = rc.err();
         }
 
-        self.writevs.push(lengths);
+        self.writevs.push(chunks);
         Ok(total)
+    }
+
+    pub fn writev_lengths(&self) -> Vec<Vec<usize>> {
+        self.writevs
+            .iter()
+            .map(|write| {
+                write
+                    .iter()
+                    .map(|chunk| chunk.len())
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub fn message_lengths(&self) -> Vec<usize> {
+        let mut buffer = vec![];
+        for writev in &self.writevs {
+            for chunk in writev {
+                buffer.append(&mut chunk.clone());
+            }
+        }
+
+        let mut lengths = vec![];
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let header = &buffer[offset..offset + 5];
+            println!(
+                "message header: ty={:x?} ver={:x?} len={:x?}",
+                header[0],
+                &header[1..3],
+                &header[3..5]
+            );
+            let len = u16::from_be_bytes(header[3..5].try_into().unwrap()) as usize;
+            lengths.push(header.len() + len);
+            offset += header.len() + len;
+        }
+
+        lengths
     }
 }
 
-impl<C, S> io::Read for OtherSession<'_, C, S>
-where
-    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
-    S: SideData,
-{
+impl<C: Connection> io::Read for OtherSession<'_, C> {
     fn read(&mut self, mut b: &mut [u8]) -> io::Result<usize> {
         self.reads += 1;
         self.sess.write_tls(&mut b)
     }
 }
 
-impl<C, S> io::Write for OtherSession<'_, C, S>
-where
-    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
-    S: SideData,
-{
+impl<C: Connection> io::Write for OtherSession<'_, C> {
     fn write(&mut self, _: &[u8]) -> io::Result<usize> {
         unreachable!()
     }
@@ -1737,6 +1704,7 @@ where
 }
 
 /// Check `reader` has available exactly `bytes`
+#[track_caller]
 pub fn check_read(reader: &mut dyn io::Read, bytes: &[u8]) {
     let mut buf = vec![0u8; bytes.len() + 1];
     assert_eq!(bytes.len(), reader.read(&mut buf).unwrap());
@@ -1744,12 +1712,14 @@ pub fn check_read(reader: &mut dyn io::Read, bytes: &[u8]) {
 }
 
 /// Check `reader has available exactly `bytes`, followed by EOF
+#[track_caller]
 pub fn check_read_and_close(reader: &mut dyn io::Read, expect: &[u8]) {
     check_read(reader, expect);
     assert!(matches!(reader.read(&mut [0u8; 5]), Ok(0)));
 }
 
 /// Check `reader` yields only an error of kind `err_kind`
+#[track_caller]
 pub fn check_read_err(reader: &mut dyn io::Read, err_kind: io::ErrorKind) {
     let mut buf = vec![0u8; 1];
     let err = reader.read(&mut buf).unwrap_err();
@@ -1757,6 +1727,7 @@ pub fn check_read_err(reader: &mut dyn io::Read, err_kind: io::ErrorKind) {
 }
 
 /// Check `reader` has available exactly `bytes`
+#[track_caller]
 pub fn check_fill_buf(reader: &mut dyn io::BufRead, bytes: &[u8]) {
     let b = reader.fill_buf().unwrap();
     assert_eq!(b, bytes);
@@ -1765,6 +1736,7 @@ pub fn check_fill_buf(reader: &mut dyn io::BufRead, bytes: &[u8]) {
 }
 
 /// Check `reader` yields only an error of kind `err_kind`
+#[track_caller]
 pub fn check_fill_buf_err(reader: &mut dyn io::BufRead, err_kind: io::ErrorKind) {
     let err = reader.fill_buf().unwrap_err();
     assert!(matches!(err, err if err.kind() == err_kind))
@@ -1789,8 +1761,8 @@ pub fn certificate_error_expecting_name(expected: &str) -> CertificateError {
 mod plaintext {
     use rustls::ConnectionTrafficSecrets;
     use rustls::crypto::cipher::{
-        AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, MessageDecrypter, MessageEncrypter,
-        OutboundPlainMessage, PrefixedPayload, Tls13AeadAlgorithm, UnsupportedOperationError,
+        AeadKey, InboundOpaque, Iv, MessageDecrypter, MessageEncrypter, OutboundOpaque,
+        OutboundPlain, Tls13AeadAlgorithm, UnsupportedOperationError,
     };
 
     use super::*;
@@ -1824,13 +1796,13 @@ mod plaintext {
     impl MessageEncrypter for Encrypter {
         fn encrypt(
             &mut self,
-            msg: OutboundPlainMessage<'_>,
+            msg: EncodedMessage<OutboundPlain<'_>>,
             _seq: u64,
-        ) -> Result<OutboundOpaqueMessage, Error> {
-            let mut payload = PrefixedPayload::with_capacity(msg.payload.len());
+        ) -> Result<EncodedMessage<OutboundOpaque>, Error> {
+            let mut payload = OutboundOpaque::with_capacity(msg.payload.len());
             payload.extend_from_chunks(&msg.payload);
 
-            Ok(OutboundOpaqueMessage {
+            Ok(EncodedMessage {
                 typ: ContentType::ApplicationData,
                 version: ProtocolVersion::TLSv1_2,
                 payload,
@@ -1847,9 +1819,9 @@ mod plaintext {
     impl MessageDecrypter for Decrypter {
         fn decrypt<'a>(
             &mut self,
-            msg: InboundOpaqueMessage<'a>,
+            msg: EncodedMessage<InboundOpaque<'a>>,
             _seq: u64,
-        ) -> Result<InboundPlainMessage<'a>, Error> {
+        ) -> Result<EncodedMessage<&'a [u8]>, Error> {
             Ok(msg.into_plain_message())
         }
     }
@@ -1858,13 +1830,13 @@ mod plaintext {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // complete mock, but not 100% used in tests
 pub enum ClientStorageOp {
-    SetKxHint(ServerName<'static>, NamedGroup),
-    GetKxHint(ServerName<'static>, Option<NamedGroup>),
-    SetTls12Session(ServerName<'static>),
-    GetTls12Session(ServerName<'static>, bool),
-    RemoveTls12Session(ServerName<'static>),
-    InsertTls13Ticket(ServerName<'static>),
-    TakeTls13Ticket(ServerName<'static>, bool),
+    SetKxHint(ClientSessionKey<'static>, NamedGroup),
+    GetKxHint(ClientSessionKey<'static>, Option<NamedGroup>),
+    SetTls12Session(ClientSessionKey<'static>),
+    GetTls12Session(ClientSessionKey<'static>, bool),
+    RemoveTls12Session(ClientSessionKey<'static>),
+    InsertTls13Ticket(ClientSessionKey<'static>),
+    TakeTls13Ticket(ClientSessionKey<'static>, bool),
 }
 
 pub struct ClientStorage {
@@ -1902,93 +1874,75 @@ impl fmt::Debug for ClientStorage {
 }
 
 impl rustls::client::ClientSessionStore for ClientStorage {
-    fn set_kx_hint(&self, server_name: ServerName<'static>, group: NamedGroup) {
+    fn set_kx_hint(&self, key: ClientSessionKey<'static>, group: NamedGroup) {
         self.ops
             .lock()
             .unwrap()
-            .push(ClientStorageOp::SetKxHint(server_name.clone(), group));
-        self.storage
-            .set_kx_hint(server_name, group)
+            .push(ClientStorageOp::SetKxHint(key.clone(), group));
+        self.storage.set_kx_hint(key, group)
     }
 
-    fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup> {
-        let rc = self.storage.kx_hint(server_name);
+    fn kx_hint(&self, key: &ClientSessionKey<'_>) -> Option<NamedGroup> {
+        let rc = self.storage.kx_hint(key);
         self.ops
             .lock()
             .unwrap()
-            .push(ClientStorageOp::GetKxHint(server_name.to_owned(), rc));
+            .push(ClientStorageOp::GetKxHint(key.to_owned(), rc));
         rc
     }
 
     fn set_tls12_session(
         &self,
-        server_name: ServerName<'static>,
-        value: rustls::client::Tls12ClientSessionValue,
+        key: ClientSessionKey<'static>,
+        value: rustls::client::Tls12Session,
     ) {
         self.ops
             .lock()
             .unwrap()
-            .push(ClientStorageOp::SetTls12Session(server_name.clone()));
+            .push(ClientStorageOp::SetTls12Session(key.clone()));
         self.storage
-            .set_tls12_session(server_name, value)
+            .set_tls12_session(key, value)
     }
 
-    fn tls12_session(
-        &self,
-        server_name: &ServerName<'_>,
-    ) -> Option<rustls::client::Tls12ClientSessionValue> {
-        let rc = self.storage.tls12_session(server_name);
+    fn tls12_session(&self, key: &ClientSessionKey<'_>) -> Option<rustls::client::Tls12Session> {
+        let rc = self.storage.tls12_session(key);
         self.ops
             .lock()
             .unwrap()
             .push(ClientStorageOp::GetTls12Session(
-                server_name.to_owned(),
+                key.to_owned(),
                 rc.is_some(),
             ));
         rc
     }
 
-    fn remove_tls12_session(&self, server_name: &ServerName<'static>) {
+    fn remove_tls12_session(&self, key: &ClientSessionKey<'static>) {
         self.ops
             .lock()
             .unwrap()
-            .push(ClientStorageOp::RemoveTls12Session(server_name.clone()));
-        self.storage
-            .remove_tls12_session(server_name);
+            .push(ClientStorageOp::RemoveTls12Session(key.clone()));
+        self.storage.remove_tls12_session(key);
     }
 
-    fn insert_tls13_ticket(
-        &self,
-        server_name: ServerName<'static>,
-        mut value: rustls::client::Tls13ClientSessionValue,
-    ) {
+    fn insert_tls13_ticket(&self, key: ClientSessionKey<'static>, mut value: Tls13Session) {
         if let Some((expected, desired)) = self.alter_max_early_data_size {
-            assert_eq!(value.max_early_data_size(), expected);
-            value._private_set_max_early_data_size(desired);
+            value._reset_max_early_data_size(expected, desired);
         }
 
         self.ops
             .lock()
             .unwrap()
-            .push(ClientStorageOp::InsertTls13Ticket(server_name.clone()));
+            .push(ClientStorageOp::InsertTls13Ticket(key.clone()));
         self.storage
-            .insert_tls13_ticket(server_name, value);
+            .insert_tls13_ticket(key, value);
     }
 
-    fn take_tls13_ticket(
-        &self,
-        server_name: &ServerName<'static>,
-    ) -> Option<rustls::client::Tls13ClientSessionValue> {
-        let rc = self
-            .storage
-            .take_tls13_ticket(server_name);
+    fn take_tls13_ticket(&self, key: &ClientSessionKey<'static>) -> Option<Tls13Session> {
+        let rc = self.storage.take_tls13_ticket(key);
         self.ops
             .lock()
             .unwrap()
-            .push(ClientStorageOp::TakeTls13Ticket(
-                server_name.clone(),
-                rc.is_some(),
-            ));
+            .push(ClientStorageOp::TakeTls13Ticket(key.clone(), rc.is_some()));
         rc
     }
 }
@@ -2046,8 +2000,8 @@ pub mod macros {
                 true
             }
             #[allow(dead_code)]
-            const fn provider_is_fips() -> bool {
-                false
+            const fn provider_is_fips() -> rustls::pki_types::FipsStatus {
+                rustls::pki_types::FipsStatus::Unvalidated
             }
             #[allow(dead_code)]
             const ALL_VERSIONS: [rustls::crypto::CryptoProvider; 2] = [
@@ -2061,7 +2015,7 @@ pub mod macros {
     macro_rules! provider_aws_lc_rs {
         () => {
             #[allow(unused_imports)]
-            use rustls::crypto::aws_lc_rs as provider;
+            use rustls_aws_lc_rs as provider;
             #[allow(dead_code)]
             const fn provider_is_aws_lc_rs() -> bool {
                 true
@@ -2071,8 +2025,12 @@ pub mod macros {
                 false
             }
             #[allow(dead_code)]
-            const fn provider_is_fips() -> bool {
-                cfg!(feature = "fips")
+            const fn provider_is_fips() -> rustls::pki_types::FipsStatus {
+                if cfg!(feature = "fips") {
+                    rustls::pki_types::FipsStatus::Pending
+                } else {
+                    rustls::pki_types::FipsStatus::Unvalidated
+                }
             }
             #[allow(dead_code)]
             const ALL_VERSIONS: [rustls::crypto::CryptoProvider; 2] = [
@@ -2089,8 +2047,6 @@ pub mod encoding {
     use rustls::crypto::{CipherSuite, SignatureScheme};
     use rustls::enums::{ContentType, HandshakeType, ProtocolVersion};
     use rustls::error::AlertDescription;
-    use rustls::internal::msgs::codec::Codec;
-    use rustls::internal::msgs::enums::{AlertLevel, ExtensionType};
 
     /// Return a client hello with mandatory extensions added to `extensions`
     ///
@@ -2128,21 +2084,51 @@ pub mod encoding {
     ) -> Vec<u8> {
         let mut out = vec![];
 
-        legacy_version.encode(&mut out);
+        out.extend_from_slice(&legacy_version.to_array());
         out.extend_from_slice(random);
         out.extend_from_slice(session_id);
-        cipher_suites.to_vec().encode(&mut out);
+        out.extend(len_u16(vector_of(
+            cipher_suites
+                .into_iter()
+                .map(|cs| cs.to_array()),
+        )));
         out.extend_from_slice(&[0x01, 0x00]); // only null compression
 
         let mut exts = vec![];
         for e in extensions {
-            e.typ.encode(&mut exts);
+            exts.extend_from_slice(&e.typ.to_be_bytes());
             exts.extend_from_slice(&(e.body.len() as u16).to_be_bytes());
             exts.extend_from_slice(&e.body);
         }
 
         out.extend(len_u16(exts));
         handshake_framing(HandshakeType::ClientHello, out)
+    }
+
+    pub fn server_hello(
+        legacy_version: ProtocolVersion,
+        random: &[u8; 32],
+        session_id: &[u8],
+        cipher_suite: CipherSuite,
+        extensions: Vec<Extension>,
+    ) -> Vec<u8> {
+        let mut out = vec![];
+
+        out.extend_from_slice(&legacy_version.to_array());
+        out.extend_from_slice(random);
+        out.extend_from_slice(session_id);
+        out.extend_from_slice(&cipher_suite.to_array());
+        out.extend_from_slice(&[0x00]); // null compression
+
+        let mut exts = vec![];
+        for e in extensions {
+            exts.extend_from_slice(&e.typ.to_be_bytes());
+            exts.extend_from_slice(&(e.body.len() as u16).to_be_bytes());
+            exts.extend_from_slice(&e.body);
+        }
+
+        out.extend(len_u16(exts));
+        handshake_framing(HandshakeType::ServerHello, out)
     }
 
     /// Apply handshake framing to `body`.
@@ -2164,36 +2150,36 @@ pub mod encoding {
 
     #[derive(Clone)]
     pub struct Extension {
-        pub typ: ExtensionType,
+        pub typ: u16,
         pub body: Vec<u8>,
     }
 
     impl Extension {
         pub fn new_sig_algs() -> Self {
             Self {
-                typ: ExtensionType::SignatureAlgorithms,
+                typ: Self::SIGNATURE_ALGORITHMS,
                 body: len_u16(vector_of(
                     [
                         SignatureScheme::RSA_PKCS1_SHA256,
                         SignatureScheme::ECDSA_NISTP256_SHA256,
                     ]
-                    .into_iter(),
+                    .map(|s| s.to_array()),
                 )),
             }
         }
 
         pub fn new_kx_groups() -> Self {
             Self {
-                typ: ExtensionType::EllipticCurves,
-                body: len_u16(vector_of([NamedGroup::secp256r1].into_iter())),
+                typ: Self::ELLIPTIC_CURVES,
+                body: len_u16(vector_of([NamedGroup::secp256r1.to_array()])),
             }
         }
 
         pub fn new_versions() -> Self {
             Self {
-                typ: ExtensionType::SupportedVersions,
+                typ: Self::SUPPORTED_VERSIONS,
                 body: len_u8(vector_of(
-                    [ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_2].into_iter(),
+                    [ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_2].map(|v| v.to_array()),
                 )),
             }
         }
@@ -2210,24 +2196,47 @@ pub mod encoding {
             share.splice(0..0, NamedGroup::secp256r1.to_array());
 
             Self {
-                typ: ExtensionType::KeyShare,
+                typ: Self::KEY_SHARE,
                 body: len_u16(share),
             }
         }
 
         pub fn new_quic_transport_params(body: &[u8]) -> Self {
             Self {
-                typ: ExtensionType::TransportParameters,
+                typ: Self::TRANSPORT_PARAMETERS,
                 body: len_u16(body.to_vec()),
             }
         }
+
+        pub fn new_alpn(body: &[u8]) -> Self {
+            Self {
+                typ: Self::ALPN,
+                body: len_u16(body.to_vec()),
+            }
+        }
+
+        pub const ELLIPTIC_CURVES: u16 = 0x000a;
+        pub const SIGNATURE_ALGORITHMS: u16 = 0x000d;
+        pub const SUPPORTED_VERSIONS: u16 = 0x002b;
+        pub const KEY_SHARE: u16 = 0x0033;
+        pub const TRANSPORT_PARAMETERS: u16 = 0x0039;
+        pub const ALPN: u16 = 0x0010;
     }
 
-    /// Return a full TLS message containing an alert.
+    /// Return a full TLS message containing a fatal alert.
     pub fn alert(desc: AlertDescription, suffix: &[u8]) -> Vec<u8> {
-        let mut body = vec![AlertLevel::Fatal.into(), desc.into()];
+        let mut body = vec![ALERT_LEVEL_FATAL, desc.into()];
         body.extend_from_slice(suffix);
         message_framing(ContentType::Alert, ProtocolVersion::TLSv1_2, body)
+    }
+
+    /// Return a full TLS message containing a warning alert.
+    pub fn warning_alert(desc: AlertDescription) -> Vec<u8> {
+        message_framing(
+            ContentType::Alert,
+            ProtocolVersion::TLSv1_2,
+            vec![ALERT_LEVEL_WARNING, desc.into()],
+        )
     }
 
     /// Prefix with u8 length
@@ -2252,12 +2261,10 @@ pub mod encoding {
     }
 
     /// Encode each of `items`
-    pub fn vector_of<'a, T: Codec<'a>>(items: impl Iterator<Item = T>) -> Vec<u8> {
-        let mut body = Vec::new();
-
-        for i in items {
-            i.encode(&mut body);
-        }
-        body
+    pub fn vector_of<const N: usize>(items: impl IntoIterator<Item = [u8; N]>) -> Vec<u8> {
+        items.into_iter().flatten().collect()
     }
+
+    const ALERT_LEVEL_WARNING: u8 = 1;
+    const ALERT_LEVEL_FATAL: u8 = 2;
 }

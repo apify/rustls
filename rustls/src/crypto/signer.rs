@@ -1,20 +1,25 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::Debug;
+use core::hash::{Hash, Hasher};
 use core::iter;
 
-use pki_types::{AlgorithmIdentifier, CertificateDer, PrivateKeyDer, SubjectPublicKeyInfoDer};
+#[cfg(feature = "webpki")]
+use pki_types::PrivateKeyDer;
+use pki_types::{AlgorithmIdentifier, CertificateDer, SubjectPublicKeyInfoDer};
 
+#[cfg(feature = "webpki")]
 use super::CryptoProvider;
 use crate::client::{ClientCredentialResolver, CredentialRequest};
-use crate::common_state::CommonState;
 use crate::crypto::SignatureScheme;
 use crate::enums::CertificateType;
-use crate::error::{AlertDescription, ApiMisuse, Error, InvalidMessage, PeerIncompatible};
-use crate::msgs::codec::{Codec, Reader};
-use crate::server::{ClientHello, ParsedCertificate, ServerCredentialResolver};
+use crate::error::{ApiMisuse, Error, InvalidMessage, PeerIncompatible};
+use crate::msgs::{Codec, Reader};
+use crate::server::{ClientHello, ServerCredentialResolver};
 use crate::sync::Arc;
-use crate::{SignerPublicKey, x509};
+#[cfg(feature = "webpki")]
+use crate::webpki::ParsedCertificate;
+use crate::{DynHasher, SignerPublicKey, x509};
 
 /// Server certificate resolver which always resolves to the same identity and key.
 ///
@@ -23,7 +28,7 @@ use crate::{SignerPublicKey, x509};
 ///
 /// [`ConfigBuilder::with_server_credential_resolver()`]: crate::ConfigBuilder::with_server_credential_resolver
 /// [`ConfigBuilder::with_client_credential_resolver()`]: crate::ConfigBuilder::with_client_credential_resolver
-#[derive(Debug)]
+#[derive(Debug, Hash)]
 pub struct SingleCredential {
     credentials: Credentials,
     types: &'static [CertificateType],
@@ -57,6 +62,10 @@ impl ClientCredentialResolver for SingleCredential {
 
     fn supported_certificate_types(&self) -> &'static [CertificateType] {
         self.types
+    }
+
+    fn hash_config(&self, h: &mut dyn Hasher) {
+        self.hash(&mut DynHasher(h));
     }
 }
 
@@ -102,6 +111,7 @@ impl Credentials {
     /// if possible (if it is an `X509` identity).
     ///
     /// [`KeyProvider`]: crate::crypto::KeyProvider
+    #[cfg(feature = "webpki")]
     pub fn from_der(
         identity: Arc<Identity<'static>>,
         key: PrivateKeyDer<'static>,
@@ -123,6 +133,7 @@ impl Credentials {
     ///
     /// This constructor should be used with all [`SigningKey`] implementations
     /// that can provide a public key, including those provided by rustls itself.
+    #[cfg(feature = "webpki")]
     pub fn new(identity: Arc<Identity<'static>>, key: Box<dyn SigningKey>) -> Result<Self, Error> {
         if let Identity::X509(CertificateIdentity { end_entity, .. }) = &*identity {
             let parsed = ParsedCertificate::try_from(end_entity)?;
@@ -169,6 +180,13 @@ impl Credentials {
     }
 }
 
+impl Hash for Credentials {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity.hash(state);
+        self.ocsp.hash(state);
+    }
+}
+
 /// A packaged-together certificate chain and one-time-use signer.
 ///
 /// This is used in the [`ClientCredentialResolver`] and [`ServerCredentialResolver`] traits
@@ -187,7 +205,7 @@ pub struct SelectedCredential {
 
 /// A peer's identity, depending on the negotiated certificate type.
 #[non_exhaustive]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Identity<'a> {
     /// A standard X.509 certificate chain.
     ///
@@ -216,7 +234,6 @@ impl<'a> Identity<'a> {
     pub(crate) fn from_peer(
         mut cert_chain: Vec<CertificateDer<'a>>,
         expected: CertificateType,
-        common: &mut CommonState,
     ) -> Result<Option<Self>, Error> {
         let mut iter = cert_chain.drain(..);
         let Some(first) = iter.next() else {
@@ -232,15 +249,9 @@ impl<'a> Identity<'a> {
                 0 => Ok(Some(Self::RawPublicKey(
                     SubjectPublicKeyInfoDer::from(first.as_ref()).into_owned(),
                 ))),
-                _ => Err(common.send_fatal_alert(
-                    AlertDescription::BadCertificate,
-                    PeerIncompatible::MultipleRawKeys,
-                )),
+                _ => Err(PeerIncompatible::MultipleRawKeys.into()),
             },
-            CertificateType::Unknown(ty) => Err(common.send_fatal_alert(
-                AlertDescription::UnsupportedCertificate,
-                PeerIncompatible::UnknownCertificateType(ty),
-            )),
+            CertificateType(ty) => Err(PeerIncompatible::UnknownCertificateType(ty).into()),
         }
     }
 
@@ -331,7 +342,7 @@ where
 
 /// Data required to verify the peer's identity.
 #[non_exhaustive]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CertificateIdentity<'a> {
     /// Certificate for the entity being verified.
     pub end_entity: CertificateDer<'a>,
@@ -342,6 +353,14 @@ pub struct CertificateIdentity<'a> {
 }
 
 impl<'a> CertificateIdentity<'a> {
+    /// Create a new `CertificateIdentity` from an end-entity certificate and intermediates.
+    pub fn new(end_entity: CertificateDer<'a>, intermediates: Vec<CertificateDer<'a>>) -> Self {
+        Self {
+            end_entity,
+            intermediates,
+        }
+    }
+
     /// Convert this `CertificateIdentity` into an owned version.
     pub fn into_owned(self) -> CertificateIdentity<'static> {
         CertificateIdentity {

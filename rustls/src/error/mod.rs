@@ -3,18 +3,20 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::fmt;
-#[cfg(feature = "std")]
+use core::ops::Deref;
+use core::{fmt, mem};
 use std::time::SystemTimeError;
 
 use pki_types::{AlgorithmIdentifier, EchConfigListBytes, ServerName, UnixTime};
+#[cfg(feature = "webpki")]
 use webpki::ExtendedKeyUsage;
 
+use crate::common_state::maybe_send_fatal_alert;
+use crate::conn::SendPath;
 use crate::crypto::kx::KeyExchangeAlgorithm;
-use crate::crypto::{GetRandomFailed, InconsistentKeys};
+use crate::crypto::{CipherSuite, GetRandomFailed, InconsistentKeys};
 use crate::enums::{ContentType, HandshakeType};
-use crate::msgs::codec::Codec;
-use crate::msgs::handshake::EchConfigPayload;
+use crate::msgs::{Codec, EchConfigPayload};
 
 #[cfg(test)]
 mod tests;
@@ -154,6 +156,31 @@ pub enum Error {
     Other(OtherError),
 }
 
+/// Determine which alert should be sent for a given error.
+///
+/// If this mapping fails, no alert is sent.
+impl TryFrom<&Error> for AlertDescription {
+    type Error = ();
+
+    fn try_from(error: &Error) -> Result<Self, Self::Error> {
+        Ok(match error {
+            Error::DecryptError => Self::BadRecordMac,
+            Error::InappropriateMessage { .. } | Error::InappropriateHandshakeMessage { .. } => {
+                Self::UnexpectedMessage
+            }
+            Error::InvalidCertificate(e) => Self::from(e),
+            Error::InvalidMessage(e) => Self::from(*e),
+            Error::NoApplicationProtocol => Self::NoApplicationProtocol,
+            Error::PeerMisbehaved(e) => Self::from(*e),
+            Error::PeerIncompatible(e) => Self::from(*e),
+            Error::PeerSentOversizedRecord => Self::RecordOverflow,
+            Error::RejectedEch(_) => Self::EncryptedClientHelloRequired,
+
+            _ => return Err(()),
+        })
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -290,7 +317,6 @@ impl From<InconsistentKeys> for Error {
     }
 }
 
-#[cfg(feature = "std")]
 impl From<SystemTimeError> for Error {
     #[inline]
     fn from(_: SystemTimeError) -> Self {
@@ -556,8 +582,8 @@ impl PartialEq<Self> for CertificateError {
 // The following mapping are heavily referenced in:
 // * [OpenSSL Implementation](https://github.com/openssl/openssl/blob/45bb98bfa223efd3258f445ad443f878011450f0/ssl/statem/statem_lib.c#L1434)
 // * [BoringSSL Implementation](https://github.com/google/boringssl/blob/583c60bd4bf76d61b2634a58bcda99a92de106cb/ssl/ssl_x509.cc#L1323)
-impl From<CertificateError> for AlertDescription {
-    fn from(e: CertificateError) -> Self {
+impl From<&CertificateError> for AlertDescription {
+    fn from(e: &CertificateError) -> Self {
         use CertificateError::*;
         match e {
             BadEncoding
@@ -595,7 +621,6 @@ impl From<CertificateError> for AlertDescription {
 impl fmt::Display for CertificateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            #[cfg(feature = "std")]
             Self::NotValidForNameContext {
                 expected,
                 presented,
@@ -692,9 +717,9 @@ impl fmt::Display for CertificateError {
 enum_builder! {
     /// The `AlertDescription` TLS protocol enum.  Values in this enum are taken
     /// from the various RFCs covering TLS, and are listed by IANA.
-    /// The `Unknown` item is used when processing unrecognized ordinals.
-    #[repr(u8)]
-    pub enum AlertDescription {
+    pub struct AlertDescription(pub u8);
+
+    enum AlertDescriptionName {
         CloseNotify => 0x00,
         UnexpectedMessage => 0x0a,
         BadRecordMac => 0x14,
@@ -729,120 +754,140 @@ enum_builder! {
         UnknownPskIdentity => 0x73,
         CertificateRequired => 0x74,
         NoApplicationProtocol => 0x78,
-        EncryptedClientHelloRequired => 0x79, // https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#section-11.2
+        EncryptedClientHelloRequired => 0x79, // https://datatracker.ietf.org/doc/html/rfc9849#section-11.2
     }
 }
 
 impl fmt::Display for AlertDescription {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Ok(known) = AlertDescriptionName::try_from(*self) else {
+            return write!(f, "sent an unknown alert (0x{:02x?})", self.0);
+        };
+
         // these should be:
         // - in past tense
         // - be syntactically correct if prefaced with 'the peer' to describe
         //   received alerts
-        match self {
+        match known {
             // this is normal.
-            Self::CloseNotify => write!(f, "cleanly closed the connection"),
+            AlertDescriptionName::CloseNotify => write!(f, "cleanly closed the connection"),
 
             // these are abnormal.  they are usually symptomatic of an interop failure.
             // please file a bug report.
-            Self::UnexpectedMessage => write!(f, "received an unexpected message"),
-            Self::BadRecordMac => write!(f, "failed to verify a message"),
-            Self::RecordOverflow => write!(f, "rejected an over-length message"),
-            Self::IllegalParameter => write!(
+            AlertDescriptionName::UnexpectedMessage => write!(f, "received an unexpected message"),
+            AlertDescriptionName::BadRecordMac => write!(f, "failed to verify a message"),
+            AlertDescriptionName::RecordOverflow => write!(f, "rejected an over-length message"),
+            AlertDescriptionName::IllegalParameter => write!(
                 f,
                 "rejected a message because a field was incorrect or inconsistent"
             ),
-            Self::DecodeError => write!(f, "failed to decode a message"),
-            Self::DecryptError => {
+            AlertDescriptionName::DecodeError => write!(f, "failed to decode a message"),
+            AlertDescriptionName::DecryptError => {
                 write!(f, "failed to perform a handshake cryptographic operation")
             }
-            Self::InappropriateFallback => {
+            AlertDescriptionName::InappropriateFallback => {
                 write!(f, "detected an attempted version downgrade")
             }
-            Self::MissingExtension => {
+            AlertDescriptionName::MissingExtension => {
                 write!(f, "required a specific extension that was not provided")
             }
-            Self::UnsupportedExtension => write!(f, "rejected an unsolicited extension"),
+            AlertDescriptionName::UnsupportedExtension => {
+                write!(f, "rejected an unsolicited extension")
+            }
 
             // these are deprecated by TLS1.3 and should be very rare (but possible
             // with TLS1.2 or earlier peers)
-            Self::DecryptionFailed => write!(f, "failed to decrypt a message"),
-            Self::DecompressionFailure => write!(f, "failed to decompress a message"),
-            Self::NoCertificate => write!(f, "found no certificate"),
-            Self::ExportRestriction => write!(f, "refused due to export restrictions"),
-            Self::NoRenegotiation => write!(f, "rejected an attempt at renegotiation"),
-            Self::CertificateUnobtainable => {
+            AlertDescriptionName::DecryptionFailed => write!(f, "failed to decrypt a message"),
+            AlertDescriptionName::DecompressionFailure => {
+                write!(f, "failed to decompress a message")
+            }
+            AlertDescriptionName::NoCertificate => write!(f, "found no certificate"),
+            AlertDescriptionName::ExportRestriction => {
+                write!(f, "refused due to export restrictions")
+            }
+            AlertDescriptionName::NoRenegotiation => {
+                write!(f, "rejected an attempt at renegotiation")
+            }
+            AlertDescriptionName::CertificateUnobtainable => {
                 write!(f, "failed to retrieve its certificate")
             }
-            Self::BadCertificateHashValue => {
+            AlertDescriptionName::BadCertificateHashValue => {
                 write!(f, "rejected the `certificate_hash` extension")
             }
 
             // this is fairly normal. it means a server cannot choose compatible parameters
             // given our offer.  please use ssllabs.com or similar to investigate what parameters
             // the server supports.
-            Self::HandshakeFailure => write!(
+            AlertDescriptionName::HandshakeFailure => write!(
                 f,
                 "failed to negotiate an acceptable set of security parameters"
             ),
-            Self::ProtocolVersion => write!(f, "did not support a suitable TLS version"),
-            Self::InsufficientSecurity => {
+            AlertDescriptionName::ProtocolVersion => {
+                write!(f, "did not support a suitable TLS version")
+            }
+            AlertDescriptionName::InsufficientSecurity => {
                 write!(f, "required a higher security level than was offered")
             }
 
             // these usually indicate a local misconfiguration, either in certificate selection
             // or issuance.
-            Self::BadCertificate => {
+            AlertDescriptionName::BadCertificate => {
                 write!(
                     f,
                     "rejected the certificate as corrupt or incorrectly signed"
                 )
             }
-            Self::UnsupportedCertificate => {
+            AlertDescriptionName::UnsupportedCertificate => {
                 write!(f, "did not support the certificate")
             }
-            Self::CertificateRevoked => write!(f, "found the certificate to be revoked"),
-            Self::CertificateExpired => write!(f, "found the certificate to be expired"),
-            Self::CertificateUnknown => {
+            AlertDescriptionName::CertificateRevoked => {
+                write!(f, "found the certificate to be revoked")
+            }
+            AlertDescriptionName::CertificateExpired => {
+                write!(f, "found the certificate to be expired")
+            }
+            AlertDescriptionName::CertificateUnknown => {
                 write!(f, "rejected the certificate for an unspecified reason")
             }
-            Self::UnknownCa => write!(f, "found the certificate was not issued by a trusted CA"),
-            Self::BadCertificateStatusResponse => {
+            AlertDescriptionName::UnknownCa => {
+                write!(f, "found the certificate was not issued by a trusted CA")
+            }
+            AlertDescriptionName::BadCertificateStatusResponse => {
                 write!(f, "rejected the certificate status response")
             }
             // typically this means client authentication is required, in TLS1.2...
-            Self::AccessDenied => write!(f, "denied access"),
+            AlertDescriptionName::AccessDenied => write!(f, "denied access"),
             // and in TLS1.3...
-            Self::CertificateRequired => write!(f, "required a client certificate"),
+            AlertDescriptionName::CertificateRequired => {
+                write!(f, "required a client certificate")
+            }
 
-            Self::InternalError => write!(f, "encountered an internal error"),
-            Self::UserCanceled => write!(f, "canceled the handshake"),
+            AlertDescriptionName::InternalError => write!(f, "encountered an internal error"),
+            AlertDescriptionName::UserCanceled => write!(f, "canceled the handshake"),
 
             // rejection of SNI (uncommon; usually servers behave as if it was not sent)
-            Self::UnrecognizedName => {
+            AlertDescriptionName::UnrecognizedName => {
                 write!(f, "did not recognize a name in the `server_name` extension")
             }
 
             // rejection of PSK connections (NYI in this library); indicates a local
             // misconfiguration.
-            Self::UnknownPskIdentity => {
+            AlertDescriptionName::UnknownPskIdentity => {
                 write!(f, "did not recognize any offered PSK identity")
             }
 
             // rejection of ALPN (varying levels of support, but missing support is
             // often dangerous if the peers fail to agree on the same protocol)
-            Self::NoApplicationProtocol => write!(
+            AlertDescriptionName::NoApplicationProtocol => write!(
                 f,
                 "did not support any of the offered application protocols"
             ),
 
             // ECH requirement by clients, see
-            // <https://datatracker.ietf.org/doc/draft-ietf-tls-esni/25/>
-            Self::EncryptedClientHelloRequired => {
+            // <https://datatracker.ietf.org/doc/html/rfc9849#name-update-of-the-tls-alert-reg>
+            AlertDescriptionName::EncryptedClientHelloRequired => {
                 write!(f, "required use of encrypted client hello")
             }
-
-            Self::Unknown(n) => write!(f, "sent an unknown alert (0x{n:02x?})"),
         }
     }
 }
@@ -899,8 +944,6 @@ pub enum InvalidMessage {
     ///
     /// The argument names the context.
     IllegalEmptyList(&'static str),
-    /// A peer sent an empty value, but a non-empty value is required.
-    IllegalEmptyValue,
     /// A peer sent a message where a given extension type was repeated
     DuplicateExtension(u16),
     /// A peer sent a message with a PSK offer extension in wrong position
@@ -917,6 +960,7 @@ impl From<InvalidMessage> for AlertDescription {
             InvalidMessage::PreSharedKeyIsNotFinalExtension => Self::IllegalParameter,
             InvalidMessage::DuplicateExtension(_) => Self::IllegalParameter,
             InvalidMessage::UnknownHelloRetryRequestExtension => Self::UnsupportedExtension,
+            InvalidMessage::CertificatePayloadTooLarge => Self::BadCertificate,
             _ => Self::DecodeError,
         }
     }
@@ -934,7 +978,7 @@ impl From<InvalidMessage> for AlertDescription {
 /// the wild.
 #[expect(missing_docs)]
 #[non_exhaustive]
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PeerMisbehaved {
     AttemptedDowngradeToTls12WhenTls13IsSupported,
     BadCertChainExtensions,
@@ -949,6 +993,8 @@ pub enum PeerMisbehaved {
     EarlyDataExtensionWithoutResumption,
     EarlyDataOfferedWithVariedCipherSuite,
     HandshakeHashVariedAfterRetry,
+    /// Received an alert with an undefined level and the given [`AlertDescription`]
+    IllegalAlertLevel(u8, AlertDescription),
     IllegalHelloRetryRequestWithEmptyCookie,
     IllegalHelloRetryRequestWithNoChanges,
     IllegalHelloRetryRequestWithOfferedGroup,
@@ -959,7 +1005,10 @@ pub enum PeerMisbehaved {
     IllegalHelloRetryRequestWithInvalidEch,
     IllegalMiddleboxChangeCipherSpec,
     IllegalTlsInnerPlaintext,
+    /// Received a warning alert with the given [`AlertDescription`]
+    IllegalWarningAlert(AlertDescription),
     IncorrectBinder,
+    IncorrectFinished,
     InvalidCertCompression,
     InvalidMaxEarlyDataSize,
     InvalidKeyShare,
@@ -1000,7 +1049,7 @@ pub enum PeerMisbehaved {
     SignedKxWithWrongAlgorithm,
     SignedHandshakeWithUnadvertisedSigScheme,
     TooManyEmptyFragments,
-    TooManyKeyUpdateRequests,
+    TooManyConsecutiveHandshakeMessagesAfterHandshake,
     TooManyRenegotiationRequests,
     TooManyWarningAlertsReceived,
     TooMuchEarlyDataReceived,
@@ -1013,6 +1062,40 @@ pub enum PeerMisbehaved {
     UnsolicitedEchExtension,
 }
 
+impl From<PeerMisbehaved> for AlertDescription {
+    fn from(e: PeerMisbehaved) -> Self {
+        match e {
+            PeerMisbehaved::DisallowedEncryptedExtension
+            | PeerMisbehaved::IllegalHelloRetryRequestWithInvalidEch
+            | PeerMisbehaved::UnexpectedCleartextExtension
+            | PeerMisbehaved::UnsolicitedEchExtension
+            | PeerMisbehaved::UnsolicitedEncryptedExtension
+            | PeerMisbehaved::UnsolicitedServerHelloExtension => Self::UnsupportedExtension,
+
+            PeerMisbehaved::IllegalMiddleboxChangeCipherSpec
+            | PeerMisbehaved::KeyEpochWithPendingFragment
+            | PeerMisbehaved::KeyUpdateReceivedInQuicConnection => Self::UnexpectedMessage,
+
+            PeerMisbehaved::IllegalWarningAlert(_) => Self::DecodeError,
+
+            PeerMisbehaved::IncorrectBinder | PeerMisbehaved::IncorrectFinished => {
+                Self::DecryptError
+            }
+
+            PeerMisbehaved::InvalidCertCompression
+            | PeerMisbehaved::SelectedUnofferedCertCompression => Self::BadCertificate,
+
+            PeerMisbehaved::MissingKeyShare
+            | PeerMisbehaved::MissingPskModesExtension
+            | PeerMisbehaved::MissingQuicTransportParameters => Self::MissingExtension,
+
+            PeerMisbehaved::NoCertificatesPresented => Self::CertificateRequired,
+
+            _ => Self::IllegalParameter,
+        }
+    }
+}
+
 /// The set of cases where we failed to make a connection because a peer
 /// doesn't support a TLS version/feature we require.
 ///
@@ -1020,7 +1103,7 @@ pub enum PeerMisbehaved {
 /// versions.
 #[expect(missing_docs)]
 #[non_exhaustive]
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PeerIncompatible {
     EcPointsExtensionRequired,
     ExtendedMasterSecretExtensionRequired,
@@ -1048,6 +1131,24 @@ pub enum PeerIncompatible {
     UnsolicitedCertificateTypeExtension,
 }
 
+impl From<PeerIncompatible> for AlertDescription {
+    fn from(e: PeerIncompatible) -> Self {
+        match e {
+            PeerIncompatible::NullCompressionRequired => Self::IllegalParameter,
+
+            PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig
+            | PeerIncompatible::SupportedVersionsExtensionRequired
+            | PeerIncompatible::Tls12NotOffered
+            | PeerIncompatible::Tls12NotOfferedOrEnabled
+            | PeerIncompatible::Tls13RequiredForQuic => Self::ProtocolVersion,
+
+            PeerIncompatible::UnknownCertificateType(_) => Self::UnsupportedCertificate,
+
+            _ => Self::HandshakeFailure,
+        }
+    }
+}
+
 /// Extended Key Usage (EKU) purpose values.
 ///
 /// These are usually represented as OID values in the certificate's extension (if present), but
@@ -1066,6 +1167,7 @@ pub enum ExtendedKeyPurpose {
 }
 
 impl ExtendedKeyPurpose {
+    #[cfg(feature = "webpki")]
     pub(crate) fn for_values(values: impl Iterator<Item = usize>) -> Self {
         let values = values.collect::<Vec<_>>();
         match &*values {
@@ -1259,13 +1361,16 @@ fn join<T: fmt::Debug>(items: &[T]) -> String {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApiMisuse {
+    /// Trying to resume a session with an unknown cipher suite.
+    ResumingFromUnknownCipherSuite(CipherSuite),
+
     /// The [`KeyingMaterialExporter`][] was already consumed.
     ///
-    /// Methods that obtain an exporter (eg, [`ConnectionCommon::exporter()`][]) can only
+    /// Methods that obtain an exporter (eg, [`Connection::exporter()`][]) can only
     /// be used once.  This error is returned on subsequent calls.
     ///
     /// [`KeyingMaterialExporter`]: crate::KeyingMaterialExporter
-    /// [`ConnectionCommon::exporter()`]: crate::ConnectionCommon::exporter()
+    /// [`Connection::exporter()`]: crate::Connection::exporter()
     ExporterAlreadyUsed,
 
     /// The `context` parameter to [`KeyingMaterialExporter::derive()`][] was too long.
@@ -1342,16 +1447,11 @@ pub enum ApiMisuse {
 
     /// Secret extraction operation attempted without opting-in to secret extraction.
     ///
-    /// This is possible from:
-    ///
-    /// - [`ClientConnection::dangerous_extract_secrets()`][crate::client::ClientConnection::dangerous_extract_secrets]
-    /// - [`ServerConnection::dangerous_extract_secrets()`][crate::server::ServerConnection::dangerous_extract_secrets]
-    /// - [`ClientConnection::dangerous_into_kernel_connection()`][crate::client::UnbufferedClientConnection::dangerous_into_kernel_connection]
-    /// - [`ServerConnection::dangerous_into_kernel_connection()`][crate::server::UnbufferedServerConnection::dangerous_into_kernel_connection]
+    /// This is possible from [`Connection::dangerous_extract_secrets()`][crate::Connection::dangerous_extract_secrets].
     ///
     /// You must set [`ServerConfig::enable_secret_extraction`][crate::server::ServerConfig::enable_secret_extraction] or
-    /// [`ClientConfig::enable_secret_extraction`][crate::client::ClientConfig::enable_secret_extraction] to true before calling
-    /// these functions.
+    /// [`ClientConfig::enable_secret_extraction`][crate::client::ClientConfig::enable_secret_extraction] to true before this
+    /// is available.
     SecretExtractionRequiresPriorOptIn,
 
     /// Secret extraction operation attempted without first extracting all pending
@@ -1395,6 +1495,17 @@ pub enum ApiMisuse {
         /// The maximum allowed IV length
         maximum: usize,
     },
+
+    /// Calling [`ServerConnection::set_resumption_data()`] must be done before
+    /// any resumption is offered.
+    ///
+    /// [`ServerConnection::set_resumption_data()`]: crate::server::ServerConnection::set_resumption_data()
+    ResumptionDataProvidedTooLate,
+
+    /// [`KernelConnection::update_tx_secret()`] and associated are not available for TLS1.2 connections.
+    ///
+    /// [`KernelConnection::update_tx_secret()`]: crate::conn::kernel::KernelConnection::update_tx_secret()
+    KeyUpdateNotAvailableForTls12,
 }
 
 impl fmt::Display for ApiMisuse {
@@ -1436,14 +1547,7 @@ mod other_error {
 
     impl fmt::Display for OtherError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            #[cfg(feature = "std")]
-            {
-                write!(f, "{}", self.0)
-            }
-            #[cfg(not(feature = "std"))]
-            {
-                f.write_str("no further information available")
-            }
+            write!(f, "{}", self.0)
         }
     }
 
@@ -1455,3 +1559,58 @@ mod other_error {
 }
 
 pub use other_error::OtherError;
+
+/// An [`Error`] along with the (possibly encrypted) alert to send to
+/// the peer.
+pub struct ErrorWithAlert {
+    /// The error
+    pub error: Error,
+    pub(crate) data: Vec<u8>,
+}
+
+impl ErrorWithAlert {
+    pub(crate) fn new(error: Error, send_path: &mut SendPath) -> Self {
+        maybe_send_fatal_alert(send_path, &error);
+        Self {
+            error,
+            data: send_path.sendable_tls.take_one_vec(),
+        }
+    }
+
+    /// Consume any pending TLS data.
+    ///
+    /// The returned buffer will contain the alert, if one is to be sent.
+    pub fn take_tls_data(&mut self) -> Option<Vec<u8>> {
+        match self.data.is_empty() {
+            true => None,
+            false => Some(mem::take(&mut self.data)),
+        }
+    }
+}
+
+impl Deref for ErrorWithAlert {
+    type Target = Error;
+
+    fn deref(&self) -> &Self::Target {
+        &self.error
+    }
+}
+
+/// Direct conversion with no alert.
+impl From<Error> for ErrorWithAlert {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            data: Vec::new(),
+        }
+    }
+}
+
+impl fmt::Debug for ErrorWithAlert {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ErrorWithAlert")
+            .field("error", &self.error)
+            .field("data", &self.data.len())
+            .finish_non_exhaustive()
+    }
+}

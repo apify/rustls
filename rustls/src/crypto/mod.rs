@@ -2,30 +2,24 @@ use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::borrow::Borrow;
-use core::fmt::Debug;
+use core::fmt::{self, Debug};
+use core::hash::{Hash, Hasher};
 use core::time::Duration;
 
-use pki_types::PrivateKeyDer;
+use pki_types::{FipsStatus, PrivateKeyDer, SignatureVerificationAlgorithm};
 
-#[cfg(feature = "impit")]
-use crate::client::client_emulator::BrowserEmulator;
+use crate::crypto::kx::KeyExchangeAlgorithm;
 use crate::enums::ProtocolVersion;
+#[cfg(feature = "webpki")]
+use crate::error::PeerMisbehaved;
 use crate::error::{ApiMisuse, Error};
-use crate::msgs::handshake::ALL_KEY_EXCHANGE_ALGORITHMS;
+use crate::msgs::ALL_KEY_EXCHANGE_ALGORITHMS;
 use crate::sync::Arc;
-pub use crate::webpki::{
-    WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
-};
+#[cfg(feature = "webpki")]
+pub use crate::webpki::{verify_tls12_signature, verify_tls13_signature};
 #[cfg(doc)]
 use crate::{ClientConfig, ConfigBuilder, ServerConfig, client, crypto, server};
 use crate::{SupportedCipherSuite, Tls12CipherSuite, Tls13CipherSuite};
-
-/// aws-lc-rs-based CryptoProvider.
-#[cfg(feature = "aws-lc-rs")]
-pub mod aws_lc_rs;
-
-/// retch-specific CryptoProvider.
-pub mod emulation;
 
 /// TLS message encryption/decryption interfaces.
 pub mod cipher;
@@ -52,6 +46,16 @@ pub mod tls13;
 /// Hybrid public key encryption (RFC 9180).
 pub mod hpke;
 
+#[cfg(any(doc, test))]
+pub(crate) mod test_provider;
+#[cfg(test)]
+pub(crate) use test_provider::TEST_PROVIDER;
+#[cfg(doc)]
+#[doc(hidden)]
+pub use test_provider::TEST_PROVIDER;
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+pub(crate) use test_provider::TLS13_TEST_SUITE;
+
 // Message signing interfaces.
 mod signer;
 pub use signer::{
@@ -63,22 +67,16 @@ pub use crate::suites::CipherSuiteCommon;
 
 /// Controls core cryptography used by rustls.
 ///
-/// This crate comes with one built-in option, provided as
-/// `CryptoProvider` structures:
-///
-/// - [`crypto::aws_lc_rs::DEFAULT_PROVIDER`]: (behind the `aws-lc-rs` crate feature).
-///   This provider uses the [aws-lc-rs](https://github.com/aws/aws-lc-rs)
-///   crate.  The `fips` crate feature makes this option use FIPS140-3-approved cryptography.
-///
 /// This structure provides defaults. Everything in it can be overridden at
 /// runtime by replacing field values as needed.
 ///
 /// # Using the per-process default `CryptoProvider`
 ///
-/// There is the concept of an implicit default provider, configured at run-time once in
-/// a given process.
-///
-/// It is used for functions like [`ClientConfig::builder()`] and [`ServerConfig::builder()`].
+/// If it is hard to pass a specific `CryptoProvider` to all callers that need to establish
+/// TLS connections, you can store a per-process `CryptoProvider` default via
+/// [`CryptoProvider::install_default()`]. When initializing a `ClientConfig` or `ServerConfig` via
+/// [`ClientConfig::builder()`] or [`ServerConfig::builder()`], you can obtain the installed
+/// provider via [`CryptoProvider::get_default()`].
 ///
 /// The intention is that an application can specify the [`CryptoProvider`] they wish to use
 /// once, and have that apply to the variety of places where their application does TLS
@@ -90,25 +88,20 @@ pub use crate::suites::CipherSuiteCommon;
 /// - _libraries_ should use [`ClientConfig::builder()`]/[`ServerConfig::builder()`]
 ///   or otherwise rely on the [`CryptoProvider::get_default()`] provider.
 /// - _applications_ should call [`CryptoProvider::install_default()`] early
-///   in their `fn main()`. If _applications_ uses a custom provider based on the one built-in,
-///   they can activate the `custom-provider` feature to ensure its usage.
+///   in their `fn main()`.
 ///
 /// # Using a specific `CryptoProvider`
 ///
 /// Supply the provider when constructing your [`ClientConfig`] or [`ServerConfig`]:
 ///
-/// - [`ClientConfig::builder()`]
-/// - [`ServerConfig::builder()`]
+/// - [`ClientConfig::builder()`][crate::ClientConfig::builder()]
+/// - [`ServerConfig::builder()`][crate::ServerConfig::builder()]
 ///
 /// When creating and configuring a webpki-backed client or server certificate verifier, a choice of
 /// provider is also needed to start the configuration process:
 ///
-/// - [`client::WebPkiServerVerifier::builder()`]
-/// - [`server::WebPkiClientVerifier::builder()`]
-///
-/// If you install a custom provider and want to avoid any accidental use of a built-in provider, the feature
-/// `custom-provider` can be activated to ensure your custom provider is used everywhere
-/// and not a built-in one. This will disable any implicit use of a built-in provider.
+/// - [`WebPkiServerVerifier::builder()`][crate::client::WebPkiServerVerifier::builder()]
+/// - [`WebPkiClientVerifier::builder()`][crate::server::WebPkiClientVerifier::builder()]
 ///
 /// # Making a custom `CryptoProvider`
 ///
@@ -125,15 +118,14 @@ pub use crate::suites::CipherSuiteCommon;
 /// API (with [`ConfigBuilder::with_single_cert`], etc.), it might look like this:
 ///
 /// ```
-/// # #[cfg(feature = "aws-lc-rs")] {
 /// # use std::sync::Arc;
 /// # mod fictitious_hsm_api { pub fn load_private_key(key_der: pki_types::PrivateKeyDer<'static>) -> ! { unreachable!(); } }
-/// use rustls::crypto::aws_lc_rs;
 ///
 /// pub fn provider() -> rustls::crypto::CryptoProvider {
-///   rustls::crypto::CryptoProvider{
+/// # let DEFAULT_PROVIDER = panic!();
+///   rustls::crypto::CryptoProvider {
 ///     key_provider: &HsmKeyLoader,
-///     ..aws_lc_rs::DEFAULT_PROVIDER
+///     ..DEFAULT_PROVIDER
 ///   }
 /// }
 ///
@@ -145,7 +137,6 @@ pub use crate::suites::CipherSuiteCommon;
 ///          fictitious_hsm_api::load_private_key(key_der)
 ///     }
 /// }
-/// # }
 /// ```
 ///
 /// ## References to the individual elements
@@ -160,25 +151,11 @@ pub use crate::suites::CipherSuiteCommon;
 /// - **Authentication key loading** - see [`KeyProvider::load_private_key()`] and
 ///   [`SigningKey`].
 ///
-/// # Example code
-///
-/// See custom [`provider-example/`] for a full client and server example that uses
-/// cryptography from the [`RustCrypto`] and [`dalek-cryptography`] projects.
-///
-/// ```shell
-/// $ cargo run --example client | head -3
-/// Current ciphersuite: TLS13_CHACHA20_POLY1305_SHA256
-/// HTTP/1.1 200 OK
-/// Content-Type: text/html; charset=utf-8
-/// Content-Length: 19899
-/// ```
-///
-/// [`provider-example/`]: https://github.com/rustls/rustls/tree/main/provider-example/
-/// [`RustCrypto`]: https://github.com/RustCrypto
-/// [`dalek-cryptography`]: https://github.com/dalek-cryptography
-///
 /// # FIPS-approved cryptography
-/// The `fips` crate feature enables use of the `aws-lc-rs` crate in FIPS mode.
+///
+/// Each element of a `CryptoProvider` may be implemented using FIPS-approved cryptography,
+/// and the FIPS status of the overall provider is derived from the status of its elements.
+/// Call [`CryptoProvider::fips()`] to determine the FIPS status of a given provider.
 ///
 /// You can verify the configuration at runtime by checking
 /// [`ServerConfig::fips()`]/[`ClientConfig::fips()`] return `true`.
@@ -232,85 +209,13 @@ pub struct CryptoProvider {
     pub ticketer_factory: &'static dyn TicketerFactory,
 }
 
-/// Convenience builder for `CryptoProvider`.
-#[cfg(feature = "impit")]
-pub struct CryptoProviderBuilder {
-    browser_emulator: Option<BrowserEmulator>,
-}
-
-#[cfg(feature = "impit")]
-impl CryptoProviderBuilder {
-    /// Sets the browser emulator to use for this provider.
-    pub fn with_browser_emulator(mut self, browser_emulator: &BrowserEmulator) -> Self {
-        self.browser_emulator = Some(browser_emulator.clone());
-        self
-    }
-
-    /// Builds the `CryptoProvider`.
-    pub fn build(self) -> CryptoProvider {
-        use crate::client::client_emulator::{BrowserEmulator, BrowserType};
-        use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
-
-        match self.browser_emulator {
-            Some(BrowserEmulator {
-                browser_type: BrowserType::Chrome,
-                version: _,
-            }) => {
-                use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
-                use crate::crypto::emulation::{
-                    CHROME_SIGNATURE_VERIFICATION_ALGOS, CHROME_TLS12_CIPHER_SUITES,
-                    CHROME_TLS13_CIPHER_SUITES,
-                };
-
-                let provider = CryptoProvider {
-                    tls13_cipher_suites: Cow::Borrowed(&CHROME_TLS13_CIPHER_SUITES),
-                    tls12_cipher_suites: Cow::Borrowed(&CHROME_TLS12_CIPHER_SUITES),
-                    signature_verification_algorithms: CHROME_SIGNATURE_VERIFICATION_ALGOS,
-                    ..DEFAULT_PROVIDER
-                };
-
-                provider
-            }
-            Some(BrowserEmulator {
-                browser_type: BrowserType::Firefox,
-                version: _,
-            }) => {
-                use crate::crypto::aws_lc_rs::DEFAULT_PROVIDER;
-                use crate::crypto::emulation::{
-                    FIREFOX_SIGNATURE_VERIFICATION_ALGOS, FIREFOX_TLS12_CIPHER_SUITES,
-                    FIREFOX_TLS13_CIPHER_SUITES,
-                };
-
-                let provider = CryptoProvider {
-                    tls13_cipher_suites: Cow::Borrowed(&FIREFOX_TLS13_CIPHER_SUITES),
-                    tls12_cipher_suites: Cow::Borrowed(&FIREFOX_TLS12_CIPHER_SUITES),
-                    signature_verification_algorithms: FIREFOX_SIGNATURE_VERIFICATION_ALGOS,
-                    ..DEFAULT_PROVIDER
-                };
-
-                provider
-            }
-            None => DEFAULT_PROVIDER,
-        }
-    }
-}
-
 impl CryptoProvider {
-    /// Returns a new `CryptoProviderBuilder`.
-    #[cfg(feature = "impit")]
-    pub fn builder() -> CryptoProviderBuilder {
-        CryptoProviderBuilder {
-            browser_emulator: None,
-        }
-    }
-
     /// Sets this `CryptoProvider` as the default for this process.
     ///
     /// This can be called successfully at most once in any process execution.
     ///
-    /// Call this early in your process to configure which provider is used for
-    /// the provider.  The configuration should happen before any use of
-    /// [`ClientConfig::builder()`] or [`ServerConfig::builder()`].
+    /// After calling this, other callers can obtain a reference to the installed
+    /// default via [`CryptoProvider::get_default()`].
     pub fn install_default(self) -> Result<(), Arc<Self>> {
         static_default::install_default(self)
     }
@@ -324,13 +229,13 @@ impl CryptoProvider {
         static_default::get_default()
     }
 
-    /// Returns `true` if this `CryptoProvider` is operating in FIPS mode.
+    /// Return the FIPS validation status for this `CryptoProvider`.
     ///
     /// This covers only the cryptographic parts of FIPS approval.  There are
     /// also TLS protocol-level recommendations made by NIST.  You should
     /// prefer to call [`ClientConfig::fips()`] or [`ServerConfig::fips()`]
     /// which take these into account.
-    pub fn fips(&self) -> bool {
+    pub fn fips(&self) -> FipsStatus {
         let Self {
             tls12_cipher_suites,
             tls13_cipher_suites,
@@ -340,17 +245,24 @@ impl CryptoProvider {
             key_provider,
             ticketer_factory,
         } = self;
-        tls12_cipher_suites
-            .iter()
-            .all(|cs| cs.fips())
-            && tls13_cipher_suites
-                .iter()
-                .all(|cs| cs.fips())
-            && kx_groups.iter().all(|kx| kx.fips())
-            && signature_verification_algorithms.fips()
-            && secure_random.fips()
-            && key_provider.fips()
-            && ticketer_factory.fips()
+
+        let mut status = Ord::min(
+            signature_verification_algorithms.fips(),
+            secure_random.fips(),
+        );
+        status = Ord::min(status, key_provider.fips());
+        status = Ord::min(status, ticketer_factory.fips());
+        for cs in tls12_cipher_suites.iter() {
+            status = Ord::min(status, cs.fips());
+        }
+        for cs in tls13_cipher_suites.iter() {
+            status = Ord::min(status, cs.fips());
+        }
+        for kx in kx_groups.iter() {
+            status = Ord::min(status, kx.fips());
+        }
+
+        status
     }
 
     pub(crate) fn consistency_check(&self) -> Result<(), Error> {
@@ -360,6 +272,17 @@ impl CryptoProvider {
 
         if self.kx_groups.is_empty() {
             return Err(ApiMisuse::NoKeyExchangeGroupsConfigured.into());
+        }
+
+        // verifying DHE kx groups return their actual group
+        for group in self.kx_groups.iter() {
+            if group.name().key_exchange_algorithm() == KeyExchangeAlgorithm::DHE
+                && group.ffdhe_group().is_none()
+            {
+                return Err(Error::General(alloc::format!(
+                    "SupportedKxGroup {group:?} must return Some() from `ffdhe_group()`"
+                )));
+            }
         }
 
         // verifying cipher suites have matching kx groups
@@ -441,6 +364,158 @@ impl Borrow<[&'static Tls13CipherSuite]> for CryptoProvider {
     }
 }
 
+/// Describes which `webpki` signature verification algorithms are supported and
+/// how they map to TLS [`SignatureScheme`]s.
+///
+/// Create one with [`WebPkiSupportedAlgorithms::new`], which can be done in const-context.
+#[derive(Clone, Copy)]
+pub struct WebPkiSupportedAlgorithms {
+    /// A list of all supported signature verification algorithms.
+    ///
+    /// Used for verifying certificate chains.
+    ///
+    /// The order of this list is not significant.  It may be empty, but the default
+    /// certificate verifier will reject all certificates so a custom verifier will be required.
+    pub(crate) all: &'static [&'static dyn SignatureVerificationAlgorithm],
+
+    /// A mapping from TLS `SignatureScheme`s to matching webpki signature verification algorithms.
+    ///
+    /// This field has invariants enforced by [`Self::new()`]:
+    ///
+    /// - The mappings must be non-empty.
+    /// - The list of verification algorithms for each mapping must be non-empty.
+    ///
+    /// This is one (`SignatureScheme`) to many ([`SignatureVerificationAlgorithm`]) because
+    /// (depending on the protocol version) there is not necessary a 1-to-1 mapping.
+    ///
+    /// For TLS1.2, all `SignatureVerificationAlgorithm`s are tried in sequence.
+    ///
+    /// For TLS1.3, only the first is tried.
+    ///
+    /// The supported schemes in this mapping is communicated to the peer and the order is significant.
+    /// The first mapping is our highest preference.
+    pub(crate) mapping: &'static [(
+        SignatureScheme,
+        &'static [&'static dyn SignatureVerificationAlgorithm],
+    )],
+}
+
+impl WebPkiSupportedAlgorithms {
+    /// Creating a `WebPkiSupportedAlgorithms` and checking its consistency.
+    ///
+    /// This is intended to only be called in const context, so the panics are
+    /// compile-time.
+    pub const fn new(
+        all: &'static [&'static dyn SignatureVerificationAlgorithm],
+        mapping: &'static [(
+            SignatureScheme,
+            &'static [&'static dyn SignatureVerificationAlgorithm],
+        )],
+    ) -> Result<Self, ApiMisuse> {
+        let s = Self { all, mapping };
+        if mapping.is_empty() {
+            return Err(ApiMisuse::NoSignatureVerificationAlgorithms);
+        }
+
+        // TODO: rewrite when feature(const_iter) and feature(const_for) are available
+        let mut i = 0;
+        while i < s.mapping.len() {
+            if s.mapping[i].1.is_empty() {
+                return Err(ApiMisuse::NoSignatureVerificationAlgorithms);
+            }
+            assert!(!s.mapping[i].1.is_empty());
+            i += 1;
+        }
+
+        Ok(s)
+    }
+
+    /// Return all the `scheme` items in `mapping`, maintaining order.
+    pub fn supported_schemes(&self) -> Vec<SignatureScheme> {
+        self.mapping
+            .iter()
+            .map(|item| item.0)
+            .collect()
+    }
+
+    /// Return the FIPS validation status of this implementation.
+    pub fn fips(&self) -> FipsStatus {
+        let algs = self
+            .all
+            .iter()
+            .map(|alg| alg.fips_status())
+            .min();
+        let mapped = self
+            .mapping
+            .iter()
+            .flat_map(|(_, algs)| algs.iter().map(|alg| alg.fips_status()))
+            .min();
+
+        match (algs, mapped) {
+            (Some(algs), Some(mapped)) => Ord::min(algs, mapped),
+            (Some(status), None) | (None, Some(status)) => status,
+            (None, None) => FipsStatus::Unvalidated,
+        }
+    }
+
+    /// Accessor for the `mapping` field.
+    pub fn mapping(
+        &self,
+    ) -> &'static [(
+        SignatureScheme,
+        &'static [&'static dyn SignatureVerificationAlgorithm],
+    )] {
+        self.mapping
+    }
+
+    /// Return the first item in `mapping` that matches `scheme`.
+    #[cfg(feature = "webpki")]
+    pub(crate) fn convert_scheme(
+        &self,
+        scheme: SignatureScheme,
+    ) -> Result<&[&'static dyn SignatureVerificationAlgorithm], Error> {
+        self.mapping
+            .iter()
+            .filter_map(|item| if item.0 == scheme { Some(item.1) } else { None })
+            .next()
+            .ok_or_else(|| PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into())
+    }
+}
+
+impl Debug for WebPkiSupportedAlgorithms {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WebPkiSupportedAlgorithms {{ all: [ .. ], mapping: ")?;
+        f.debug_list()
+            .entries(self.mapping.iter().map(|item| item.0))
+            .finish()?;
+        write!(f, " }}")
+    }
+}
+
+impl Hash for WebPkiSupportedAlgorithms {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self { all, mapping } = self;
+
+        write_algs(state, all);
+        state.write_usize(mapping.len());
+        for (scheme, algs) in *mapping {
+            state.write_u16(u16::from(*scheme));
+            write_algs(state, algs);
+        }
+
+        fn write_algs<H: Hasher>(
+            state: &mut H,
+            algs: &[&'static dyn SignatureVerificationAlgorithm],
+        ) {
+            state.write_usize(algs.len());
+            for alg in algs {
+                state.write(alg.public_key_alg_id().as_ref());
+                state.write(alg.signature_alg_id().as_ref());
+            }
+        }
+    }
+}
+
 pub(crate) mod rand {
     use super::{GetRandomFailed, SecureRandom};
 
@@ -483,9 +558,9 @@ pub trait SecureRandom: Send + Sync + Debug {
     /// rustls: it is assumed that the cryptography library provides for this itself.
     fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed>;
 
-    /// Return `true` if this is backed by a FIPS-approved implementation.
-    fn fips(&self) -> bool {
-        false
+    /// Return the FIPS validation status of this implementation.
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated
     }
 }
 
@@ -510,12 +585,12 @@ pub trait KeyProvider: Send + Sync + Debug {
         key_der: PrivateKeyDer<'static>,
     ) -> Result<Box<dyn SigningKey>, Error>;
 
-    /// Return `true` if this is backed by a FIPS-approved implementation.
+    /// Return the FIPS validation status for this key provider.
     ///
-    /// If this returns `true`, that must be the case for all possible key types
-    /// supported by [`KeyProvider::load_private_key()`].
-    fn fips(&self) -> bool {
-        false
+    /// The returned status must cover all possible key types supported by
+    /// [`KeyProvider::load_private_key()`].
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated
     }
 }
 
@@ -528,8 +603,10 @@ pub trait TicketerFactory: Debug + Send + Sync {
     /// Build a new `TicketProducer`.
     fn ticketer(&self) -> Result<Arc<dyn TicketProducer>, Error>;
 
-    /// Return `true` if this is backed by a FIPS-approved implementation.
-    fn fips(&self) -> bool;
+    /// Return the FIPS validation status of ticketers produced from here.
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated
+    }
 }
 
 /// A trait for the ability to encrypt and decrypt tickets.
@@ -559,83 +636,27 @@ pub trait TicketProducer: Debug + Send + Sync {
     fn lifetime(&self) -> Duration;
 }
 
-/// This function returns a [`CryptoProvider`] that uses
-/// FIPS140-3-approved cryptography.
-///
-/// Using this function expresses in your code that you require
-/// FIPS-approved cryptography, and will not compile if you make
-/// a mistake with cargo features.
-///
-/// See our [FIPS documentation](crate::manual::_06_fips) for
-/// more detail.
-///
-/// Install this as the process-default provider, like:
-///
-/// ```rust
-/// # #[cfg(feature = "fips")] {
-/// rustls::crypto::default_fips_provider().install_default()
-///     .expect("default provider already set elsewhere");
-/// # }
-/// ```
-///
-/// You can also use this explicitly, like:
-///
-/// ```rust
-/// # #[cfg(feature = "fips")] {
-/// # let root_store = rustls::RootCertStore::empty();
-/// let config = rustls::ClientConfig::builder(
-///         rustls::crypto::default_fips_provider().into()
-///     )
-///     .with_root_certificates(root_store)
-///     .with_no_client_auth()
-///     .unwrap();
-/// # }
-/// ```
-#[cfg(all(feature = "aws-lc-rs", any(feature = "fips", rustls_docsrs)))]
-#[cfg_attr(rustls_docsrs, doc(cfg(feature = "fips")))]
-pub fn default_fips_provider() -> CryptoProvider {
-    aws_lc_rs::DEFAULT_PROVIDER
-}
-
 mod static_default {
-    #[cfg(not(feature = "std"))]
-    use alloc::boxed::Box;
-    #[cfg(feature = "std")]
     use std::sync::OnceLock;
-
-    #[cfg(not(feature = "std"))]
-    use once_cell::race::OnceBox;
 
     use super::CryptoProvider;
     use crate::sync::Arc;
 
-    #[cfg(feature = "std")]
     pub(crate) fn install_default(
         default_provider: CryptoProvider,
     ) -> Result<(), Arc<CryptoProvider>> {
         PROCESS_DEFAULT_PROVIDER.set(Arc::new(default_provider))
     }
 
-    #[cfg(not(feature = "std"))]
-    pub(crate) fn install_default(
-        default_provider: CryptoProvider,
-    ) -> Result<(), Arc<CryptoProvider>> {
-        PROCESS_DEFAULT_PROVIDER
-            .set(Box::new(Arc::new(default_provider)))
-            .map_err(|e| *e)
-    }
-
     pub(crate) fn get_default() -> Option<&'static Arc<CryptoProvider>> {
         PROCESS_DEFAULT_PROVIDER.get()
     }
 
-    #[cfg(feature = "std")]
     static PROCESS_DEFAULT_PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
-    #[cfg(not(feature = "std"))]
-    static PROCESS_DEFAULT_PROVIDER: OnceBox<Arc<CryptoProvider>> = OnceBox::new();
 }
 
 #[cfg(test)]
+#[track_caller]
 pub(crate) fn tls13_suite(
     suite: CipherSuite,
     provider: &CryptoProvider,
@@ -648,6 +669,7 @@ pub(crate) fn tls13_suite(
 }
 
 #[cfg(test)]
+#[track_caller]
 pub(crate) fn tls12_suite(
     suite: CipherSuite,
     provider: &CryptoProvider,
@@ -660,6 +682,7 @@ pub(crate) fn tls12_suite(
 }
 
 #[cfg(test)]
+#[track_caller]
 pub(crate) fn tls13_only(provider: CryptoProvider) -> CryptoProvider {
     CryptoProvider {
         tls12_cipher_suites: Cow::default(),
@@ -668,6 +691,7 @@ pub(crate) fn tls13_only(provider: CryptoProvider) -> CryptoProvider {
 }
 
 #[cfg(test)]
+#[track_caller]
 pub(crate) fn tls12_only(provider: CryptoProvider) -> CryptoProvider {
     CryptoProvider {
         tls13_cipher_suites: Cow::default(),

@@ -3,8 +3,6 @@
     "*-ECDSA_SHA1-*": "no ecdsa-sha1",
     "*-HintMismatch-*": "hints are a boringssl-specific feature",
     "*-P-224-*": "no p224",
-    "*-MLKEM1024-*": "no mlkem1024 support",
-    "*-MLKEM1024": "no mlkem1024 support",
     "*-QUIC": "quic mode does not work over TLS1.3 framing -- do this in the shim?",
     "*-QUIC-*" :"quic mode does not work over TLS1.3 framing -- do this in the shim?",
     "*-RSA_PKCS1_SHA256_LEGACY-*": "NYI on our side https://datatracker.ietf.org/doc/draft-ietf-tls-tls13-pkcs1/01/",
@@ -66,8 +64,8 @@
     "GREASE-*": "not implemented",
     "IgnoreExtensionsOnIntermediates-TLS13": "assumes SCT support",
     "LargeMessage-Reject": "not supported as a runtime option (cert size limit is compile-time constant)",
-    "MLKEMKeyShareIncludedSecond-X25519MLKEM768": "no mlkem1024 support",
-    "MLKEMKeyShareIncludedThird-X25519MLKEM768": "no mlkem1024 support",
+    "MLKEMKeyShareIncludedSecond-X25519MLKEM768": "we only include a share for the first configured group",
+    "MLKEMKeyShareIncludedThird-X25519MLKEM768": "we only include a share for the first configured group",
     "MTU*": "dtls only",
     "NPN-*": "no NPN support, never",
     "NoCommonCurves": "nothing to fall back to",
@@ -108,7 +106,7 @@
     "SignedCertificateTimestampListEmptySCT-Client-*": "no sct stapling",
     "TLS13-Client-*TicketFlags*": "no flags extension support (on tickets or elsewhere)",
     "TrustAnchors-*": "no TrustAnchor draft support",
-    "TwoMLKEMs": "no mlkem1024 support",
+    "TwoMLKEMs": "we only include a share for the first configured group",
     "VerifyPreferences-Enforced": "we validate but don't actually implement -verify-prefs",
     "VerifyPreferences-NoCommonAlgorithms": "we validate but don't actually implement -verify-prefs",
 #if defined(RING)
@@ -131,8 +129,9 @@
     "TLS-ECH-Server*": "ECH server support NYI",
 #endif
 #if defined(AWS_LC_RS)
-    "MLKEMKeyShareIncludedSecond": "we only include a share for the first configured group",
-    "MLKEMKeyShareIncludedThird": "we only include a share for the first configured group",
+    "MLKEMKeyShareIncludedSecond-MLKEM1024": "we only include a share for the first configured group",
+    "MLKEMKeyShareIncludedThird-MLKEM1024": "we only include a share for the first configured group",
+    "NotJustMLKEMKeyShare-MLKEM1024": "we only include a share for the first configured group",
 #else
     "*MLKEM*": "not implemented",
 #endif
@@ -160,7 +159,6 @@
   },
   "ErrorMap": {
     ":APPLICATION_DATA_INSTEAD_OF_HANDSHAKE:": [":UNEXPECTED_MESSAGE:"],
-    ":DIGEST_CHECK_FAILED:": [":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:"],
     ":ENCRYPTED_LENGTH_TOO_LONG:": [":GARBAGE:"],
     ":HTTPS_PROXY_REQUEST:": [":GARBAGE:"],
     ":HTTP_REQUEST:": [":GARBAGE:"],
@@ -170,10 +168,10 @@
     ":WRONG_VERSION_NUMBER:": [":GARBAGE:"]
   },
   "TestErrorMap": {
-    "ALPNClient-EmptyProtocolName-TLS-TLS12": ":ILLEGAL_EMPTY_VALUE:",
-    "ALPNClient-EmptyProtocolName-TLS-TLS13": ":ILLEGAL_EMPTY_VALUE:",
-    "ALPNServer-EmptyProtocolName-TLS-TLS12": ":ILLEGAL_EMPTY_VALUE:",
-    "ALPNServer-EmptyProtocolName-TLS-TLS13": ":ILLEGAL_EMPTY_VALUE:",
+    "ALPNClient-EmptyProtocolName-TLS-TLS12": ":DECODE_ERROR:",
+    "ALPNClient-EmptyProtocolName-TLS-TLS13": ":DECODE_ERROR:",
+    "ALPNServer-EmptyProtocolName-TLS-TLS12": ":DECODE_ERROR:",
+    "ALPNServer-EmptyProtocolName-TLS-TLS13": ":DECODE_ERROR:",
     "AppDataBeforeTLS13KeyChange": ":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:",
     "AppDataBeforeTLS13KeyChange-Empty": ":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:",
     "CertCompressionTooLargeClient-TLS13": ":GARBAGE:",
@@ -199,7 +197,7 @@
     "ExtendedMasterSecret-YesToNo-Client": ":RESUMED_SESSION_WITH_VARIED_EMS:",
     "ExtendedMasterSecret-YesToNo-Server": ":RESUMED_SESSION_WITH_VARIED_EMS:",
     "HelloRetryRequest-CipherChange-TLS13": ":SELECTED_DIFFERENT_CIPHERSUITE_AFTER_RETRY:",
-    "HelloRetryRequest-EmptyCookie-TLS13": ":ILLEGAL_EMPTY_VALUE:",
+    "HelloRetryRequest-EmptyCookie-TLS13": ":DECODE_ERROR:",
     "HelloRetryRequestVersionMismatch-TLS13": ":INCOMPATIBLE:",
     "KeyUpdate-InvalidRequestMode": ":BAD_HANDSHAKE_MSG:",
     "MinimumVersion-Client-TLS13-TLS12-TLS": ":INCOMPATIBLE:",
@@ -277,7 +275,6 @@
     "TrailingMessageData-TLS13-EndOfEarlyData-TLS": ":BAD_HANDSHAKE_MSG:",
     "TrailingMessageData-TLS13-ServerCertificate-TLS": ":BAD_HANDSHAKE_MSG:",
     "TrailingMessageData-TLS13-ServerCertificateVerify-TLS": ":BAD_HANDSHAKE_MSG:",
-    "TrailingMessageData-TLS13-ServerFinished-TLS": ":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:",
     "TrailingMessageData-TLS13-ServerHello-TLS": ":BAD_HANDSHAKE_MSG:",
     "Unclean-Shutdown": ":CLOSE_WITHOUT_CLOSE_NOTIFY:",
     "UnknownCurve-HelloRetryRequest-TLS13": ":ILLEGAL_HELLO_RETRY_REQUEST_WITH_UNOFFERED_GROUP:",

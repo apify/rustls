@@ -19,9 +19,11 @@ use std::sync::Arc;
 use std::{env, io};
 
 use rustls::crypto::Identity;
-use rustls::crypto::aws_lc_rs::DEFAULT_PROVIDER;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{Connection, ServerConfig, ServerConnection};
+use rustls_aws_lc_rs::DEFAULT_PROVIDER;
+use rustls_util::complete_io;
 
 fn main() -> Result<(), Box<dyn StdError>> {
     let mut args = env::args();
@@ -40,7 +42,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
     let private_key =
         PrivateKeyDer::from_pem_file(private_key_file).expect("cannot open private key file");
 
-    let mut config = rustls::ServerConfig::builder(Arc::new(DEFAULT_PROVIDER))
+    let mut config = ServerConfig::builder(Arc::new(DEFAULT_PROVIDER))
         .with_no_client_auth()
         .with_single_cert(Arc::new(Identity::from_cert_chain(certs)?), private_key)?;
     config.max_early_data_size = 1000;
@@ -52,7 +54,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
         println!("Accepting connection");
 
-        let mut conn = rustls::ServerConnection::new(Arc::new(config.clone()))?;
+        let mut conn = ServerConnection::new(Arc::new(config.clone()))?;
 
         let mut buf = Vec::new();
         let mut did_early_data = false;
@@ -107,6 +109,6 @@ fn main() -> Result<(), Box<dyn StdError>> {
         conn.writer()
             .write_all(b"Hello from the server")?;
         conn.send_close_notify();
-        conn.complete_io(&mut stream)?;
+        complete_io(&mut stream, &mut conn)?;
     }
 }

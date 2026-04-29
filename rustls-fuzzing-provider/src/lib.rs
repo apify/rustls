@@ -5,9 +5,9 @@ use std::sync::Arc;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::ServerVerifier;
 use rustls::crypto::cipher::{
-    AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, KeyBlockShape, MessageDecrypter,
-    MessageEncrypter, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload,
-    Tls12AeadAlgorithm, Tls13AeadAlgorithm, UnsupportedOperationError,
+    AeadKey, EncodedMessage, InboundOpaque, Iv, KeyBlockShape, MessageDecrypter, MessageEncrypter,
+    OutboundOpaque, OutboundPlain, Tls12AeadAlgorithm, Tls13AeadAlgorithm,
+    UnsupportedOperationError,
 };
 use rustls::crypto::kx::{
     KeyExchangeAlgorithm, NamedGroup, SharedSecret, StartedKeyExchange, SupportedKxGroup,
@@ -20,7 +20,7 @@ use rustls::crypto::{
 use rustls::enums::{ContentType, ProtocolVersion};
 use rustls::error::{PeerIncompatible, PeerMisbehaved};
 use rustls::pki_types::{
-    AlgorithmIdentifier, CertificateDer, InvalidSignature, PrivateKeyDer,
+    AlgorithmIdentifier, CertificateDer, FipsStatus, InvalidSignature, PrivateKeyDer,
     SignatureVerificationAlgorithm, SubjectPublicKeyInfoDer, alg_id,
 };
 use rustls::server::{ClientHello, ServerCredentialResolver};
@@ -54,9 +54,11 @@ pub fn server_verifier() -> Arc<dyn ServerVerifier> {
         &include_bytes!("../../test-ca/ecdsa-p256/inter.der")[..],
     )]);
 
-    WebPkiServerVerifier::builder(root_store.into(), &PROVIDER)
-        .build()
-        .unwrap()
+    Arc::new(
+        WebPkiServerVerifier::builder(root_store.into(), &PROVIDER)
+            .build()
+            .unwrap(),
+    )
 }
 
 pub fn server_cert_resolver() -> Arc<dyn ServerCredentialResolver> {
@@ -112,14 +114,14 @@ impl crypto::TicketerFactory for Provider {
         Ok(Arc::new(Ticketer))
     }
 
-    fn fips(&self) -> bool {
-        false
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated
     }
 }
 
 pub const TLS13_FUZZING_SUITE: &Tls13CipherSuite = &Tls13CipherSuite {
     common: CipherSuiteCommon {
-        suite: CipherSuite::Unknown(0xff13),
+        suite: CipherSuite(0xff13),
         hash_provider: &Hash,
         confidentiality_limit: u64::MAX,
     },
@@ -131,7 +133,7 @@ pub const TLS13_FUZZING_SUITE: &Tls13CipherSuite = &Tls13CipherSuite {
 
 pub const TLS_FUZZING_SUITE: &Tls12CipherSuite = &Tls12CipherSuite {
     common: CipherSuiteCommon {
-        suite: CipherSuite::Unknown(0xff12),
+        suite: CipherSuite(0xff12),
         hash_provider: &Hash,
         confidentiality_limit: u64::MAX,
     },
@@ -318,11 +320,11 @@ struct Tls13Cipher;
 impl MessageEncrypter for Tls13Cipher {
     fn encrypt(
         &mut self,
-        m: OutboundPlainMessage<'_>,
+        m: EncodedMessage<OutboundPlain<'_>>,
         seq: u64,
-    ) -> Result<OutboundOpaqueMessage, Error> {
+    ) -> Result<EncodedMessage<OutboundOpaque>, Error> {
         let total_len = self.encrypted_payload_len(m.payload.len());
-        let mut payload = PrefixedPayload::with_capacity(total_len);
+        let mut payload = OutboundOpaque::with_capacity(total_len);
 
         payload.extend_from_chunks(&m.payload);
         payload.extend_from_slice(&m.typ.to_array());
@@ -338,7 +340,7 @@ impl MessageEncrypter for Tls13Cipher {
         payload.extend_from_slice(&seq.to_be_bytes());
         payload.extend_from_slice(AEAD_TAG);
 
-        Ok(OutboundOpaqueMessage {
+        Ok(EncodedMessage {
             typ: ContentType::ApplicationData,
             version: ProtocolVersion::TLSv1_2,
             payload,
@@ -353,9 +355,9 @@ impl MessageEncrypter for Tls13Cipher {
 impl MessageDecrypter for Tls13Cipher {
     fn decrypt<'a>(
         &mut self,
-        mut m: InboundOpaqueMessage<'a>,
+        mut m: EncodedMessage<InboundOpaque<'a>>,
         seq: u64,
-    ) -> Result<InboundPlainMessage<'a>, Error> {
+    ) -> Result<EncodedMessage<&'a [u8]>, Error> {
         let payload = &mut m.payload;
 
         let mut expected_tag = vec![];
@@ -387,11 +389,11 @@ struct Tls12Cipher;
 impl MessageEncrypter for Tls12Cipher {
     fn encrypt(
         &mut self,
-        m: OutboundPlainMessage<'_>,
+        m: EncodedMessage<OutboundPlain<'_>>,
         seq: u64,
-    ) -> Result<OutboundOpaqueMessage, Error> {
+    ) -> Result<EncodedMessage<OutboundOpaque>, Error> {
         let total_len = self.encrypted_payload_len(m.payload.len());
-        let mut payload = PrefixedPayload::with_capacity(total_len);
+        let mut payload = OutboundOpaque::with_capacity(total_len);
         payload.extend_from_chunks(&m.payload);
 
         for (p, mask) in payload
@@ -405,7 +407,7 @@ impl MessageEncrypter for Tls12Cipher {
         payload.extend_from_slice(&seq.to_be_bytes());
         payload.extend_from_slice(AEAD_TAG);
 
-        Ok(OutboundOpaqueMessage {
+        Ok(EncodedMessage {
             typ: m.typ,
             version: m.version,
             payload,
@@ -420,9 +422,9 @@ impl MessageEncrypter for Tls12Cipher {
 impl MessageDecrypter for Tls12Cipher {
     fn decrypt<'a>(
         &mut self,
-        mut m: InboundOpaqueMessage<'a>,
+        mut m: EncodedMessage<InboundOpaque<'a>>,
         seq: u64,
-    ) -> Result<InboundPlainMessage<'a>, Error> {
+    ) -> Result<EncodedMessage<&'a [u8]>, Error> {
         let payload = &mut m.payload;
 
         let mut expected_tag = vec![];
@@ -453,9 +455,12 @@ const AEAD_MASK: &[u8] = b"AeadMaskPattern";
 const AEAD_TAG: &[u8] = b"AeadTagA";
 const AEAD_OVERHEAD: usize = 16;
 
-pub static VERIFY_ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
-    all: &[VERIFY_ALGORITHM],
-    mapping: &[(SIGNATURE_SCHEME, &[VERIFY_ALGORITHM])],
+pub static VERIFY_ALGORITHMS: WebPkiSupportedAlgorithms = match WebPkiSupportedAlgorithms::new(
+    &[VERIFY_ALGORITHM],
+    &[(SIGNATURE_SCHEME, &[VERIFY_ALGORITHM])],
+) {
+    Ok(algs) => algs,
+    Err(_) => panic!("bad WebPkiSupportedAlgorithms"),
 };
 
 static VERIFY_ALGORITHM: &dyn SignatureVerificationAlgorithm = &VerifyAlgorithm;

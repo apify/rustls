@@ -1,25 +1,22 @@
 use alloc::boxed::Box;
 use alloc::string::ToString;
-use alloc::vec::Vec;
-use core::fmt;
+use core::{array, fmt};
 
+use pki_types::FipsStatus;
 use zeroize::Zeroize;
 
 use crate::enums::{ContentType, ProtocolVersion};
-use crate::error::{ApiMisuse, Error, InvalidMessage};
-use crate::msgs::base::hex;
-use crate::msgs::codec::{self, Codec, Reader};
-use crate::msgs::message::{MessageError, read_opaque_message_header};
+use crate::error::{ApiMisuse, Error};
+use crate::msgs::{put_u16, put_u64};
 use crate::suites::ConnectionTrafficSecrets;
 
-mod inbound;
-pub use inbound::{BorrowedPayload, InboundOpaqueMessage, InboundPlainMessage};
-
-mod outbound;
-pub use outbound::{OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload};
+mod messages;
+pub use messages::{
+    EncodedMessage, InboundOpaque, MessageError, OutboundOpaque, OutboundPlain, Payload,
+};
 
 mod record_layer;
-pub(crate) use record_layer::{Decrypted, PreEncryptAction, RecordLayer};
+pub(crate) use record_layer::{Decrypted, DecryptionState, EncryptionState, PreEncryptAction};
 
 /// Factory trait for building `MessageEncrypter` and `MessageDecrypter` for a TLS1.3 cipher suite.
 pub trait Tls13AeadAlgorithm: Send + Sync {
@@ -48,8 +45,8 @@ pub trait Tls13AeadAlgorithm: Send + Sync {
     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError>;
 
     /// Return `true` if this is backed by a FIPS-approved implementation.
-    fn fips(&self) -> bool {
-        false
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated
     }
 }
 
@@ -93,9 +90,9 @@ pub trait Tls12AeadAlgorithm: Send + Sync + 'static {
         explicit: &[u8],
     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError>;
 
-    /// Return `true` if this is backed by a FIPS-approved implementation.
-    fn fips(&self) -> bool {
-        false
+    /// Return the FIPS validation status of this implementation.
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated
     }
 }
 
@@ -116,7 +113,6 @@ impl fmt::Display for UnsupportedOperationError {
     }
 }
 
-#[cfg(feature = "std")]
 impl core::error::Error for UnsupportedOperationError {}
 
 /// How a TLS1.2 `key_block` is partitioned.
@@ -154,9 +150,9 @@ pub trait MessageDecrypter: Send + Sync {
     /// `seq` which can be used to derive a unique [`Nonce`].
     fn decrypt<'a>(
         &mut self,
-        msg: InboundOpaqueMessage<'a>,
+        msg: EncodedMessage<InboundOpaque<'a>>,
         seq: u64,
-    ) -> Result<InboundPlainMessage<'a>, Error>;
+    ) -> Result<EncodedMessage<&'a [u8]>, Error>;
 }
 
 /// Objects with this trait can encrypt TLS messages.
@@ -165,25 +161,13 @@ pub trait MessageEncrypter: Send + Sync {
     /// `seq` which can be used to derive a unique [`Nonce`].
     fn encrypt(
         &mut self,
-        msg: OutboundPlainMessage<'_>,
+        msg: EncodedMessage<OutboundPlain<'_>>,
         seq: u64,
-    ) -> Result<OutboundOpaqueMessage, Error>;
+    ) -> Result<EncodedMessage<OutboundOpaque>, Error>;
 
     /// Return the length of the ciphertext that results from encrypting plaintext of
     /// length `payload_len`
     fn encrypted_payload_len(&self, payload_len: usize) -> usize;
-}
-
-impl dyn MessageEncrypter {
-    pub(crate) fn invalid() -> Box<dyn MessageEncrypter> {
-        Box::new(InvalidMessageEncrypter {})
-    }
-}
-
-impl dyn MessageDecrypter {
-    pub(crate) fn invalid() -> Box<dyn MessageDecrypter> {
-        Box::new(InvalidMessageDecrypter {})
-    }
 }
 
 /// A write or read IV.
@@ -265,7 +249,7 @@ impl Nonce {
         let mut buf = [0u8; Iv::MAX_LEN];
 
         if iv_len >= 8 {
-            codec::put_u64(seq, &mut buf[iv_len - 8..iv_len]);
+            put_u64(seq, &mut buf[iv_len - 8..iv_len]);
             if let Some(path_id) = path_id {
                 if iv_len >= 12 {
                     buf[iv_len - 12..iv_len - 8].copy_from_slice(&path_id.to_be_bytes());
@@ -352,10 +336,10 @@ pub fn make_tls12_aad(
     len: usize,
 ) -> [u8; TLS12_AAD_SIZE] {
     let mut out = [0; TLS12_AAD_SIZE];
-    codec::put_u64(seq, &mut out[0..]);
+    put_u64(seq, &mut out[0..]);
     out[8] = typ.into();
-    codec::put_u16(vers.into(), &mut out[9..]);
-    codec::put_u16(len as u16, &mut out[11..]);
+    put_u16(vers.into(), &mut out[9..]);
+    put_u16(len as u16, &mut out[11..]);
     out
 }
 
@@ -391,6 +375,7 @@ impl AeadKey {
 }
 
 impl Drop for AeadKey {
+    #[inline(never)]
     fn drop(&mut self) {
         self.buf.zeroize();
     }
@@ -411,160 +396,19 @@ impl From<[u8; Self::MAX_LEN]> for AeadKey {
     }
 }
 
-/// A decrypted TLS frame
-///
-/// This type owns all memory for its interior parts. It can be decrypted from an OpaqueMessage
-/// or encrypted into an OpaqueMessage, and it is also used for joining and fragmenting.
-#[expect(clippy::exhaustive_structs)]
-#[derive(Clone, Debug)]
-pub struct PlainMessage {
-    /// The content type of this message.
-    pub typ: ContentType,
-    /// The protocol version of this message.
-    pub version: ProtocolVersion,
-    /// The payload of this message.
-    pub payload: Payload<'static>,
-}
-
-impl PlainMessage {
-    /// Construct by decoding from a [`Reader`].
-    ///
-    /// `MessageError` allows callers to distinguish between valid prefixes (might
-    /// become valid if we read more data) and invalid data.
-    pub fn read(r: &mut Reader<'_>) -> Result<Self, MessageError> {
-        let (typ, version, len) = read_opaque_message_header(r)?;
-
-        let content = r
-            .take(len as usize)
-            .ok_or(MessageError::TooShortForLength)?;
-
-        Ok(Self {
-            typ,
-            version,
-            payload: Payload::Owned(content.to_vec()),
-        })
-    }
-
-    /// Convert into an unencrypted [`OutboundOpaqueMessage`] (without decrypting).
-    pub fn into_unencrypted_opaque(self) -> OutboundOpaqueMessage {
-        OutboundOpaqueMessage {
-            version: self.version,
-            typ: self.typ,
-            payload: PrefixedPayload::from(self.payload.bytes()),
-        }
-    }
-
-    /// Borrow as an [`InboundPlainMessage`].
-    pub fn borrow_inbound(&self) -> InboundPlainMessage<'_> {
-        InboundPlainMessage {
-            version: self.version,
-            typ: self.typ,
-            payload: self.payload.bytes(),
-        }
-    }
-
-    /// Borrow as an [`OutboundPlainMessage`].
-    pub fn borrow_outbound(&self) -> OutboundPlainMessage<'_> {
-        OutboundPlainMessage {
-            version: self.version,
-            typ: self.typ,
-            payload: self.payload.bytes().into(),
+impl From<[u8; 16]> for AeadKey {
+    fn from(buf: [u8; 16]) -> Self {
+        Self {
+            buf: array::from_fn(|i| if i < 16 { buf[i] } else { 0 }),
+            used: 16,
         }
     }
 }
 
-/// An externally length'd payload
-#[non_exhaustive]
-#[derive(Clone, Eq, PartialEq)]
-pub enum Payload<'a> {
-    /// Borrowed payload
-    Borrowed(&'a [u8]),
-    /// Owned payload
-    Owned(Vec<u8>),
-}
-
-impl<'a> Payload<'a> {
-    /// A reference to the payload's bytes
-    pub fn bytes(&self) -> &[u8] {
-        match self {
-            Self::Borrowed(bytes) => bytes,
-            Self::Owned(bytes) => bytes,
-        }
-    }
-
-    pub(crate) fn into_owned(self) -> Payload<'static> {
-        Payload::Owned(self.into_vec())
-    }
-
-    pub(crate) fn into_vec(self) -> Vec<u8> {
-        match self {
-            Self::Borrowed(bytes) => bytes.to_vec(),
-            Self::Owned(bytes) => bytes,
-        }
-    }
-
-    pub(crate) fn read(r: &mut Reader<'a>) -> Self {
-        Self::Borrowed(r.rest())
-    }
-}
-
-impl Payload<'static> {
-    /// Create a new owned payload from the given `bytes`.
-    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
-        Self::Owned(bytes.into())
-    }
-}
-
-impl<'a> Codec<'a> for Payload<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        bytes.extend_from_slice(self.bytes());
-    }
-
-    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
-        Ok(Self::read(r))
-    }
-}
-
-impl fmt::Debug for Payload<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        hex(f, self.bytes())
-    }
-}
-
-/// A `MessageEncrypter` which doesn't work.
-struct InvalidMessageEncrypter {}
-
-impl MessageEncrypter for InvalidMessageEncrypter {
-    fn encrypt(
-        &mut self,
-        _m: OutboundPlainMessage<'_>,
-        _seq: u64,
-    ) -> Result<OutboundOpaqueMessage, Error> {
-        Err(Error::EncryptError)
-    }
-
-    fn encrypted_payload_len(&self, payload_len: usize) -> usize {
-        payload_len
-    }
-}
-
-/// A `MessageDecrypter` which doesn't work.
-struct InvalidMessageDecrypter {}
-
-impl MessageDecrypter for InvalidMessageDecrypter {
-    fn decrypt<'a>(
-        &mut self,
-        _m: InboundOpaqueMessage<'a>,
-        _seq: u64,
-    ) -> Result<InboundPlainMessage<'a>, Error> {
-        Err(Error::DecryptError)
-    }
-}
-
-#[cfg(all(test, feature = "aws-lc-rs"))]
+#[cfg(test)]
 pub(crate) struct FakeAead;
 
-#[cfg(all(test, feature = "aws-lc-rs"))]
+#[cfg(test)]
 impl Tls12AeadAlgorithm for FakeAead {
     fn encrypter(&self, _: AeadKey, _: &[u8], _: &[u8]) -> Box<dyn MessageEncrypter> {
         todo!()
@@ -587,8 +431,8 @@ impl Tls12AeadAlgorithm for FakeAead {
         Err(UnsupportedOperationError)
     }
 
-    fn fips(&self) -> bool {
-        false
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated
     }
 }
 
@@ -733,5 +577,12 @@ mod tests {
                 maximum: 16
             }))
         ));
+    }
+
+    #[test]
+    fn aead_key_16_bytes() {
+        let bytes = [0xABu8; 16];
+        let key = AeadKey::from(bytes);
+        assert_eq!(key.as_ref(), &bytes);
     }
 }

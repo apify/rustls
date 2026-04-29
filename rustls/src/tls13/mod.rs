@@ -1,5 +1,7 @@
 use core::fmt;
 
+use pki_types::FipsStatus;
+
 use crate::common_state::Protocol;
 use crate::crypto::{self, SignatureScheme, hash};
 use crate::enums::ProtocolVersion;
@@ -57,10 +59,10 @@ impl Tls13CipherSuite {
             .then_some(prev)
     }
 
-    /// Return `true` if this is backed by a FIPS-approved implementation.
+    /// Return the FIPS validation status of this implementation.
     ///
-    /// This means all the constituent parts that do cryptography return `true` for `fips()`.
-    pub fn fips(&self) -> bool {
+    /// This is the combination of the constituent parts of the cipher suite.
+    pub fn fips(&self) -> FipsStatus {
         let Self {
             common,
             protocol_version: _,
@@ -68,16 +70,19 @@ impl Tls13CipherSuite {
             aead_alg,
             quic,
         } = self;
-        common.fips()
-            && hkdf_provider.fips()
-            && aead_alg.fips()
-            && quic.map(|q| q.fips()).unwrap_or(true)
+
+        let mut status = Ord::min(common.fips(), hkdf_provider.fips());
+        status = Ord::min(status, aead_alg.fips());
+        match quic {
+            Some(quic) => Ord::min(status, quic.fips()),
+            None => status,
+        }
     }
 
     /// Returns a `quic::Suite` for the ciphersuite, if supported.
     pub fn quic_suite(&'static self) -> Option<crate::quic::Suite> {
         self.quic
-            .map(|quic| crate::quic::Suite { quic, suite: self })
+            .map(|quic| crate::quic::Suite { suite: self, quic })
     }
 }
 
@@ -96,7 +101,7 @@ impl Suite for Tls13CipherSuite {
     fn usable_for_protocol(&self, proto: Protocol) -> bool {
         match proto {
             Protocol::Tcp => true,
-            Protocol::Quic => self.quic.is_some(),
+            Protocol::Quic(_) => self.quic.is_some(),
         }
     }
 
@@ -127,7 +132,7 @@ impl fmt::Debug for Tls13CipherSuite {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tls13CipherSuite")
             .field("suite", &self.common.suite)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -172,33 +177,30 @@ const MAX_VERIFY_MSG: usize = 64 + CLIENT_CONSTANT.len() + hash::Output::MAX_LEN
 
 #[cfg(test)]
 mod tests {
-    use crate::TEST_PROVIDERS;
-    use crate::crypto::{CipherSuite, tls13_suite};
+    use crate::crypto::{CipherSuite, TEST_PROVIDER, tls13_suite};
 
     #[test]
     fn test_can_resume_to() {
-        for &provider in TEST_PROVIDERS {
-            let Some(cha_poly) = provider
-                .tls13_cipher_suites
-                .iter()
-                .find(|cs| cs.common.suite == CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
-            else {
-                continue;
-            };
+        let Some(cha_poly) = TEST_PROVIDER
+            .tls13_cipher_suites
+            .iter()
+            .find(|cs| cs.common.suite == CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
+        else {
+            return;
+        };
 
-            let aes_128_gcm = tls13_suite(CipherSuite::TLS13_AES_128_GCM_SHA256, provider);
-            assert!(
-                aes_128_gcm
-                    .can_resume_from(cha_poly)
-                    .is_some()
-            );
+        let aes_128_gcm = tls13_suite(CipherSuite::TLS13_AES_128_GCM_SHA256, &TEST_PROVIDER);
+        assert!(
+            aes_128_gcm
+                .can_resume_from(cha_poly)
+                .is_some()
+        );
 
-            let aes_256_gcm = tls13_suite(CipherSuite::TLS13_AES_256_GCM_SHA384, provider);
-            assert!(
-                aes_256_gcm
-                    .can_resume_from(cha_poly)
-                    .is_none()
-            );
-        }
+        let aes_256_gcm = tls13_suite(CipherSuite::TLS13_AES_256_GCM_SHA384, &TEST_PROVIDER);
+        assert!(
+            aes_256_gcm
+                .can_resume_from(cha_poly)
+                .is_none()
+        );
     }
 }
