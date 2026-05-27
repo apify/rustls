@@ -283,7 +283,8 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithTlsFingerprint> {
                     FingerprintCertCompressionAlgorithm::Brotli => {
                         Some(compress::BROTLI_COMPRESSOR)
                     }
-                    _ => None, // Only Brotli is supported for now
+                    FingerprintCertCompressionAlgorithm::Zlib => Some(compress::ZLIB_COMPRESSOR),
+                    _ => None, // Zstd not implemented yet
                 })
                 .collect();
             let decompressors: Vec<_> = compression
@@ -292,6 +293,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithTlsFingerprint> {
                     FingerprintCertCompressionAlgorithm::Brotli => {
                         Some(compress::BROTLI_DECOMPRESSOR)
                     }
+                    FingerprintCertCompressionAlgorithm::Zlib => Some(compress::ZLIB_DECOMPRESSOR),
                     _ => None,
                 })
                 .collect();

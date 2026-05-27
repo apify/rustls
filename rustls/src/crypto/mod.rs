@@ -239,7 +239,7 @@ impl CryptoProviderBuilder {
             let cipher_suites: Vec<_> = fingerprint
                 .cipher_suites
                 .iter()
-                .map(|cs| cs.to_supported_cipher_suite())
+                .filter_map(|cs| cs.to_supported_cipher_suite())
                 .collect();
 
             // Build signature verification algorithms from the fingerprint's signature algorithms
