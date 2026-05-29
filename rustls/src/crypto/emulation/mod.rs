@@ -71,6 +71,12 @@ pub enum FingerprintCipherSuite {
     TLS_RSA_WITH_AES_256_CBC_SHA,
     TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
     TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+    // Legacy 3DES suites: advertise-only. aws-lc-rs does not implement
+    // these, so they are excluded from negotiation but their codepoints
+    // are sent in the ClientHello to match real-world fingerprints.
+    TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+    TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA,
+    TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
     /// GREASE cipher suite
     Grease,
 }
@@ -119,13 +125,24 @@ impl FingerprintCipherSuite {
             Self::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA => {
                 CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA
             }
+            Self::TLS_RSA_WITH_3DES_EDE_CBC_SHA => CipherSuite::TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+            Self::TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA => {
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA
+            }
+            Self::TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA => {
+                CipherSuite::TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA
+            }
             Self::Grease => CipherSuite::TLS_RESERVED_GREASE,
         }
     }
 
     /// Converts the fingerprint cipher suite to rustls's SupportedCipherSuite.
-    pub fn to_supported_cipher_suite(&self) -> SupportedCipherSuite {
-        match self {
+    ///
+    /// Returns `None` for advertise-only suites that have no aws-lc-rs
+    /// implementation (e.g. legacy 3DES). These are still emitted in the
+    /// ClientHello via [`Self::to_cipher_suite`] but cannot be negotiated.
+    pub fn to_supported_cipher_suite(&self) -> Option<SupportedCipherSuite> {
+        Some(match self {
             Self::TLS13_AES_128_GCM_SHA256 => aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256,
             Self::TLS13_AES_256_GCM_SHA384 => aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384,
             Self::TLS13_CHACHA20_POLY1305_SHA256 => {
@@ -173,8 +190,11 @@ impl FingerprintCipherSuite {
             Self::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA => {
                 aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA
             }
+            Self::TLS_RSA_WITH_3DES_EDE_CBC_SHA
+            | Self::TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA
+            | Self::TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA => return None,
             Self::Grease => aws_lc_rs::cipher_suite::TLS13_RESERVED_GREASE,
-        }
+        })
     }
 }
 
