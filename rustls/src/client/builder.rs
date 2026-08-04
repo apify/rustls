@@ -327,6 +327,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCertWithTlsFingerprint> {
             cert_decompressors,
             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
             ech_mode: self.state.client_ech_mode,
+            send_ticket_request: None,
         }
     }
 }
