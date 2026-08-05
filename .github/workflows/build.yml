@@ -132,8 +132,8 @@ jobs:
         with:
           toolchain: "1.71"
 
-      # zlib-rs is optional and requires a later MSRV
-      - run: cargo check --locked --lib $(admin/all-features-except zlib rustls) -p rustls
+      # zlib-rs is optional and requires a later MSRV; `impit` re-enables `zlib`
+      - run: cargo check --locked --lib $(admin/all-features-except zlib,impit rustls) -p rustls
 
       - uses: dtolnay/rust-toolchain@master
         with:
