@@ -254,6 +254,10 @@ pub enum FingerprintSignatureAlgorithm {
     // EdDSA algorithms
     Ed25519,
     Ed448,
+    // ML-DSA algorithms (draft-ietf-tls-mldsa)
+    MlDsa44,
+    MlDsa65,
+    MlDsa87,
     // Legacy
     EcdsaSha1Legacy,
 }
@@ -274,6 +278,9 @@ impl FingerprintSignatureAlgorithm {
             Self::RsaPkcs1Sha1 => SignatureScheme::RSA_PKCS1_SHA1,
             Self::Ed25519 => SignatureScheme::ED25519,
             Self::Ed448 => SignatureScheme::ED448,
+            Self::MlDsa44 => SignatureScheme::ML_DSA_44,
+            Self::MlDsa65 => SignatureScheme::ML_DSA_65,
+            Self::MlDsa87 => SignatureScheme::ML_DSA_87,
             Self::EcdsaSha1Legacy => SignatureScheme::ECDSA_SHA1_Legacy,
         }
     }
@@ -416,6 +423,9 @@ impl FingerprintSignatureAlgorithm {
             Self::Ed25519 => ED25519_ALGS,
             // Ed448 is not supported by webpki, SHA1 legacy uses fallback in mapping
             Self::Ed448 | Self::RsaPkcs1Sha1 | Self::EcdsaSha1Legacy => EMPTY,
+            // ML-DSA is advertised to match browsers that offer it, but webpki has
+            // no verifier for it, so it contributes nothing to certificate validation.
+            Self::MlDsa44 | Self::MlDsa65 | Self::MlDsa87 => EMPTY,
         }
     }
 
@@ -457,6 +467,21 @@ impl FingerprintSignatureAlgorithm {
         static ECDSA_SHA1_FALLBACK: &[&dyn pki_types::SignatureVerificationAlgorithm] =
             &[webpki_algs::ECDSA_P256_SHA256];
         static ED25519: &[&dyn pki_types::SignatureVerificationAlgorithm] = &[webpki_algs::ED25519];
+        // ML-DSA is advertised for fingerprint accuracy but webpki has no verifier
+        // for it. The mapping doubles as the list of schemes we offer, so the entry
+        // has to exist; it must also be non-empty, because the TLS 1.3 verify path
+        // indexes the first element. This placeholder can never validate an ML-DSA
+        // signature, so a server that actually selects one fails the handshake
+        // cleanly instead of panicking.
+        //
+        // Ed25519 rather than a P-256 verifier: the placeholder does get run, so a
+        // server whose certificate key matches it could have a CertificateVerify
+        // mislabelled as ML-DSA accepted. Only the legitimate key holder can produce
+        // such a signature, but P-256 is the common case for publicly-trusted server
+        // certificates whereas Ed25519 is not issued by public CAs, so this keeps the
+        // window as small as the fallback approach allows.
+        static ML_DSA_FALLBACK: &[&dyn pki_types::SignatureVerificationAlgorithm] =
+            &[webpki_algs::ED25519];
 
         match self {
             Self::EcdsaSecp256r1Sha256 => {
@@ -481,6 +506,9 @@ impl FingerprintSignatureAlgorithm {
             Self::Ed25519 => Some((SignatureScheme::ED25519, ED25519)),
             // Ed448 is not supported
             Self::Ed448 => None,
+            Self::MlDsa44 => Some((SignatureScheme::ML_DSA_44, ML_DSA_FALLBACK)),
+            Self::MlDsa65 => Some((SignatureScheme::ML_DSA_65, ML_DSA_FALLBACK)),
+            Self::MlDsa87 => Some((SignatureScheme::ML_DSA_87, ML_DSA_FALLBACK)),
         }
     }
 }
