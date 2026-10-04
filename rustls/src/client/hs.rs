@@ -258,6 +258,17 @@ fn emit_client_hello_for_retry(
         ..Default::default()
     });
 
+    if !config
+        .crypto_provider()
+        .cipher_suites
+        .iter()
+        .any(|cs| cs.tls13().is_some())
+    {
+        if let Some(schemes) = &mut exts.signature_schemes {
+            schemes.retain(|scheme| scheme.algorithm().is_some());
+        }
+    }
+
     #[cfg(feature = "impit")]
     if let Some(ref fingerprint) = config.tls_fingerprint {
         // Apply TLS fingerprint extensions configuration
