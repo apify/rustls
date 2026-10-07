@@ -20,6 +20,7 @@
 )]
 
 use core::fmt::{Debug, Formatter};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::{env, net, process, thread, time};
@@ -36,7 +37,7 @@ use rustls::client::{
 };
 use rustls::crypto::aws_lc_rs::hpke;
 use rustls::crypto::hpke::{Hpke, HpkePublicKey};
-use rustls::crypto::{CryptoProvider, aws_lc_rs, ring};
+use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms, aws_lc_rs, ring};
 use rustls::internal::msgs::codec::{Codec, Reader};
 use rustls::internal::msgs::handshake::EchConfigPayload;
 use rustls::internal::msgs::persist::ServerSessionValue;
@@ -51,6 +52,15 @@ use rustls::{
     DigitallySignedStruct, DistinguishedName, Error, HandshakeKind, InvalidMessage, NamedGroup,
     PeerIncompatible, PeerMisbehaved, ProtocolVersion, RootCertStore, Side, SignatureAlgorithm,
     SignatureScheme, SupportedProtocolVersion, client, compress, server, sign, version,
+};
+use webpki::aws_lc_rs::{
+    ECDSA_P256_SHA256, ECDSA_P256_SHA384, ECDSA_P256_SHA512, ECDSA_P384_SHA256, ECDSA_P384_SHA384,
+    ECDSA_P384_SHA512, ECDSA_P521_SHA256, ECDSA_P521_SHA384, ECDSA_P521_SHA512, ED25519,
+    RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS,
+    RSA_PKCS1_2048_8192_SHA384, RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS,
+    RSA_PKCS1_2048_8192_SHA512, RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS,
+    RSA_PSS_2048_8192_SHA256_LEGACY_KEY, RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+    RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
 };
 
 static BOGO_NACK: i32 = 89;
@@ -93,6 +103,7 @@ struct Options {
     max_version: Option<ProtocolVersion>,
     server_ocsp_response: Vec<u8>,
     groups: Option<Vec<NamedGroup>>,
+    server_supported_group_hint: Option<NamedGroup>,
     export_keying_material: usize,
     export_keying_material_label: String,
     export_keying_material_context: String,
@@ -117,21 +128,36 @@ struct Options {
     ech_config_list: Option<EchConfigListBytes<'static>>,
     expect_ech_accept: bool,
     expect_ech_retry_configs: Option<EchConfigListBytes<'static>>,
+    expect_no_ech_retry_configs: bool,
     on_resume_ech_config_list: Option<EchConfigListBytes<'static>>,
     on_resume_expect_ech_accept: bool,
     on_initial_expect_ech_accept: bool,
     enable_ech_grease: bool,
+    expect_ech_name_override: Option<String>,
+    expect_no_ech_name_override: bool,
+    on_retry_expect_ech_name_override: Option<String>,
     send_key_update: bool,
     expect_curve_id: Option<NamedGroup>,
     on_initial_expect_curve_id: Option<NamedGroup>,
     on_resume_expect_curve_id: Option<NamedGroup>,
     wait_for_debugger: bool,
     ocsp: OcspValidation,
+    verify_prefs: Option<SignatureScheme>,
 }
 
 impl Options {
     fn new() -> Self {
-        let selected_provider = SelectedProvider::from_env();
+        let selected_provider = match env::var("BOGO_SHIM_PROVIDER")
+            .ok()
+            .as_deref()
+        {
+            None | Some("aws-lc-rs") => SelectedProvider::AwsLcRs,
+            #[cfg(feature = "fips")]
+            Some("aws-lc-rs-fips") => SelectedProvider::AwsLcRsFips,
+            Some("ring") => SelectedProvider::Ring,
+            Some(other) => panic!("unrecognised value for BOGO_SHIM_PROVIDER: {other:?}"),
+        };
+
         Self {
             port: 0,
             shim_id: 0,
@@ -163,6 +189,7 @@ impl Options {
             max_version: None,
             server_ocsp_response: vec![],
             groups: None,
+            server_supported_group_hint: None,
             export_keying_material: 0,
             export_keying_material_label: "".to_string(),
             export_keying_material_context: "".to_string(),
@@ -187,17 +214,49 @@ impl Options {
             ech_config_list: None,
             expect_ech_accept: false,
             expect_ech_retry_configs: None,
+            expect_no_ech_retry_configs: false,
             on_resume_ech_config_list: None,
             on_resume_expect_ech_accept: false,
             on_initial_expect_ech_accept: false,
             enable_ech_grease: false,
+            expect_ech_name_override: None,
+            expect_no_ech_name_override: false,
+            on_retry_expect_ech_name_override: None,
             send_key_update: false,
             expect_curve_id: None,
             on_initial_expect_curve_id: None,
             on_resume_expect_curve_id: None,
             wait_for_debugger: false,
             ocsp: OcspValidation::default(),
+            verify_prefs: None,
         }
+    }
+
+    pub(crate) fn provider(&self) -> CryptoProvider {
+        let mut provider = self.provider.clone();
+
+        if let Some(groups) = &self.groups {
+            provider
+                .kx_groups
+                .retain(|kxg| groups.contains(&kxg.name()));
+        }
+
+        if !matches!(self.selected_provider, SelectedProvider::Ring)
+            && matches!(
+                self.verify_prefs,
+                Some(
+                    SignatureScheme::ML_DSA_44
+                        | SignatureScheme::ML_DSA_65
+                        | SignatureScheme::ML_DSA_87
+                )
+            )
+        {
+            // ML-DSA is disabled by default, enable for preferred verification scheme
+            provider.signature_verification_algorithms =
+                aws_lc_rs::default_provider().signature_verification_algorithms;
+        }
+
+        provider
     }
 
     fn version_allowed(&self, vers: ProtocolVersion) -> bool {
@@ -212,6 +271,35 @@ impl Options {
 
     fn tls12_supported(&self) -> bool {
         self.support_tls12 && self.version_allowed(ProtocolVersion::TLSv1_2)
+    }
+
+    fn expected_server_names(&self) -> Vec<ServerName<'static>> {
+        let mut names = vec![];
+
+        let name = match (
+            &self.expect_ech_name_override,
+            self.expect_no_ech_name_override,
+        ) {
+            (Some(override_name), _) => override_name,
+            (None, true) => &self.host_name,
+            (None, false) => return names,
+        };
+
+        names.push(
+            ServerName::try_from(name.as_str())
+                .expect("invalid expected server name")
+                .to_owned(),
+        );
+
+        if let Some(on_retry) = &self.on_retry_expect_ech_name_override {
+            names.push(
+                ServerName::try_from(on_retry.as_str())
+                    .expect("invalid expected server name")
+                    .to_owned(),
+            );
+        }
+
+        names
     }
 
     fn supported_versions(&self) -> Vec<&'static SupportedProtocolVersion> {
@@ -280,37 +368,21 @@ enum SelectedProvider {
     AwsLcRs,
     #[cfg_attr(not(feature = "fips"), allow(dead_code))]
     AwsLcRsFips,
-    #[cfg_attr(not(feature = "post-quantum"), allow(dead_code))]
-    PostQuantum,
     Ring,
 }
 
 impl SelectedProvider {
-    fn from_env() -> Self {
-        match env::var("BOGO_SHIM_PROVIDER")
-            .ok()
-            .as_deref()
-        {
-            None | Some("aws-lc-rs") => Self::AwsLcRs,
-            #[cfg(feature = "fips")]
-            Some("aws-lc-rs-fips") => Self::AwsLcRsFips,
-            #[cfg(feature = "post-quantum")]
-            Some("post-quantum") => Self::PostQuantum,
-            Some("ring") => Self::Ring,
-            Some(other) => panic!("unrecognised value for BOGO_SHIM_PROVIDER: {other:?}"),
-        }
-    }
-
     fn provider(&self) -> CryptoProvider {
         match self {
-            Self::AwsLcRs | Self::AwsLcRsFips | Self::PostQuantum => {
+            Self::AwsLcRs | Self::AwsLcRsFips => {
                 // ensure all suites and kx groups are included (even in fips builds)
                 // as non-fips test cases require them.  runner activates fips mode via -fips-202205 option
                 // this includes rustls-post-quantum, which just returns an altered
                 // version of `aws_lc_rs::default_provider()`
                 CryptoProvider {
-                    kx_groups: aws_lc_rs::DEFAULT_KX_GROUPS.to_vec(),
+                    kx_groups: aws_lc_rs::ALL_KX_GROUPS.to_vec(),
                     cipher_suites: aws_lc_rs::ALL_CIPHER_SUITES.to_vec(),
+                    signature_verification_algorithms: SUPPORTED_SIG_ALGS,
                     ..aws_lc_rs::default_provider()
                 }
             }
@@ -321,20 +393,83 @@ impl SelectedProvider {
 
     fn ticketer(&self) -> Arc<dyn ProducesTickets> {
         match self {
-            Self::AwsLcRs | Self::AwsLcRsFips | Self::PostQuantum => {
-                aws_lc_rs::Ticketer::new().unwrap()
-            }
+            Self::AwsLcRs | Self::AwsLcRsFips => aws_lc_rs::Ticketer::new().unwrap(),
             Self::Ring => ring::Ticketer::new().unwrap(),
         }
     }
 
     fn supports_ech(&self) -> bool {
         match *self {
-            Self::AwsLcRs | Self::AwsLcRsFips | Self::PostQuantum => true,
+            Self::AwsLcRs | Self::AwsLcRsFips => true,
             Self::Ring => false,
         }
     }
 }
+
+// aws-lc-rs signature algorithms, with ML-DSA disabled
+pub(crate) static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
+    all: &[
+        ECDSA_P256_SHA256,
+        ECDSA_P256_SHA384,
+        ECDSA_P256_SHA512,
+        ECDSA_P384_SHA256,
+        ECDSA_P384_SHA384,
+        ECDSA_P384_SHA512,
+        ECDSA_P521_SHA256,
+        ECDSA_P521_SHA384,
+        ECDSA_P521_SHA512,
+        ED25519,
+        RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+        RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+        RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+        RSA_PKCS1_2048_8192_SHA256,
+        RSA_PKCS1_2048_8192_SHA384,
+        RSA_PKCS1_2048_8192_SHA512,
+        RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS,
+        RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS,
+        RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS,
+    ],
+    mapping: &[
+        // Note: for TLS1.2 the curve is not fixed by SignatureScheme. For TLS1.3 it is.
+        (
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            &[ECDSA_P384_SHA384, ECDSA_P256_SHA384, ECDSA_P521_SHA384],
+        ),
+        (
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            &[ECDSA_P256_SHA256, ECDSA_P384_SHA256, ECDSA_P521_SHA256],
+        ),
+        (
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            &[ECDSA_P521_SHA512, ECDSA_P384_SHA512, ECDSA_P256_SHA512],
+        ),
+        (SignatureScheme::ED25519, &[ED25519]),
+        (
+            SignatureScheme::RSA_PSS_SHA512,
+            &[RSA_PSS_2048_8192_SHA512_LEGACY_KEY],
+        ),
+        (
+            SignatureScheme::RSA_PSS_SHA384,
+            &[RSA_PSS_2048_8192_SHA384_LEGACY_KEY],
+        ),
+        (
+            SignatureScheme::RSA_PSS_SHA256,
+            &[RSA_PSS_2048_8192_SHA256_LEGACY_KEY],
+        ),
+        (
+            SignatureScheme::RSA_PKCS1_SHA512,
+            &[RSA_PKCS1_2048_8192_SHA512],
+        ),
+        (
+            SignatureScheme::RSA_PKCS1_SHA384,
+            &[RSA_PKCS1_2048_8192_SHA384],
+        ),
+        (
+            SignatureScheme::RSA_PKCS1_SHA256,
+            &[RSA_PKCS1_2048_8192_SHA256],
+        ),
+    ],
+};
 
 fn load_root_certs(filename: &str) -> Arc<RootCertStore> {
     let mut roots = RootCertStore::empty();
@@ -392,15 +527,14 @@ impl DummyClientAuth {
         trusted_cert_file: &str,
         mandatory: bool,
         root_hint_subjects: Vec<DistinguishedName>,
+        provider: Arc<CryptoProvider>,
     ) -> Self {
         Self {
             mandatory,
             root_hint_subjects,
             parent: WebPkiClientVerifier::builder_with_provider(
                 load_root_certs(trusted_cert_file),
-                SelectedProvider::from_env()
-                    .provider()
-                    .into(),
+                provider,
             )
             .build()
             .unwrap(),
@@ -459,20 +593,27 @@ impl ClientCertVerifier for DummyClientAuth {
 struct DummyServerAuth {
     parent: Arc<dyn ServerCertVerifier>,
     ocsp: OcspValidation,
+    expect_server_names: Vec<ServerName<'static>>,
+    server_name_index: AtomicUsize,
 }
 
 impl DummyServerAuth {
-    fn new(trusted_cert_file: &str, ocsp: OcspValidation) -> Self {
+    fn new(
+        trusted_cert_file: &str,
+        ocsp: OcspValidation,
+        expect_server_names: Vec<ServerName<'static>>,
+        provider: Arc<CryptoProvider>,
+    ) -> Self {
         Self {
             parent: WebPkiServerVerifier::builder_with_provider(
                 load_root_certs(trusted_cert_file),
-                SelectedProvider::from_env()
-                    .provider()
-                    .into(),
+                provider,
             )
             .build()
             .unwrap(),
             ocsp,
+            expect_server_names,
+            server_name_index: AtomicUsize::new(0),
         }
     }
 }
@@ -482,10 +623,16 @@ impl ServerCertVerifier for DummyServerAuth {
         &self,
         _end_entity: &CertificateDer<'_>,
         _certs: &[CertificateDer<'_>],
-        _hostname: &ServerName<'_>,
+        hostname: &ServerName<'_>,
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
+        if !self.expect_server_names.is_empty() {
+            let expect_server_name = &self.expect_server_names[self
+                .server_name_index
+                .fetch_add(1, Ordering::SeqCst)];
+            assert_eq!(hostname, expect_server_name);
+        }
         if let OcspValidation::Reject = self.ocsp {
             return Err(CertificateError::InvalidOcspResponse.into());
         }
@@ -591,11 +738,7 @@ impl client::ResolvesClientCert for MultipleClientCredentialResolver {
         for sig_scheme in sig_schemes.iter().copied() {
             for (i, cert) in self.additional.iter().enumerate() {
                 // if the server sends any issuer hints, respect them
-                if cert.must_match_issuer
-                    && !root_hint_subjects
-                        .iter()
-                        .any(|dn| *dn == cert.issuer_dn.as_ref())
-                {
+                if cert.must_match_issuer && !cert.any_issuer_matches_hints(root_hint_subjects) {
                     continue;
                 }
 
@@ -647,14 +790,17 @@ impl client::ResolvesClientCert for MultipleClientCredentialResolver {
 #[derive(Debug)]
 struct ClientCert {
     certkey: Arc<sign::CertifiedKey>,
-    issuer_dn: DistinguishedName,
+    issuer_names: Vec<DistinguishedName>,
     must_match_issuer: bool,
 }
 
 impl ClientCert {
     fn new(mut certkey: sign::CertifiedKey, meta: &Credential) -> Self {
-        let parsed_cert = webpki::EndEntityCert::try_from(certkey.cert.last().unwrap()).unwrap();
-        let issuer_dn = DistinguishedName::in_sequence(parsed_cert.issuer());
+        let mut issuer_names = Vec::new();
+        for cert in &certkey.cert {
+            let parsed_cert = webpki::EndEntityCert::try_from(cert).unwrap();
+            issuer_names.push(DistinguishedName::in_sequence(parsed_cert.issuer()));
+        }
 
         if let Some(scheme) = meta.use_signing_scheme {
             certkey.key = Arc::new(FixedSignatureSchemeSigningKey {
@@ -665,9 +811,17 @@ impl ClientCert {
 
         Self {
             certkey: Arc::new(certkey),
-            issuer_dn,
+            issuer_names,
             must_match_issuer: meta.must_match_issuer,
         }
+    }
+
+    fn any_issuer_matches_hints(&self, hints: &[&[u8]]) -> bool {
+        hints.iter().any(|dn| {
+            self.issuer_names
+                .iter()
+                .any(|issuer| *dn == issuer.as_ref())
+        })
     }
 }
 
@@ -683,6 +837,9 @@ fn lookup_scheme(scheme: u16) -> SignatureScheme {
         0x0805 => SignatureScheme::RSA_PSS_SHA384,
         0x0806 => SignatureScheme::RSA_PSS_SHA512,
         0x0807 => SignatureScheme::ED25519,
+        0x0904 => SignatureScheme::ML_DSA_44,
+        0x0905 => SignatureScheme::ML_DSA_65,
+        0x0906 => SignatureScheme::ML_DSA_87,
         // TODO: add support for Ed448
         // 0x0808 => SignatureScheme::ED448,
         _ => {
@@ -752,12 +909,15 @@ impl server::StoresServerSessions for ServerCacheWithResumptionDelay {
 }
 
 fn make_server_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ServerConfig> {
+    let provider = Arc::new(opts.provider());
+
     let client_auth =
         if opts.verify_peer || opts.offer_no_client_cas || opts.require_any_client_cert {
             Arc::new(DummyClientAuth::new(
                 &opts.trusted_cert_file,
                 opts.require_any_client_cert,
                 opts.root_hint_subjects.clone(),
+                provider.clone(),
             ))
         } else {
             WebPkiClientVerifier::no_client_auth()
@@ -770,15 +930,7 @@ fn make_server_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ServerConfi
     let cred = &opts.credentials.default;
     let (certs, key) = cred.load_from_file();
 
-    let mut provider = opts.provider.clone();
-
-    if let Some(groups) = &opts.groups {
-        provider
-            .kx_groups
-            .retain(|kxg| groups.contains(&kxg.name()));
-    }
-
-    let mut cfg = ServerConfig::builder_with_provider(provider.into())
+    let mut cfg = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&opts.supported_versions())
         .unwrap()
         .with_client_cert_verifier(client_auth)
@@ -843,24 +995,26 @@ fn make_server_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ServerConfi
     Arc::new(cfg)
 }
 
-struct ClientCacheWithoutKxHints {
+struct ClientCacheWithSpecificKxHints {
     delay: u32,
+    kx_hint: Option<NamedGroup>,
     storage: Arc<client::ClientSessionMemoryCache>,
 }
 
-impl ClientCacheWithoutKxHints {
-    fn new(delay: u32) -> Arc<Self> {
+impl ClientCacheWithSpecificKxHints {
+    fn new(delay: u32, kx_hint: Option<NamedGroup>) -> Arc<Self> {
         Arc::new(Self {
             delay,
+            kx_hint,
             storage: Arc::new(client::ClientSessionMemoryCache::new(32)),
         })
     }
 }
 
-impl client::ClientSessionStore for ClientCacheWithoutKxHints {
+impl client::ClientSessionStore for ClientCacheWithSpecificKxHints {
     fn set_kx_hint(&self, _: ServerName<'static>, _: NamedGroup) {}
     fn kx_hint(&self, _: &ServerName<'_>) -> Option<NamedGroup> {
-        None
+        self.kx_hint
     }
 
     fn set_tls12_session(
@@ -904,7 +1058,7 @@ impl client::ClientSessionStore for ClientCacheWithoutKxHints {
     }
 }
 
-impl Debug for ClientCacheWithoutKxHints {
+impl Debug for ClientCacheWithSpecificKxHints {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         // Note: we omit self.storage here as it may contain sensitive data.
         f.debug_struct("ClientCacheWithoutKxHints")
@@ -914,15 +1068,7 @@ impl Debug for ClientCacheWithoutKxHints {
 }
 
 fn make_client_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ClientConfig> {
-    let mut provider = opts.provider.clone();
-
-    if let Some(groups) = &opts.groups {
-        provider
-            .kx_groups
-            .retain(|kxg| groups.contains(&kxg.name()));
-    }
-
-    let provider = Arc::new(provider);
+    let provider = Arc::new(opts.provider());
     let cfg = ClientConfig::builder_with_provider(provider.clone());
 
     let cfg = if opts.selected_provider.supports_ech() {
@@ -955,6 +1101,8 @@ fn make_client_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ClientConfi
         .with_custom_certificate_verifier(Arc::new(DummyServerAuth::new(
             &opts.trusted_cert_file,
             opts.ocsp,
+            opts.expected_server_names(),
+            provider.clone(),
         )));
 
     let mut cfg = match opts.credentials.configured() {
@@ -990,11 +1138,14 @@ fn make_client_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ClientConfi
         false => cfg.with_no_client_auth(),
     };
 
-    cfg.resumption = Resumption::store(ClientCacheWithoutKxHints::new(opts.resumption_delay))
-        .tls12_resumption(match opts.tickets {
-            true => Tls12Resumption::SessionIdOrTickets,
-            false => Tls12Resumption::SessionIdOnly,
-        });
+    cfg.resumption = Resumption::store(ClientCacheWithSpecificKxHints::new(
+        opts.resumption_delay,
+        opts.server_supported_group_hint,
+    ))
+    .tls12_resumption(match opts.tickets {
+        true => Tls12Resumption::SessionIdOrTickets,
+        false => Tls12Resumption::SessionIdOnly,
+    });
     cfg.enable_sni = opts.use_sni;
     cfg.max_fragment_size = opts.max_fragment;
     cfg.require_ems = opts.require_ems;
@@ -1109,6 +1260,9 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         Error::PeerIncompatible(PeerIncompatible::ServerRejectedEncryptedClientHello(
             _retry_configs,
         )) => {
+            if opts.expect_no_ech_retry_configs {
+                assert_eq!(_retry_configs, None);
+            }
             if let Some(expected_configs) = &opts.expect_ech_retry_configs {
                 let expected_configs =
                     Vec::<EchConfigPayload>::read(&mut Reader::init(expected_configs)).unwrap();
@@ -1117,9 +1271,10 @@ fn handle_err(opts: &Options, err: Error) -> ! {
             quit(":ECH_REJECTED:")
         }
         Error::PeerIncompatible(_) => quit(":INCOMPATIBLE:"),
-        Error::PeerMisbehaved(PeerMisbehaved::MissingPskModesExtension) => {
-            quit(":MISSING_EXTENSION:")
-        }
+        Error::PeerMisbehaved(
+            PeerMisbehaved::MissingPskExtensionInSecondClientHello
+            | PeerMisbehaved::MissingPskModesExtension,
+        ) => quit(":MISSING_EXTENSION:"),
         Error::PeerMisbehaved(PeerMisbehaved::TooMuchEarlyDataReceived) => {
             quit(":TOO_MUCH_READ_EARLY_DATA:")
         }
@@ -1557,7 +1712,9 @@ pub fn main() {
                 opts.credentials.last_mut().key_file = args.remove(0);
             }
             "-new-x509-credential" => {
-                opts.credentials.additional.push(Credential::default());
+                opts.credentials
+                    .additional
+                    .push(Credential::default());
             }
             "-expect-selected-credential" => {
                 opts.credentials.expect_selected = args.remove(0).parse::<isize>().ok();
@@ -1608,68 +1765,74 @@ pub fn main() {
             }
             "-signing-prefs" => {
                 let alg = args.remove(0).parse::<u16>().unwrap();
-                opts.credentials.last_mut().use_signing_scheme = Some(alg);
+                opts.credentials
+                    .last_mut()
+                    .use_signing_scheme = Some(alg);
             }
             "-must-match-issuer" => {
-                opts.credentials.last_mut().must_match_issuer = true;
+                opts.credentials
+                    .last_mut()
+                    .must_match_issuer = true;
             }
-            "-use-client-ca-list" => {
-                match args.remove(0).as_ref() {
-                    "<EMPTY>" | "<NULL>" => {
-                        opts.root_hint_subjects = vec![];
-                    }
-                    list => {
-                        opts.root_hint_subjects = list.split(',')
-                            .map(|entry| DistinguishedName::from(decode_hex(entry)))
-                            .collect();
-                    }
+            "-use-client-ca-list" => match args.remove(0).as_ref() {
+                "<EMPTY>" | "<NULL>" => {
+                    opts.root_hint_subjects = vec![];
                 }
-            }
+                list => {
+                    opts.root_hint_subjects = list
+                        .split(',')
+                        .map(|entry| DistinguishedName::from(decode_hex(entry)))
+                        .collect();
+                }
+            },
             "-verify-prefs" => {
-                lookup_scheme(args.remove(0).parse::<u16>().unwrap());
+                opts.verify_prefs = Some(lookup_scheme(args.remove(0).parse::<u16>().unwrap()));
             }
             "-expect-curve-id" => {
-                opts.expect_curve_id = Some(NamedGroup::from(args.remove(0).parse::<u16>().unwrap()));
+                opts.expect_curve_id =
+                    Some(NamedGroup::from(args.remove(0).parse::<u16>().unwrap()));
             }
             "-on-initial-expect-curve-id" => {
-                opts.on_initial_expect_curve_id = Some(NamedGroup::from(args.remove(0).parse::<u16>().unwrap()));
+                opts.on_initial_expect_curve_id =
+                    Some(NamedGroup::from(args.remove(0).parse::<u16>().unwrap()));
             }
             "-on-resume-expect-curve-id" => {
-                opts.on_resume_expect_curve_id = Some(NamedGroup::from(args.remove(0).parse::<u16>().unwrap()));
+                opts.on_resume_expect_curve_id =
+                    Some(NamedGroup::from(args.remove(0).parse::<u16>().unwrap()));
             }
-            "-max-cert-list" |
-            "-expect-peer-signature-algorithm" |
-            "-expect-peer-verify-pref" |
-            "-expect-advertised-alpn" |
-            "-expect-alpn" |
-            "-on-initial-expect-alpn" |
-            "-on-resume-expect-alpn" |
-            "-on-retry-expect-alpn" |
-            "-expect-server-name" |
-            "-expect-ocsp-response" |
-            "-expect-signed-cert-timestamps" |
-            "-expect-certificate-types" |
-            "-expect-client-ca-list" |
-            "-on-retry-expect-early-data-reason" |
-            "-on-resume-expect-early-data-reason" |
-            "-on-initial-expect-early-data-reason" |
-            "-on-initial-expect-cipher" |
-            "-on-resume-expect-cipher" |
-            "-on-retry-expect-cipher" |
-            "-expect-ticket-age-skew" |
-            "-handshaker-path" |
-            "-application-settings" |
-            "-expect-msg-callback" => {
+            "-max-cert-list"
+            | "-expect-peer-signature-algorithm"
+            | "-expect-peer-verify-pref"
+            | "-expect-advertised-alpn"
+            | "-expect-alpn"
+            | "-on-initial-expect-alpn"
+            | "-on-resume-expect-alpn"
+            | "-on-retry-expect-alpn"
+            | "-expect-server-name"
+            | "-expect-ocsp-response"
+            | "-expect-signed-cert-timestamps"
+            | "-expect-certificate-types"
+            | "-expect-client-ca-list"
+            | "-on-retry-expect-early-data-reason"
+            | "-on-resume-expect-early-data-reason"
+            | "-on-initial-expect-early-data-reason"
+            | "-on-initial-expect-cipher"
+            | "-on-resume-expect-cipher"
+            | "-on-retry-expect-cipher"
+            | "-expect-ticket-age-skew"
+            | "-handshaker-path"
+            | "-application-settings"
+            | "-expect-msg-callback" => {
                 println!("not checking {} {}; NYI", arg, args.remove(0));
             }
 
-            "-expect-secure-renegotiation" |
-            "-expect-no-session-id" |
-            "-enable-ed25519" |
-            "-on-resume-expect-no-offer-early-data" |
-            "-expect-tls13-downgrade" |
-            "-enable-signed-cert-timestamps" |
-            "-expect-session-id" => {
+            "-expect-secure-renegotiation"
+            | "-expect-no-session-id"
+            | "-enable-ed25519"
+            | "-on-resume-expect-no-offer-early-data"
+            | "-expect-tls13-downgrade"
+            | "-enable-signed-cert-timestamps"
+            | "-expect-session-id" => {
                 println!("not checking {arg}; NYI");
             }
 
@@ -1685,7 +1848,7 @@ pub fn main() {
             "-expect-session-miss" => {
                 opts.expect_handshake_kind_resumed = Some(vec![
                     HandshakeKind::Full,
-                    HandshakeKind::FullWithHelloRetryRequest
+                    HandshakeKind::FullWithHelloRetryRequest,
                 ]);
             }
             "-export-keying-material" => {
@@ -1704,16 +1867,19 @@ pub fn main() {
                 opts.export_traffic_secrets = true;
             }
             "-quic-transport-params" => {
-                opts.quic_transport_params = BASE64_STANDARD.decode(args.remove(0).as_bytes())
+                opts.quic_transport_params = BASE64_STANDARD
+                    .decode(args.remove(0).as_bytes())
                     .expect("invalid base64");
             }
             "-expect-quic-transport-params" => {
-                opts.expect_quic_transport_params = BASE64_STANDARD.decode(args.remove(0).as_bytes())
+                opts.expect_quic_transport_params = BASE64_STANDARD
+                    .decode(args.remove(0).as_bytes())
                     .expect("invalid base64");
             }
 
             "-ocsp-response" => {
-                opts.server_ocsp_response = BASE64_STANDARD.decode(args.remove(0).as_bytes())
+                opts.server_ocsp_response = BASE64_STANDARD
+                    .decode(args.remove(0).as_bytes())
                     .expect("invalid base64");
             }
             "-select-alpn" => {
@@ -1763,25 +1929,24 @@ pub fn main() {
                 opts.only_write_one_byte_after_handshake_on_resume = true;
             }
             "-on-resume-early-write-after-message" => {
-                opts.queue_early_data_after_received_messages= match args.remove(0).parse::<u8>().unwrap() {
-                    // estimate where these messages appear in the server's first flight.
-                    2 => vec![5 + 128 + 5 + 32],
-                    8 => vec![5 + 128 + 5 + 32, 5 + 64],
-                    _ => {
-                        panic!("unhandled -on-resume-early-write-after-message");
-                    }
-                };
+                opts.queue_early_data_after_received_messages =
+                    match args.remove(0).parse::<u8>().unwrap() {
+                        // estimate where these messages appear in the server's first flight.
+                        2 => vec![5 + 128 + 5 + 32],
+                        8 => vec![5 + 128 + 5 + 32, 5 + 64],
+                        _ => {
+                            panic!("unhandled -on-resume-early-write-after-message");
+                        }
+                    };
                 opts.queue_data_on_resume = true;
             }
             "-expect-ticket-supports-early-data" => {
                 opts.expect_ticket_supports_early_data = true;
             }
-            "-expect-accept-early-data" |
-            "-on-resume-expect-accept-early-data" => {
+            "-expect-accept-early-data" | "-on-resume-expect-accept-early-data" => {
                 opts.expect_accept_early_data = true;
             }
-            "-expect-early-data-reason" |
-            "-on-resume-expect-reject-early-data-reason" => {
+            "-expect-early-data-reason" | "-on-resume-expect-reject-early-data-reason" => {
                 let reason = args.remove(0);
                 match reason.as_str() {
                     "disabled" | "protocol_version" => {
@@ -1793,8 +1958,7 @@ pub fn main() {
                     }
                 }
             }
-            "-expect-reject-early-data" |
-            "-on-resume-expect-reject-early-data" => {
+            "-expect-reject-early-data" | "-on-resume-expect-reject-early-data" => {
                 opts.expect_reject_early_data = true;
             }
             "-expect-version" => {
@@ -1802,13 +1966,13 @@ pub fn main() {
             }
             "-curves" => {
                 let group = NamedGroup::from(args.remove(0).parse::<u16>().unwrap());
-                opts.groups.get_or_insert(Vec::new()).push(group);
-
-                // if X25519MLKEM768 is requested, insert it from rustls_post_quantum
-                #[cfg(feature = "post-quantum")]
-                if group == rustls_post_quantum::X25519MLKEM768.name() && opts.selected_provider == SelectedProvider::PostQuantum {
-                    opts.provider.kx_groups.insert(0, rustls_post_quantum::X25519MLKEM768);
-                }
+                opts.groups
+                    .get_or_insert(Vec::new())
+                    .push(group);
+            }
+            "-server-supported-groups-hint" => {
+                let group = NamedGroup::from(args.remove(0).parse::<u16>().unwrap());
+                opts.server_supported_group_hint = Some(group);
             }
             "-resumption-delay" => {
                 opts.resumption_delay = args.remove(0).parse::<u32>().unwrap();
@@ -1821,7 +1985,8 @@ pub fn main() {
                 opts.install_cert_compression_algs = CompressionAlgs::All;
             }
             "-install-one-cert-compression-alg" => {
-                opts.install_cert_compression_algs = CompressionAlgs::One(args.remove(0).parse::<u16>().unwrap());
+                opts.install_cert_compression_algs =
+                    CompressionAlgs::One(args.remove(0).parse::<u16>().unwrap());
             }
             #[cfg(feature = "fips")]
             "-fips-202205" if opts.selected_provider == SelectedProvider::AwsLcRsFips => {
@@ -1832,33 +1997,59 @@ pub fn main() {
                 process::exit(BOGO_NACK);
             }
             "-ech-config-list" => {
-                opts.ech_config_list = Some(BASE64_STANDARD.decode(args.remove(0).as_bytes())
-                    .expect("invalid ECH config base64").into());
+                opts.ech_config_list = Some(
+                    BASE64_STANDARD
+                        .decode(args.remove(0).as_bytes())
+                        .expect("invalid ECH config base64")
+                        .into(),
+                );
             }
             "-expect-ech-accept" => {
                 opts.expect_ech_accept = true;
             }
             "-expect-ech-retry-configs" => {
-                opts.expect_ech_retry_configs = Some(BASE64_STANDARD.decode(args.remove(0).as_bytes())
-                    .expect("invalid ECH config base64").into());
+                opts.expect_ech_retry_configs = Some(
+                    BASE64_STANDARD
+                        .decode(args.remove(0).as_bytes())
+                        .expect("invalid ECH config base64")
+                        .into(),
+                );
             }
             "-on-resume-ech-config-list" => {
-                opts.on_resume_ech_config_list = Some(BASE64_STANDARD.decode(args.remove(0).as_bytes())
-                    .expect("invalid on resume ECH config base64").into());
+                opts.on_resume_ech_config_list = Some(
+                    BASE64_STANDARD
+                        .decode(args.remove(0).as_bytes())
+                        .expect("invalid on resume ECH config base64")
+                        .into(),
+                );
             }
             "-on-resume-expect-ech-accept" => {
                 opts.on_resume_expect_ech_accept = true;
             }
             "-expect-no-ech-retry-configs" => {
                 opts.expect_ech_retry_configs = None;
+                opts.expect_no_ech_retry_configs = true;
             }
             "-on-initial-expect-ech-accept" => {
                 opts.on_initial_expect_ech_accept = true;
             }
             "-on-retry-expect-ech-retry-configs" => {
                 // Note: we treat this the same as -expect-ech-retry-configs
-                opts.expect_ech_retry_configs = Some(BASE64_STANDARD.decode(args.remove(0).as_bytes())
-                    .expect("invalid retry ECH config base64").into());
+                opts.expect_ech_retry_configs = Some(
+                    BASE64_STANDARD
+                        .decode(args.remove(0).as_bytes())
+                        .expect("invalid retry ECH config base64")
+                        .into(),
+                );
+            }
+            "-expect-ech-name-override" => {
+                opts.expect_ech_name_override = Some(args.remove(0));
+            }
+            "-expect-no-ech-name-override" => {
+                opts.expect_no_ech_name_override = true;
+            }
+            "-on-retry-expect-ech-name-override" => {
+                opts.on_retry_expect_ech_name_override = Some(args.remove(0));
             }
             "-enable-ech-grease" => {
                 opts.enable_ech_grease = true;
@@ -1881,82 +2072,90 @@ pub fn main() {
             }
 
             // defaults:
-            "-enable-all-curves" |
-            "-renegotiate-ignore" |
-            "-no-tls11" |
-            "-no-tls1" |
-            "-no-ssl3" |
-            "-handoff" |
-            "-ipv6" |
-            "-decline-alpn" |
-            "-permute-extensions" |
-            "-expect-no-session" |
-            "-expect-ticket-renewal" |
-            "-enable-ocsp-stapling" |
-            "-use-ocsp-callback" |
-            "-forbid-renegotiation-after-handshake" |
-            // internal openssl details:
-            "-async" |
-            "-implicit-handshake" |
-            "-use-old-client-cert-callback" |
-            "-use-early-callback" => {}
+            "-enable-all-curves"
+            | "-renegotiate-ignore"
+            | "-no-tls11"
+            | "-no-tls1"
+            | "-no-ssl3"
+            | "-handoff"
+            | "-ipv6"
+            | "-no-legacy-server-connect"
+            | "-decline-alpn"
+            | "-permute-extensions"
+            | "-expect-no-session"
+            | "-on-retry-expect-no-session"
+            | "-expect-ticket-renewal"
+            | "-enable-ocsp-stapling"
+            | "-use-ocsp-callback"
+            | "-forbid-renegotiation-after-handshake"
+            | "-async"
+            | "-implicit-handshake"
+            | "-use-old-client-cert-callback"
+            | "-use-early-callback"
+            | "-use-custom-verify-callback"
+            | "-reverify-on-resume"
+            | "-on-resume-expect-no-ech-name-override" => {}
 
             // Not implemented things
-            "-dtls" |
-            "-cipher" |
-            "-psk" |
-            "-renegotiate-freely" |
-            "-false-start" |
-            "-fallback-scsv" |
-            "-fail-early-callback" |
-            "-fail-cert-callback" |
-            "-install-ddos-callback" |
-            "-advertise-npn" |
-            "-advertise-empty-npn" |
-            "-verify-fail" |
-            "-expect-channel-id" |
-            "-send-channel-id" |
-            "-select-next-proto" |
-            "-select-empty-next-proto" |
-            "-expect-verify-result" |
-            "-send-alert" |
-            "-digest-prefs" |
-            "-use-exporter-between-reads" |
-            "-ticket-key" |
-            "-tls-unique" |
-            "-enable-server-custom-extension" |
-            "-enable-client-custom-extension" |
-            "-expect-dhe-group-size" |
-            "-use-ticket-callback" |
-            "-enable-grease" |
-            "-enable-channel-id" |
-            "-expect-early-data-info" |
-            "-expect-cipher-aes" |
-            "-retain-only-sha256-client-cert-initial" |
-            "-expect-draft-downgrade" |
-            "-allow-unknown-alpn-protos" |
-            "-on-initial-tls13-variant" |
-            "-on-resume-export-early-keying-material" |
-            "-on-resume-enable-early-data" |
-            "-export-early-keying-material" |
-            "-handshake-twice" |
-            "-on-resume-verify-fail" |
-            "-reverify-on-resume" |
-            "-no-op-extra-handshake" |
-            "-expect-peer-cert-file" |
-            "-no-rsa-pss-rsae-certs" |
-            "-ignore-tls13-downgrade" |
-            "-allow-hint-mismatch" |
-            "-wpa-202304" |
-            "-cnsa-202407" |
-            "-srtp-profiles" |
-            "-use-ticket-aead-callback" |
-            "-signed-cert-timestamps" |
-            "-on-initial-expect-peer-cert-file" |
-            "-resumption-across-names-enabled" |
-            "-expect-resumable-across-names" |
-            "-expect-not-resumable-across-names" |
-            "-use-custom-verify-callback" => {
+            "-dtls"
+            | "-cipher"
+            | "-psk"
+            | "-renegotiate-freely"
+            | "-false-start"
+            | "-fallback-scsv"
+            | "-fail-early-callback"
+            | "-fail-cert-callback"
+            | "-install-ddos-callback"
+            | "-advertise-npn"
+            | "-advertise-empty-npn"
+            | "-verify-fail"
+            | "-expect-channel-id"
+            | "-send-channel-id"
+            | "-select-next-proto"
+            | "-select-empty-next-proto"
+            | "-expect-verify-result"
+            | "-send-alert"
+            | "-digest-prefs"
+            | "-use-exporter-between-reads"
+            | "-ticket-key"
+            | "-tls-unique"
+            | "-enable-server-custom-extension"
+            | "-enable-client-custom-extension"
+            | "-expect-dhe-group-size"
+            | "-use-ticket-callback"
+            | "-enable-grease"
+            | "-enable-channel-id"
+            | "-expect-early-data-info"
+            | "-expect-cipher-aes"
+            | "-retain-only-sha256-client-cert-initial"
+            | "-expect-draft-downgrade"
+            | "-allow-unknown-alpn-protos"
+            | "-on-initial-tls13-variant"
+            | "-on-resume-export-early-keying-material"
+            | "-on-resume-enable-early-data"
+            | "-export-early-keying-material"
+            | "-handshake-twice"
+            | "-on-resume-verify-fail"
+            | "-on-retry-verify-fail"
+            | "-key-shares"
+            | "-no-key-shares"
+            | "-no-server-name-ack"
+            | "-no-op-extra-handshake"
+            | "-expect-peer-cert-file"
+            | "-no-rsa-pss-rsae-certs"
+            | "-ignore-tls13-downgrade"
+            | "-allow-hint-mismatch"
+            | "-wpa-202304"
+            | "-cnsa-202407"
+            | "-cnsa1-202603"
+            | "-cnsa2-202603"
+            | "-srtp-profiles"
+            | "-use-ticket-aead-callback"
+            | "-signed-cert-timestamps"
+            | "-on-initial-expect-peer-cert-file"
+            | "-resumption-across-names-enabled"
+            | "-expect-resumable-across-names"
+            | "-expect-not-resumable-across-names" => {
                 println!("NYI option {arg:?}");
                 process::exit(BOGO_NACK);
             }
