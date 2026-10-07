@@ -408,6 +408,12 @@ impl FingerprintSignatureAlgorithm {
             &[webpki_algs::RSA_PKCS1_2048_8192_SHA512];
         static ED25519_ALGS: &[&dyn pki_types::SignatureVerificationAlgorithm] =
             &[webpki_algs::ED25519];
+        static ML_DSA_44_ALGS: &[&dyn pki_types::SignatureVerificationAlgorithm] =
+            &[webpki_algs::ML_DSA_44];
+        static ML_DSA_65_ALGS: &[&dyn pki_types::SignatureVerificationAlgorithm] =
+            &[webpki_algs::ML_DSA_65];
+        static ML_DSA_87_ALGS: &[&dyn pki_types::SignatureVerificationAlgorithm] =
+            &[webpki_algs::ML_DSA_87];
         static EMPTY: &[&dyn pki_types::SignatureVerificationAlgorithm] = &[];
 
         match self {
@@ -421,11 +427,11 @@ impl FingerprintSignatureAlgorithm {
             Self::RsaPkcs1Sha384 => RSA_PKCS1_384_ALGS,
             Self::RsaPkcs1Sha512 => RSA_PKCS1_512_ALGS,
             Self::Ed25519 => ED25519_ALGS,
+            Self::MlDsa44 => ML_DSA_44_ALGS,
+            Self::MlDsa65 => ML_DSA_65_ALGS,
+            Self::MlDsa87 => ML_DSA_87_ALGS,
             // Ed448 is not supported by webpki, SHA1 legacy uses fallback in mapping
             Self::Ed448 | Self::RsaPkcs1Sha1 | Self::EcdsaSha1Legacy => EMPTY,
-            // ML-DSA is advertised to match browsers that offer it, but webpki has
-            // no verifier for it, so it contributes nothing to certificate validation.
-            Self::MlDsa44 | Self::MlDsa65 | Self::MlDsa87 => EMPTY,
         }
     }
 
@@ -467,21 +473,12 @@ impl FingerprintSignatureAlgorithm {
         static ECDSA_SHA1_FALLBACK: &[&dyn pki_types::SignatureVerificationAlgorithm] =
             &[webpki_algs::ECDSA_P256_SHA256];
         static ED25519: &[&dyn pki_types::SignatureVerificationAlgorithm] = &[webpki_algs::ED25519];
-        // ML-DSA is advertised for fingerprint accuracy but webpki has no verifier
-        // for it. The mapping doubles as the list of schemes we offer, so the entry
-        // has to exist; it must also be non-empty, because the TLS 1.3 verify path
-        // indexes the first element. This placeholder can never validate an ML-DSA
-        // signature, so a server that actually selects one fails the handshake
-        // cleanly instead of panicking.
-        //
-        // Ed25519 rather than a P-256 verifier: the placeholder does get run, so a
-        // server whose certificate key matches it could have a CertificateVerify
-        // mislabelled as ML-DSA accepted. Only the legitimate key holder can produce
-        // such a signature, but P-256 is the common case for publicly-trusted server
-        // certificates whereas Ed25519 is not issued by public CAs, so this keeps the
-        // window as small as the fallback approach allows.
-        static ML_DSA_FALLBACK: &[&dyn pki_types::SignatureVerificationAlgorithm] =
-            &[webpki_algs::ED25519];
+        static ML_DSA_44: &[&dyn pki_types::SignatureVerificationAlgorithm] =
+            &[webpki_algs::ML_DSA_44];
+        static ML_DSA_65: &[&dyn pki_types::SignatureVerificationAlgorithm] =
+            &[webpki_algs::ML_DSA_65];
+        static ML_DSA_87: &[&dyn pki_types::SignatureVerificationAlgorithm] =
+            &[webpki_algs::ML_DSA_87];
 
         match self {
             Self::EcdsaSecp256r1Sha256 => {
@@ -506,9 +503,9 @@ impl FingerprintSignatureAlgorithm {
             Self::Ed25519 => Some((SignatureScheme::ED25519, ED25519)),
             // Ed448 is not supported
             Self::Ed448 => None,
-            Self::MlDsa44 => Some((SignatureScheme::ML_DSA_44, ML_DSA_FALLBACK)),
-            Self::MlDsa65 => Some((SignatureScheme::ML_DSA_65, ML_DSA_FALLBACK)),
-            Self::MlDsa87 => Some((SignatureScheme::ML_DSA_87, ML_DSA_FALLBACK)),
+            Self::MlDsa44 => Some((SignatureScheme::ML_DSA_44, ML_DSA_44)),
+            Self::MlDsa65 => Some((SignatureScheme::ML_DSA_65, ML_DSA_65)),
+            Self::MlDsa87 => Some((SignatureScheme::ML_DSA_87, ML_DSA_87)),
         }
     }
 }
@@ -611,5 +608,222 @@ impl TlsFingerprint {
     /// Each unique signature algorithm configuration is only allocated once.
     pub fn to_signature_verification_algorithms(&self) -> WebPkiSupportedAlgorithms {
         sig_alg_cache::get_or_create(&self.signature_algorithms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::boxed::Box;
+    use alloc::vec;
+
+    use pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose,
+    };
+
+    use super::*;
+    use crate::crypto::CryptoProvider;
+    use crate::server::WantsServerCert;
+    use crate::sign::{CertifiedKey, Signer, SigningKey, SingleCertAndKey};
+    use crate::sync::Arc;
+    use crate::version::TLS13;
+    use crate::{
+        CertificateError, ClientConfig, ClientConnection, ConfigBuilder, Connection, Error,
+        RootCertStore, ServerConfig, ServerConnection, SignatureAlgorithm,
+    };
+
+    #[test]
+    fn server_with_ml_dsa_certificate_is_accepted() {
+        // Each level signs both the chain and the CertificateVerify, so every ML-DSA entry is
+        // exercised for certificate validation and for handshake signatures.
+        for (name, alg) in [
+            ("ML-DSA-44", &rcgen::PKCS_ML_DSA_44),
+            ("ML-DSA-65", &rcgen::PKCS_ML_DSA_65),
+            ("ML-DSA-87", &rcgen::PKCS_ML_DSA_87),
+        ] {
+            let (roots, ee_cert, ee_key) = issue(alg, alg);
+
+            let server_config = server_config_builder()
+                .with_single_cert(vec![ee_cert], ee_key)
+                .unwrap();
+
+            if let Err(err) = handshake(client_config(roots), server_config) {
+                panic!("{name}: {err:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ed25519_signature_labelled_as_ml_dsa_is_rejected() {
+        let (roots, ee_cert, ee_key) = issue(&rcgen::PKCS_ED25519, &rcgen::PKCS_ED25519);
+
+        // A genuine Ed25519 key whose CertificateVerify claims to be ML-DSA-44.
+        let ed25519 = aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(ee_key)
+            .unwrap();
+        let key = Arc::new(MislabelledKey(ed25519));
+        let server_config = server_config_builder().with_cert_resolver(Arc::new(
+            SingleCertAndKey::from(CertifiedKey::new(vec![ee_cert], key)),
+        ));
+
+        let err = handshake(client_config(roots), server_config).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::InvalidCertificate(
+                    CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. }
+                )
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A fingerprint that, like Chrome 150+, offers ML-DSA ahead of the classical schemes.
+    fn fingerprint() -> TlsFingerprint {
+        TlsFingerprint::new(
+            vec![FingerprintCipherSuite::TLS13_AES_128_GCM_SHA256],
+            // P-256 rather than X25519: `fips` builds drop X25519 from the provider.
+            vec![FingerprintKeyExchangeGroup::Secp256r1],
+            vec![
+                FingerprintSignatureAlgorithm::MlDsa44,
+                FingerprintSignatureAlgorithm::MlDsa65,
+                FingerprintSignatureAlgorithm::MlDsa87,
+                FingerprintSignatureAlgorithm::EcdsaSecp256r1Sha256,
+                FingerprintSignatureAlgorithm::Ed25519,
+            ],
+            TlsExtensionsConfig {
+                supported_versions: true,
+                ..TlsExtensionsConfig::default()
+            },
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// Builds a client the way impit does: a provider derived from the fingerprint, which
+    /// supplies the signature verification algorithms used by the certificate verifier.
+    fn client_config(roots: RootCertStore) -> ClientConfig {
+        let provider = CryptoProvider::builder()
+            .with_tls_fingerprint(fingerprint())
+            .build();
+        ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_tls_fingerprint(fingerprint())
+            .with_no_client_auth()
+    }
+
+    fn server_config_builder() -> ConfigBuilder<ServerConfig, WantsServerCert> {
+        ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+            .with_protocol_versions(&[&TLS13])
+            .unwrap()
+            .with_no_client_auth()
+    }
+
+    /// Issues a CA certificate and a `localhost` end-entity certificate signed by it.
+    fn issue(
+        ca_alg: &'static rcgen::SignatureAlgorithm,
+        ee_alg: &'static rcgen::SignatureAlgorithm,
+    ) -> (
+        RootCertStore,
+        CertificateDer<'static>,
+        PrivateKeyDer<'static>,
+    ) {
+        let mut ca_params = CertificateParams::new(vec!["Test CA".into()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+        ];
+        ca_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let issuer =
+            CertifiedIssuer::self_signed(ca_params, KeyPair::generate_for(ca_alg).unwrap())
+                .unwrap();
+
+        let ee_key = KeyPair::generate_for(ee_alg).unwrap();
+        let ee_cert = CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .signed_by(&ee_key, &issuer)
+            .unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(issuer.der().clone()).unwrap();
+        (
+            roots,
+            ee_cert.der().clone(),
+            PrivateKeyDer::try_from(ee_key.serialize_der()).unwrap(),
+        )
+    }
+
+    /// Runs a handshake to completion, returning the first error either side reports.
+    fn handshake(client_config: ClientConfig, server_config: ServerConfig) -> Result<(), Error> {
+        let mut client = Connection::from(
+            ClientConnection::new(
+                Arc::new(client_config),
+                ServerName::try_from("localhost").unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut server = Connection::from(ServerConnection::new(Arc::new(server_config)).unwrap());
+
+        while client.is_handshaking() || server.is_handshaking() {
+            let client_sent = transfer(&mut client, &mut server)?;
+            let server_sent = transfer(&mut server, &mut client)?;
+            assert!(client_sent || server_sent, "handshake stalled");
+        }
+        Ok(())
+    }
+
+    /// Moves everything `from` has queued into `to`. ML-DSA flights are several kilobytes, more
+    /// than a single `read_tls()` call accepts, so both directions loop until drained.
+    fn transfer(from: &mut Connection, to: &mut Connection) -> Result<bool, Error> {
+        let mut buf = Vec::new();
+        while from.wants_write() {
+            from.write_tls(&mut buf).unwrap();
+        }
+
+        let mut rd = &buf[..];
+        while !rd.is_empty() {
+            let read = to.read_tls(&mut rd).unwrap();
+            assert_ne!(read, 0, "read_tls made no progress");
+            to.process_new_packets()?;
+        }
+        Ok(!buf.is_empty())
+    }
+
+    /// Signs with an Ed25519 key but labels the signature as ML-DSA-44.
+    #[derive(Debug)]
+    struct MislabelledKey(Arc<dyn SigningKey>);
+
+    impl SigningKey for MislabelledKey {
+        fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+            if !offered.contains(&SignatureScheme::ML_DSA_44) {
+                return None;
+            }
+            let inner = self
+                .0
+                .choose_scheme(&[SignatureScheme::ED25519])?;
+            Some(Box::new(MislabelledSigner(inner)))
+        }
+
+        fn algorithm(&self) -> SignatureAlgorithm {
+            self.0.algorithm()
+        }
+    }
+
+    #[derive(Debug)]
+    struct MislabelledSigner(Box<dyn Signer>);
+
+    impl Signer for MislabelledSigner {
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
+            self.0.sign(message)
+        }
+
+        fn scheme(&self) -> SignatureScheme {
+            SignatureScheme::ML_DSA_44
+        }
     }
 }
