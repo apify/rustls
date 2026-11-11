@@ -1101,6 +1101,31 @@ impl State<ClientConnectionData> for ExpectCompressedCertificate {
     }
 }
 
+/// Whether any certificate entry carries a `trust_anchors` marker we did not ask for.
+///
+/// When we did send the extension, the marker is tolerated in any entry.
+fn unsolicited_trust_anchors(chain: &CertificatePayloadTls13<'_>, sent: bool) -> bool {
+    !sent
+        && chain
+            .entries
+            .iter()
+            .any(|entry| entry.extensions.trust_anchors.is_some())
+}
+
+/// Whether this client's fingerprint offers the Trust Anchor IDs extension.
+#[cfg(feature = "impit")]
+fn sent_trust_anchors(config: &ClientConfig) -> bool {
+    config
+        .tls_fingerprint
+        .as_ref()
+        .is_some_and(|fp| fp.extensions.trust_anchors.is_some())
+}
+
+#[cfg(not(feature = "impit"))]
+fn sent_trust_anchors(_config: &ClientConfig) -> bool {
+    false
+}
+
 struct ExpectCertificate {
     config: Arc<ClientConfig>,
     server_name: ServerName<'static>,
@@ -1136,6 +1161,14 @@ impl State<ClientConnectionData> for ExpectCertificate {
             return Err(cx.common.send_fatal_alert(
                 AlertDescription::DecodeError,
                 InvalidMessage::InvalidCertRequest,
+            ));
+        }
+
+        // An empty `trust_anchors` marker is only valid if we offered the extension.
+        if unsolicited_trust_anchors(&cert_chain, sent_trust_anchors(&self.config)) {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::UnsupportedExtension,
+                PeerMisbehaved::UnsolicitedCertExtension,
             ));
         }
 
@@ -1734,5 +1767,58 @@ impl KernelState for ExpectQuicTraffic {
         nst: &NewSessionTicketPayloadTls13,
     ) -> Result<(), Error> {
         self.0.handle_new_ticket_impl(cx, nst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pki_types::CertificateDer;
+
+    use super::*;
+    use crate::msgs::handshake::{CertificateEntry, CertificatePayloadTls13};
+
+    fn chain_with_marker_on_second(marker: bool) -> CertificatePayloadTls13<'static> {
+        let mut chain = chain(false);
+        let mut second = CertificateEntry::new(CertificateDer::from(vec![4, 5, 6]));
+        if marker {
+            second.extensions.trust_anchors = Some(());
+        }
+        chain.entries.push(second);
+        chain
+    }
+
+    fn chain(marker: bool) -> CertificatePayloadTls13<'static> {
+        let mut entry = CertificateEntry::new(CertificateDer::from(vec![1, 2, 3]));
+        if marker {
+            entry.extensions.trust_anchors = Some(());
+        }
+        CertificatePayloadTls13 {
+            context: PayloadU8::new(Vec::new()),
+            entries: vec![entry],
+        }
+    }
+
+    #[test]
+    fn trust_anchors_in_certificate_rejected_when_not_sent() {
+        assert!(unsolicited_trust_anchors(&chain(true), false));
+        assert!(!unsolicited_trust_anchors(&chain(true), true));
+        assert!(!unsolicited_trust_anchors(&chain(false), false));
+        assert!(!unsolicited_trust_anchors(&chain(false), true));
+    }
+
+    #[test]
+    fn trust_anchors_marker_on_later_entry_rejected_when_not_sent() {
+        assert!(unsolicited_trust_anchors(
+            &chain_with_marker_on_second(true),
+            false
+        ));
+        assert!(!unsolicited_trust_anchors(
+            &chain_with_marker_on_second(true),
+            true
+        ));
+        assert!(!unsolicited_trust_anchors(
+            &chain_with_marker_on_second(false),
+            false
+        ));
     }
 }

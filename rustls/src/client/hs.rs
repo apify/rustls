@@ -267,6 +267,12 @@ fn emit_client_hello_for_retry(
             exts.reserved_grease = Some(());
         }
 
+        if ext_config.grease_first_and_last {
+            // The encoder puts these first and last (`used_extensions_in_encoding_order`).
+            exts.reserved_grease = Some(());
+            exts.reserved_grease_last = Some(Payload::new(vec![0]));
+        }
+
         if ext_config.signed_certificate_timestamp {
             exts.signed_certificate_timestamp = Some(());
         }
@@ -283,6 +289,15 @@ fn emit_client_hello_for_retry(
                 // Use old ALPS codepoint (17513 / 0x4469)
                 exts.application_settings = Some(application_settings);
             }
+        }
+
+        if let Some(ids) = &ext_config.trust_anchors {
+            exts.trust_anchors = Some(
+                ids.iter()
+                    .cloned()
+                    .map(crate::msgs::handshake::TrustAnchorId::from)
+                    .collect(),
+            );
         }
 
         if ext_config.delegated_credentials {
@@ -309,6 +324,26 @@ fn emit_client_hello_for_retry(
     {
         if let Some(schemes) = &mut exts.signature_schemes {
             schemes.retain(|scheme| scheme.algorithm().is_some());
+        }
+    }
+
+    // `signature_schemes` comes from the verifier, and neither the fingerprint's verifier nor
+    // `NoVerifier` holds GREASE: add it here, at the fingerprint's position. This must come after
+    // the filter above, which would drop it (`0x1a1a` has no `algorithm()`).
+    #[cfg(feature = "impit")]
+    if let Some(ref fingerprint) = config.tls_fingerprint {
+        if let Some(schemes) = &mut exts.signature_schemes {
+            if let Some(position) = fingerprint.signature_algorithm_grease_position(schemes) {
+                // With the fingerprint's own verifier the count can't pass the end: its list
+                // keeps duplicates, and the filter drops every copy of a scheme together.
+                // Other verifiers' lists aren't built from the fingerprint (e.g.
+                // `NoVerifier::with_default_schemes()` when TLS errors are ignored), so clamp.
+                schemes.insert(
+                    position.min(schemes.len()),
+                    crate::crypto::emulation::FingerprintSignatureAlgorithm::Grease
+                        .to_signature_scheme(),
+                );
+            }
         }
     }
 

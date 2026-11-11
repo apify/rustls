@@ -146,6 +146,13 @@ fn refuses_certificate_ext_with_unparsed_bytes() {
 }
 
 #[test]
+fn certificate_extensions_parse_empty_trust_anchors() {
+    let bytes = [0x00u8, 0x04, 0xca, 0x34, 0x00, 0x00];
+    let exts = CertificateExtensions::read_bytes(&bytes).unwrap();
+    assert_eq!(exts.trust_anchors, Some(()));
+}
+
+#[test]
 fn refuses_certificate_ext_with_unknown_type() {
     let bytes = [0x00u8, 0x08, 0x00, 0x05, 0x00, 0x03, 0x99, 0x00, 0x00, 0x00];
     assert_eq!(
@@ -963,6 +970,7 @@ fn sample_certificate_payload_tls13() -> CertificatePayloadTls13<'static> {
                     ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
                 }),
                 signed_certificate_timestamp: None,
+                trust_anchors: None,
             },
         }],
     }

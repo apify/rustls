@@ -148,10 +148,12 @@ enum_builder! {
         EncryptedClientHello => 0xfe0d, // https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#section-11.1
         EncryptedClientHelloOuterExtensions => 0xfd00, // https://datatracker.ietf.org/doc/html/draft-ietf-tls-esni-18#section-5.1
         ReservedGrease => 0xbaba,
+        ReservedGreaseLast => 0xaaaa, // the second GREASE extension, `0xbaba ^ 0x1010`
         DelegatedCredentials => 0x0022,
         RecordSizeLimit => 0x001c,
         ApplicationSettings => 0x4469, // Old ALPS codepoint (17513)
         ApplicationSettingsNew => 0x44cd, // New ALPS codepoint (17613) used by Chrome 136+
+        TrustAnchors => 0xca34, // draft-ietf-tls-trust-anchor-ids, Chrome's codepoint
     }
 }
 

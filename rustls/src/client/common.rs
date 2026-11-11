@@ -119,3 +119,26 @@ impl ClientAuthDetails {
         Self::Empty { auth_context_tls13 }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msgs::codec::Codec;
+
+    #[test]
+    fn encrypted_extensions_trust_anchors_allowed_when_sent() {
+        // EncryptedExtensions body holding an AvailableTrustAnchorList, from Google's real reply.
+        let body = [
+            0x00u8, 0x10, 0xca, 0x34, 0x00, 0x0c, 0x00, 0x0a, 0x04, 0xd6, 0x79, 0x09, 0x06, 0x04,
+            0xd6, 0x79, 0x09, 0x01,
+        ];
+        let exts = ServerExtensions::read_bytes(&body).unwrap();
+
+        let mut hello = ClientHelloDetails::new(Vec::new(), 0);
+        assert!(hello.server_sent_unsolicited_extensions(&exts, &[]));
+        hello
+            .sent_extensions
+            .push(ExtensionType::TrustAnchors);
+        assert!(!hello.server_sent_unsolicited_extensions(&exts, &[]));
+    }
+}

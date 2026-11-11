@@ -417,6 +417,20 @@ impl TlsListElement for ProtocolName {
     };
 }
 
+wrapped_payload!(
+    /// draft-ietf-tls-trust-anchor-ids-06 §5.1: `opaque TrustAnchorID<1..32>;`
+    ///
+    /// The decoder is lenient and accepts IDs of up to 255 bytes.
+    pub(crate) struct TrustAnchorId, PayloadU8<NonEmpty>,
+);
+
+/// draft-ietf-tls-trust-anchor-ids-06 §5.1: `TrustAnchorID RequestedTrustAnchorList<0..2^16-1>;`
+///
+/// Same wire shape as the ALPN protocol list, but the list may be empty.
+impl TlsListElement for TrustAnchorId {
+    const SIZE_LEN: ListLength = ListLength::U16;
+}
+
 /// RFC7301 encodes a single protocol name as `Vec<ProtocolName>`
 #[derive(Clone, Debug)]
 pub(crate) struct SingleProtocolName(ProtocolName);
@@ -973,6 +987,10 @@ extension_struct! {
         ExtensionType::ReservedGrease =>
             pub(crate) reserved_grease: Option<()>,
 
+        /// Bogus impit extension: the second GREASE extension, sent last. Any body on read.
+        ExtensionType::ReservedGreaseLast =>
+            pub(crate) reserved_grease_last: Option<Payload<'a>>,
+
         /// Bogus impit extension
         ExtensionType::SCT =>
             pub(crate) signed_certificate_timestamp: Option<()>,
@@ -992,6 +1010,10 @@ extension_struct! {
         /// ALPS extension (new codepoint 17613, used by Chrome 136+)
         ExtensionType::ApplicationSettingsNew =>
             pub(crate) application_settings_new: Option<PayloadU16>,
+
+        /// Trust Anchor IDs (draft-ietf-tls-trust-anchor-ids, codepoint 0xca34)
+        ExtensionType::TrustAnchors =>
+            pub(crate) trust_anchors: Option<Vec<TrustAnchorId>>,
 
         /// Padding extension (RFC7685) - used to pad ClientHello to avoid triggering
         /// bugs in some middleboxes. Contains zero bytes.
@@ -1040,7 +1062,9 @@ impl ClientExtensions<'_> {
             order_seed,
             application_settings,
             application_settings_new,
+            trust_anchors,
             reserved_grease,
+            reserved_grease_last,
             signed_certificate_timestamp,
             delegated_credentials,
             record_size_limit,
@@ -1076,7 +1100,9 @@ impl ClientExtensions<'_> {
             contiguous_extensions,
             application_settings,
             application_settings_new,
+            trust_anchors,
             reserved_grease,
+            reserved_grease_last: reserved_grease_last.map(|x| x.into_owned()),
             signed_certificate_timestamp,
             delegated_credentials,
             record_size_limit,
@@ -1088,6 +1114,26 @@ impl ClientExtensions<'_> {
         let mut exts = self.order_insensitive_extensions_in_random_order();
         exts.extend(&self.contiguous_extensions);
 
+        // With `reserved_grease_last` (impit's `grease_first_and_last`), place the GREASE
+        // extensions as BoringSSL does: `ReservedGrease` first, `ReservedGreaseLast` after
+        // everything but padding and PSK. Without it, nothing moves.
+        // This only orders hellos the client builds: a received hello (where a peer's `0xaaaa`
+        // also sets the field) is never re-encoded, as the server works from its raw bytes.
+        let grease_first_and_last = self.reserved_grease_last.is_some();
+        if grease_first_and_last {
+            exts.retain(|ext| {
+                !matches!(
+                    ext,
+                    ExtensionType::ReservedGrease
+                        | ExtensionType::ReservedGreaseLast
+                        | ExtensionType::Padding
+                )
+            });
+            if self.reserved_grease.is_some() {
+                exts.insert(0, ExtensionType::ReservedGrease);
+            }
+        }
+
         if self
             .encrypted_client_hello_outer
             .is_some()
@@ -1096,6 +1142,12 @@ impl ClientExtensions<'_> {
         }
         if self.encrypted_client_hello.is_some() {
             exts.push(ExtensionType::EncryptedClientHello);
+        }
+        if grease_first_and_last {
+            exts.push(ExtensionType::ReservedGreaseLast);
+            if self.padding.is_some() {
+                exts.push(ExtensionType::Padding);
+            }
         }
         if self.preshared_key_offer.is_some() {
             exts.push(ExtensionType::PreSharedKey);
@@ -1116,6 +1168,9 @@ impl ClientExtensions<'_> {
     ///
     /// - Lastly, any ECH and PSK extensions (in that order).  These
     ///   are required to be last by the standard.
+    ///
+    /// When `reserved_grease_last` is set, the GREASE extensions and padding are taken out of
+    /// the first two portions and placed around them (see `used_extensions_in_encoding_order`).
     fn order_insensitive_extensions_in_random_order(&self) -> Vec<ExtensionType> {
         let mut order = self.collect_used();
 
@@ -1774,6 +1829,9 @@ extension_struct! {
             pub(crate) status: Option<CertificateStatus<'a>>,
         ExtensionType::SCT =>
             pub(crate) signed_certificate_timestamp: Option<PayloadU16>,
+        // draft-ietf-tls-trust-anchor-ids: an empty marker in the first entry.
+        ExtensionType::TrustAnchors =>
+            pub(crate) trust_anchors: Option<()>,
     }
 }
 
@@ -1782,6 +1840,7 @@ impl CertificateExtensions<'_> {
         CertificateExtensions {
             status: self.status.map(|s| s.into_owned()),
             signed_certificate_timestamp: self.signed_certificate_timestamp,
+            trust_anchors: self.trust_anchors,
         }
     }
 }
@@ -2973,14 +3032,14 @@ impl EchConfigContents {
     }
 
     /// Returns true if there is at least one mandatory unsupported extension.
+    ///
+    /// rustls supports no ECHConfig extensions, so any mandatory one makes the config unusable,
+    /// whatever its type: a type rustls names (like the fork's GREASE codepoints) counts too.
     pub(crate) fn has_unknown_mandatory_extension(&self) -> bool {
         self.extensions
             .iter()
             // An extension is considered mandatory if the high bit of its type is set.
-            .any(|ext| {
-                matches!(ext.ext_type(), ExtensionType::Unknown(_))
-                    && u16::from(ext.ext_type()) & 0x8000 != 0
-            })
+            .any(|ext| u16::from(ext.ext_type()) & 0x8000 != 0)
     }
 }
 
@@ -3263,6 +3322,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_trust_anchor_list_is_accepted() {
+        let mut r = Reader::init(&[0, 0]);
+        let ids = Vec::<TrustAnchorId>::read(&mut r).unwrap();
+        assert!(ids.is_empty());
+        assert!(!r.any_left());
+
+        let mut r = Reader::init(&[0, 3, 2, 0xab, 0xcd]);
+        assert_eq!(
+            Vec::<TrustAnchorId>::read(&mut r)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn client_extensions_accept_any_grease_last_body() {
+        // A peer may send `0xaaaa` with any body (Chrome's first GREASE extension can be `0xaaaa`,
+        // empty), as when it was an unknown type.
+        for (bytes, body) in [
+            (&[0x00, 0x04, 0xaa, 0xaa, 0x00, 0x00][..], &[][..]),
+            (
+                &[0x00, 0x06, 0xaa, 0xaa, 0x00, 0x02, 0x01, 0x02][..],
+                &[0x01, 0x02][..],
+            ),
+        ] {
+            let exts = ClientExtensions::read_bytes(bytes).unwrap();
+            assert_eq!(
+                exts.reserved_grease_last
+                    .as_ref()
+                    .map(|p| p.bytes()),
+                Some(body)
+            );
+            assert_eq!(exts.get_encoding(), bytes);
+        }
+    }
+
+    #[test]
     fn test_ech_config_dupe_exts() {
         let unknown_ext = EchConfigExtension::Unknown(UnknownExtension {
             typ: ExtensionType::Unknown(0x42),
@@ -3291,6 +3388,54 @@ mod tests {
 
         assert!(!config.has_duplicate_extension());
         assert!(config.has_unknown_mandatory_extension());
+    }
+
+    #[test]
+    fn test_ech_config_named_mandatory_exts() {
+        // rustls supports no ECHConfig extensions, so a mandatory one (high bit set) makes the
+        // config unusable even when rustls names its type. The first is BoGo's
+        // `TLS-ECH-Client-SelectECHConfig` case.
+        for wire in [
+            &[0xaa, 0xaa, 0x00, 0x04, b't', b'e', b's', b't'][..],
+            &[0xba, 0xba, 0x00, 0x00][..],
+            &[0xca, 0x34, 0x00, 0x00][..],
+            &[0xfe, 0x0d, 0x00, 0x00][..],
+            &[0xff, 0x01, 0x00, 0x00][..],
+        ] {
+            let config = config_with_ext(wire);
+            let typ = config.extensions[0].ext_type();
+            let code = u16::from(typ);
+            assert!(
+                config.has_unknown_mandatory_extension(),
+                "mandatory {typ:?} ({code:#06x}) not reported"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ech_config_optional_exts() {
+        // An extension with the high bit clear is optional, named or not.
+        for wire in [
+            &[0x00, 0x10, 0x00, 0x00][..],
+            &[0x12, 0x34, 0x00, 0x01, 0x00][..],
+        ] {
+            let config = config_with_ext(wire);
+            let typ = config.extensions[0].ext_type();
+            let code = u16::from(typ);
+            assert!(
+                !config.has_unknown_mandatory_extension(),
+                "optional {typ:?} ({code:#06x}) reported as mandatory"
+            );
+        }
+    }
+
+    /// `config_template()` with one extension, parsed from its wire encoding.
+    fn config_with_ext(wire: &[u8]) -> EchConfigContents {
+        let mut config = config_template();
+        config
+            .extensions
+            .push(EchConfigExtension::read_bytes(wire).unwrap());
+        config
     }
 
     fn config_template() -> EchConfigContents {
