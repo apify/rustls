@@ -1249,9 +1249,6 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         Error::InvalidMessage(InvalidMessage::PreSharedKeyIsNotFinalExtension) => {
             quit(":PRE_SHARED_KEY_MUST_BE_LAST:")
         }
-        Error::DecryptError if opts.ech_config_list.is_some() => {
-            quit(":INCONSISTENT_ECH_NEGOTIATION:")
-        }
         Error::DecryptError => quit(":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:"),
         Error::NoApplicationProtocol => quit(":NO_APPLICATION_PROTOCOL:"),
         Error::PeerIncompatible(
@@ -1305,6 +1302,9 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         }
         Error::PeerMisbehaved(PeerMisbehaved::TooManyEmptyFragments) => {
             quit(":TOO_MANY_EMPTY_FRAGMENTS:")
+        }
+        Error::PeerMisbehaved(PeerMisbehaved::EchAcceptanceVariedAfterRetry) => {
+            quit(":INCONSISTENT_ECH_NEGOTIATION:")
         }
         Error::PeerMisbehaved(PeerMisbehaved::IllegalHelloRetryRequestWithInvalidEch)
         | Error::PeerMisbehaved(PeerMisbehaved::UnsolicitedEchExtension) => {
@@ -1381,7 +1381,12 @@ const MAX_MESSAGE_SIZE: usize = 0xffff + 5;
 
 fn after_read(opts: &Options, sess: &mut Connection, conn: &mut net::TcpStream) {
     if let Err(err) = sess.process_new_packets() {
-        flush(sess, conn); /* send any alerts before exiting */
+        // Send any alerts before exiting, but don't swallow `err` if we can't.
+        while sess.wants_write() {
+            if sess.write_tls(conn).is_err() {
+                break;
+            }
+        }
         orderly_close(conn);
         handle_err(opts, err);
     }
