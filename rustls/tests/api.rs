@@ -38,7 +38,7 @@ use rustls::{
 };
 #[cfg(feature = "aws_lc_rs")]
 use rustls::{
-    client::{EchConfig, EchGreaseConfig, EchMode},
+    client::{EchConfig, EchGreaseConfig, EchMode, EchStatus},
     crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
     internal::msgs::base::PayloadU16,
     internal::msgs::handshake::{
@@ -2295,6 +2295,54 @@ fn server_error_is_sticky() {
 }
 
 #[test]
+fn write_reports_sticky_error() {
+    let (mut client, mut server) = make_pair(KeyType::Rsa2048, &provider::default_provider());
+    do_handshake(&mut client, &mut server);
+
+    // corrupt a record, so the server fails and sends a fatal alert
+    client
+        .writer()
+        .write_all(b"hello")
+        .unwrap();
+    let mut client_output = Vec::new();
+    client
+        .write_tls(&mut client_output)
+        .unwrap();
+    *client_output.last_mut().unwrap() ^= 1;
+    server
+        .read_tls(&mut client_output.as_slice())
+        .unwrap();
+    assert_eq!(server.process_new_packets(), Err(Error::DecryptError));
+    let mut server_output = Vec::new();
+    server
+        .write_tls(&mut server_output)
+        .unwrap();
+
+    for data in [&b"world"[..], b""] {
+        let err = server.writer().write(data).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), Error::DecryptError.to_string());
+    }
+    assert!(!server.wants_write());
+
+    // the client receives the alert, but has not sent one itself
+    client
+        .read_tls(&mut server_output.as_slice())
+        .unwrap();
+    let expected = Error::AlertReceived(AlertDescription::BadRecordMac);
+    assert_eq!(client.process_new_packets(), Err(expected.clone()));
+    assert!(!client.wants_write());
+
+    let err = client
+        .writer()
+        .write(b"world")
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), expected.to_string());
+    assert!(!client.wants_write());
+}
+
+#[test]
 fn server_flush_does_nothing() {
     let (_, mut server) = make_pair(KeyType::Rsa2048, &provider::default_provider());
     assert!(matches!(server.writer().flush(), Ok(())));
@@ -3300,6 +3348,256 @@ fn stream_write_swallows_underlying_io_error_after_plaintext_processed() {
     let mut client_stream = Stream::new(&mut client, &mut pipe);
     let rc = client_stream.write(b"world");
     assert_eq!(format!("{rc:?}"), "Ok(5)");
+}
+
+#[cfg(feature = "tls12")]
+#[test]
+fn client_stream_read_after_renegotiation_refusal() {
+    test_client_stream_read_after_renegotiation_refusal(StreamKind::Ref, ReadKind::Buf);
+    test_client_stream_read_after_renegotiation_refusal(StreamKind::Owned, ReadKind::Buf);
+    test_client_stream_read_after_renegotiation_refusal(StreamKind::Ref, ReadKind::BufRead);
+    test_client_stream_read_after_renegotiation_refusal(StreamKind::Owned, ReadKind::BufRead);
+}
+
+/// Sending the `no_renegotiation` alert must not be mistaken for EOF.
+///
+/// See <https://github.com/rustls/rustls/issues/3304>.
+#[cfg(feature = "tls12")]
+fn test_client_stream_read_after_renegotiation_refusal(
+    stream_kind: StreamKind,
+    read_kind: ReadKind,
+) {
+    let provider = provider::default_provider();
+    let client_config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS12], &provider);
+    let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
+    server_config.enable_secret_extraction = true;
+
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+
+    let mut raw_server = RawTls::new_server(server);
+    let hello_request = raw_server.encrypt(&PlainMessage {
+        typ: ContentType::Handshake,
+        version: ProtocolVersion::TLSv1_2,
+        payload: Payload::new(encoding::handshake_framing(
+            HandshakeType::HelloRequest,
+            vec![],
+        )),
+    });
+
+    let data = b"world";
+    let app_data = raw_server.encrypt(&PlainMessage {
+        typ: ContentType::ApplicationData,
+        version: ProtocolVersion::TLSv1_2,
+        payload: Payload::new(data.to_vec()),
+    });
+
+    // Deliver each record in its own read, followed by EOF, so the alert is
+    // written before any plaintext is available.
+    let mut pipe = TestNonBlockIo {
+        writes: vec![usize::MAX],
+        reads: vec![vec![], app_data, hello_request],
+    };
+
+    let stream: Box<dyn BufRead> = match stream_kind {
+        StreamKind::Ref => Box::new(Stream::new(&mut client, &mut pipe)),
+        StreamKind::Owned => Box::new(StreamOwned::new(client, pipe)),
+    };
+
+    test_stream_read(read_kind, stream, data)
+}
+
+#[test]
+fn stream_flush_would_block_with_pending_output() {
+    let (mut client, mut server) = make_pair(KeyType::Rsa2048, &provider::default_provider());
+    do_handshake(&mut client, &mut server);
+
+    client
+        .writer()
+        .write_all(b"hello")
+        .unwrap();
+    let pending = client
+        .process_new_packets()
+        .unwrap()
+        .tls_bytes_to_write();
+
+    // the transport accepts a single byte, then blocks
+    let mut pipe = TestNonBlockIo {
+        writes: vec![1],
+        reads: vec![],
+    };
+    let mut client_stream = Stream::new(&mut client, &mut pipe);
+
+    assert_eq!(
+        client_stream
+            .flush()
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        client_stream
+            .conn
+            .process_new_packets()
+            .unwrap()
+            .tls_bytes_to_write(),
+        pending - 1
+    );
+
+    client_stream
+        .sock
+        .writes
+        .push(usize::MAX);
+    client_stream.flush().unwrap();
+    assert!(!client_stream.conn.wants_write());
+}
+
+#[test]
+fn stream_flush_retries_failed_transport_flush() {
+    let (mut client, mut server) = make_pair(KeyType::Rsa2048, &provider::default_provider());
+    do_handshake(&mut client, &mut server);
+
+    let mut pipe = FailsFirstFlush::default();
+    let mut client_stream = Stream::new(&mut client, &mut pipe);
+
+    // `write()` hands all TLS output to the transport, but ignores its flush failure
+    assert_eq!(client_stream.write(b"hello").unwrap(), 5);
+    assert!(!client_stream.conn.wants_write());
+    assert!(!client_stream.sock.buffered.is_empty());
+
+    client_stream.flush().unwrap();
+    assert!(client_stream.sock.buffered.is_empty());
+
+    server
+        .read_tls(&mut pipe.flushed.as_slice())
+        .unwrap();
+    server.process_new_packets().unwrap();
+    check_read(&mut server.reader(), b"hello");
+}
+
+/// A buffering transport whose first `flush()` fails
+#[derive(Default)]
+struct FailsFirstFlush {
+    buffered: Vec<u8>,
+    flushed: Vec<u8>,
+    failed: bool,
+}
+
+impl Read for FailsFirstFlush {
+    fn read(&mut self, _b: &mut [u8]) -> io::Result<usize> {
+        Err(io::ErrorKind::WouldBlock.into())
+    }
+}
+
+impl Write for FailsFirstFlush {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.buffered.extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.failed {
+            self.failed = true;
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+
+        self.flushed.append(&mut self.buffered);
+        Ok(())
+    }
+}
+
+/// See <https://github.com/rustls/rustls/issues/3306>.
+#[test]
+fn stream_reports_error_after_write_accepted_plaintext() {
+    let (mut client, mut server) = make_pair(KeyType::Rsa2048, &provider::default_provider());
+    do_handshake(&mut client, &mut server);
+
+    server
+        .writer()
+        .write_all(b"hello")
+        .unwrap();
+    let mut server_output = Vec::new();
+    server
+        .write_tls(&mut server_output)
+        .unwrap();
+    *server_output.last_mut().unwrap() ^= 1;
+
+    // the transport blocks writes, so the first `write()` goes on to read the corrupt record
+    let mut pipe = TestNonBlockIo {
+        writes: vec![],
+        reads: vec![server_output],
+    };
+    let mut client_stream = Stream::new(&mut client, &mut pipe);
+
+    assert_eq!(client_stream.write(b"before").unwrap(), 6);
+
+    // one write for each of the pending records: our data and the fatal alert
+    client_stream
+        .sock
+        .writes
+        .extend([usize::MAX, usize::MAX]);
+    let err = client_stream
+        .write(b"after")
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), Error::DecryptError.to_string());
+    assert!(!client_stream.conn.wants_write());
+
+    let err = client_stream.flush().unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), Error::DecryptError.to_string());
+}
+
+#[test]
+fn stream_write_applies_backpressure_to_received_plaintext() {
+    let (mut client, mut server) = make_pair(KeyType::Rsa2048, &provider::default_provider());
+    do_handshake(&mut client, &mut server);
+
+    // the peer sends several records, but never reads what we send
+    let mut reads = Vec::new();
+    for _ in 0..3 {
+        server
+            .writer()
+            .write_all(b"hello")
+            .unwrap();
+        let mut server_output = Vec::new();
+        server
+            .write_tls(&mut server_output)
+            .unwrap();
+        reads.insert(0, server_output);
+    }
+
+    let mut pipe = TestNonBlockIo {
+        writes: vec![],
+        reads,
+    };
+    let mut client_stream = Stream::new(&mut client, &mut pipe);
+
+    // writing only reads more data while no received plaintext is buffered
+    assert_eq!(client_stream.write(b"world").unwrap(), 5);
+    for _ in 0..5 {
+        assert_eq!(
+            client_stream
+                .write(b"world")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+    assert_eq!(
+        client_stream
+            .conn
+            .process_new_packets()
+            .unwrap()
+            .plaintext_bytes_to_read(),
+        5
+    );
+
+    // buffered plaintext is still readable while writes are blocked
+    for _ in 0..3 {
+        check_read(&mut client_stream, b"hello");
+    }
 }
 
 fn make_disjoint_suite_configs() -> (ClientConfig, ServerConfig) {
@@ -7624,6 +7922,77 @@ fn test_client_fips_service_indicator_includes_ech_hpke_suite() {
     }
 }
 
+#[cfg(feature = "aws_lc_rs")]
+#[test]
+fn test_client_sends_no_application_data_after_ech_rejection() {
+    // The server has no ECH keys, so it rejects ECH and completes the outer handshake
+    // with a certificate that is valid for the ECH config's `public_name` only.
+    let suite = ALL_SUPPORTED_SUITES[0];
+    let (public_key, _) = suite.generate_key_pair().unwrap();
+    let suite_id = suite.suite();
+    let config = EchConfigPayload::V18(EchConfigContents {
+        key_config: HpkeKeyConfig {
+            config_id: 0,
+            kem_id: suite_id.kem,
+            public_key: PayloadU16::new(public_key.0.clone()),
+            symmetric_cipher_suites: vec![HpkeSymmetricCipherSuite {
+                kdf_id: suite_id.sym.kdf_id,
+                aead_id: suite_id.sym.aead_id,
+            }],
+        },
+        maximum_name_length: 0,
+        public_name: DnsName::try_from("testserver.com").unwrap(),
+        extensions: vec![],
+    });
+    let mut config_bytes = Vec::new();
+    vec![config].encode(&mut config_bytes);
+    let ech_config = EchConfig::new(EchConfigListBytes::from(config_bytes), &[suite]).unwrap();
+
+    let provider = provider::default_provider();
+    let client_config = ClientConfig::builder_with_provider(provider.clone().into())
+        .with_ech(EchMode::Enable(ech_config))
+        .unwrap();
+    let client_config = finish_client_config(KeyType::Rsa2048, client_config);
+    let server_config = make_server_config(KeyType::Rsa2048, &provider);
+
+    let mut client =
+        ClientConnection::new(Arc::new(client_config), server_name("private.example")).unwrap();
+    let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+
+    // Application data written before the handshake completes is buffered until then.
+    client
+        .writer()
+        .write_all(b"ech-inner-secret")
+        .unwrap();
+
+    let err = do_handshake_until_error(&mut client, &mut server).unwrap_err();
+    assert!(matches!(
+        err,
+        ErrorFromPeer::Client(Error::PeerIncompatible(
+            PeerIncompatible::ServerRejectedEncryptedClientHello(_)
+        ))
+    ));
+    assert_eq!(client.ech_status(), EchStatus::Rejected);
+
+    // The connection is only authenticated for the `public_name`, so it must not become
+    // usable for application data intended for the inner server name.
+    assert!(client.is_handshaking());
+    assert!(client.refresh_traffic_keys().is_err());
+
+    transfer(&mut client, &mut server);
+    assert_eq!(
+        server
+            .process_new_packets()
+            .unwrap_err(),
+        Error::AlertReceived(AlertDescription::EncryptedClientHelloRequired)
+    );
+    let mut server_received = Vec::new();
+    let _ = server
+        .reader()
+        .read_to_end(&mut server_received);
+    assert!(server_received.is_empty());
+}
+
 #[test]
 fn test_complete_io_errors_if_close_notify_received_too_early() {
     let mut server = ServerConnection::new(Arc::new(make_server_config(
@@ -8039,6 +8408,29 @@ fn test_cert_decompression_by_server_produces_invalid_cert_payload() {
 }
 
 #[test]
+fn test_cert_decompression_by_server_rejects_nonempty_context() {
+    let provider = provider::default_provider();
+    let mut server_config =
+        make_server_config_with_mandatory_client_auth(KeyType::Rsa2048, &provider);
+    server_config.cert_decompressors = vec![&NonEmptyContextDecompressor];
+    let mut client_config = make_client_config_with_auth(KeyType::Rsa2048, &provider);
+    client_config.cert_compressors = vec![&IdentityCompressor];
+
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    assert_eq!(
+        do_handshake_until_error(&mut client, &mut server),
+        Err(ErrorFromPeer::Server(Error::InvalidMessage(
+            InvalidMessage::InvalidCertRequest
+        )))
+    );
+    transfer(&mut server, &mut client);
+    assert_eq!(
+        client.process_new_packets(),
+        Err(Error::AlertReceived(AlertDescription::DecodeError))
+    );
+}
+
+#[test]
 fn test_cert_decompression_by_server_fails() {
     let provider = provider::default_provider();
     let mut server_config =
@@ -8101,6 +8493,37 @@ impl rustls::compress::CertDecompressor for GarbageDecompressor {
         output: &mut [u8],
     ) -> Result<(), rustls::compress::DecompressionFailed> {
         output.fill(0xff);
+        Ok(())
+    }
+
+    fn algorithm(&self) -> rustls::CertificateCompressionAlgorithm {
+        rustls::CertificateCompressionAlgorithm::Zlib
+    }
+}
+
+#[derive(Debug)]
+struct NonEmptyContextDecompressor;
+
+impl rustls::compress::CertDecompressor for NonEmptyContextDecompressor {
+    fn decompress(
+        &self,
+        _input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), rustls::compress::DecompressionFailed> {
+        // Emit a syntactically valid `CertificatePayloadTls13` whose
+        // certificate_request_context is one byte long instead of empty,
+        // followed by a single certificate entry sized to fill `output`.  A
+        // server following RFC 8446 must reject the non-empty context.
+        let Some(cert_len) = output.len().checked_sub(10) else {
+            return Err(rustls::compress::DecompressionFailed);
+        };
+        let mut buf = Vec::with_capacity(output.len());
+        buf.extend_from_slice(&[1, 0]); // certificate_request_context: length 1 (non-empty)
+        buf.extend_from_slice(&((cert_len + 5) as u32).to_be_bytes()[1..]); // certificate_list length (u24)
+        buf.extend_from_slice(&(cert_len as u32).to_be_bytes()[1..]); // cert_data length (u24)
+        buf.resize(buf.len() + cert_len, 0); // cert_data
+        buf.extend_from_slice(&[0, 0]); // per-entry extensions length
+        output.copy_from_slice(&buf);
         Ok(())
     }
 
@@ -8393,11 +8816,14 @@ fn test_automatic_refresh_traffic_keys() {
             server.process_new_packets().unwrap()
         );
 
-        // at CONFIDENTIALITY_LIMIT messages, we also have a key_update message sent
+        // the key_update message takes the last record allowed under the initial key,
+        // so it is sent before the message that would otherwise take that record
         assert_eq!(
             transferred,
             match i {
-                CONFIDENTIALITY_LIMIT => KEY_UPDATE_SIZE + encrypted_size(message.len()),
+                i if i == CONFIDENTIALITY_LIMIT - 1 => {
+                    KEY_UPDATE_SIZE + encrypted_size(message.len())
+                }
                 _ => encrypted_size(message.len()),
             }
         );
@@ -8423,17 +8849,22 @@ fn test_automatic_refresh_traffic_keys() {
     assert_eq!(transferred, KEY_UPDATE_SIZE + encrypted_size(message.len()));
 }
 
-#[cfg(feature = "tls12")]
 #[test]
-fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
-    let provider = aes_128_gcm_with_1024_confidentiality_limit(provider::default_provider());
+fn tls13_keys_are_updated_within_fragmented_write() {
+    // With this maximum fragment size, each record carries 27 bytes of plaintext
+    // and encrypts to 44 bytes, while an encrypted key_update message is 22 bytes.
+    const RECORD_PLAINTEXT_LEN: usize = 27;
+    const KEY_UPDATE_LEN: usize = 22;
 
-    let client_config = finish_client_config(
+    let provider = aes_128_gcm_with_1024_confidentiality_limit(provider::default_provider());
+    let mut client_config = finish_client_config(
         KeyType::Ed25519,
         ClientConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS12])
+            .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap(),
     );
+    client_config.max_fragment_size = Some(32);
+    client_config.enable_secret_extraction = true;
     let server_config = finish_server_config(
         KeyType::Ed25519,
         ServerConfig::builder_with_provider(provider)
@@ -8444,28 +8875,212 @@ fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
     let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
     do_handshake(&mut client, &mut server);
 
+    // A single write of enough records to exhaust the traffic keys twice over.
+    let records = 2 * CONFIDENTIALITY_LIMIT as usize + 1;
+    let payload = vec![0x42; records * RECORD_PLAINTEXT_LEN];
+    client.set_buffer_limit(None);
+    assert_eq!(client.writer().write(&payload).unwrap(), payload.len());
+
+    let mut client_output = Vec::new();
+    while client.wants_write() {
+        client
+            .write_tls(&mut client_output)
+            .unwrap();
+    }
+
+    let mut key_updates = Vec::new();
+    let mut index = 0;
+    let mut wire = client_output.as_slice();
+    while !wire.is_empty() {
+        let len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
+        if len == KEY_UPDATE_LEN {
+            key_updates.push(index);
+        }
+        wire = &wire[5 + len..];
+        index += 1;
+    }
+
+    // Each key_update message takes the last record allowed under the previous keys.
+    let limit = CONFIDENTIALITY_LIMIT as usize;
+    assert_eq!(key_updates, [limit - 1, 2 * limit - 1]);
+    assert_eq!(index, records + 2);
+
+    let mut received = Vec::new();
+    let mut wire = client_output.as_slice();
+    while !wire.is_empty() {
+        server.read_tls(&mut wire).unwrap();
+        let state = server.process_new_packets().unwrap();
+        let mut buf = vec![0u8; state.plaintext_bytes_to_read()];
+        server
+            .reader()
+            .read_exact(&mut buf)
+            .unwrap();
+        received.extend(buf);
+    }
+    assert_eq!(received, payload);
+
+    // The remaining records were encrypted under the newest keys.
+    let secrets = client
+        .dangerous_extract_secrets()
+        .unwrap();
+    assert_eq!(
+        secrets.tx.0,
+        records as u64 - 2 * (CONFIDENTIALITY_LIMIT - 1)
+    );
+}
+
+#[cfg(feature = "tls12")]
+#[test]
+fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
+    let (mut client, mut server) = tls12_pair_with_limited_confidentiality();
+
     for i in 0..CONFIDENTIALITY_LIMIT {
         let message = format!("{i:08}");
         client
             .writer()
             .write_all(message.as_bytes())
             .unwrap();
-        let transferred = transfer(&mut client, &mut server);
-        println!(
-            "{}: {} -> {:?}",
-            i,
-            transferred,
-            server.process_new_packets().unwrap()
-        );
-
-        let mut buf = [0u8; 32];
-        let recvd = server.reader().read(&mut buf).unwrap();
+        let (received, peer_closed) = receive(&mut client, &mut server);
 
         match i {
-            1023 => assert_eq!(recvd, 0),
-            _ => assert_eq!(&buf[..recvd], message.as_bytes()),
+            1023 => {
+                assert!(peer_closed);
+                assert_eq!(received.len(), 0);
+            }
+            _ => {
+                assert!(!peer_closed);
+                assert_eq!(&received, message.as_bytes());
+            }
         }
     }
+}
+
+#[cfg(feature = "tls12")]
+#[test]
+fn tls12_connection_fails_after_alert_at_confidentiality_limit() {
+    let (mut client, mut server) = tls12_pair_with_limited_confidentiality();
+
+    for i in 1..CONFIDENTIALITY_LIMIT {
+        let message = format!("{i:08}");
+        client
+            .writer()
+            .write_all(message.as_bytes())
+            .unwrap();
+        let (received, peer_closed) = receive(&mut client, &mut server);
+        assert!(!peer_closed);
+        assert_eq!(&received, message.as_bytes());
+    }
+
+    // Alerts are not subject to the limit, so the client's rejection of a renegotiation
+    // request takes the last sequence number before it.
+    let mut raw_server = RawTls::new_server(server);
+    let hello_request = PlainMessage {
+        typ: ContentType::Handshake,
+        version: ProtocolVersion::TLSv1_2,
+        payload: Payload::new(encoding::handshake_framing(
+            HandshakeType::HelloRequest,
+            vec![],
+        )),
+    };
+    raw_server.encrypt_and_send(&hello_request, &mut client);
+    client.process_new_packets().unwrap();
+    raw_server.receive_and_decrypt(&mut client, |m| {
+        assert_eq!(
+            format!("{m:?}"),
+            "Message { version: TLSv1_2, payload: Alert(AlertMessagePayload { level: Warning, description: NoRenegotiation }) }"
+        );
+    });
+
+    // No application data may be encrypted with the exhausted key.
+    client
+        .writer()
+        .write_all(b"later")
+        .unwrap();
+    raw_server.receive_and_decrypt(&mut client, |m| {
+        assert_eq!(
+            format!("{m:?}"),
+            "Message { version: TLSv1_2, payload: Alert(AlertMessagePayload { level: Warning, description: CloseNotify }) }"
+        );
+    });
+}
+
+#[cfg(feature = "tls12")]
+#[test]
+fn tls12_write_is_not_split_across_confidentiality_limit() {
+    let (mut client, mut server) = tls12_pair_with_limited_confidentiality();
+
+    // Leave three records before the limit.
+    for i in 1..CONFIDENTIALITY_LIMIT - 3 {
+        let message = format!("{i:08}");
+        client
+            .writer()
+            .write_all(message.as_bytes())
+            .unwrap();
+        let (received, peer_closed) = receive(&mut client, &mut server);
+        assert!(!peer_closed);
+        assert_eq!(&received, message.as_bytes());
+    }
+
+    // A write that fits in the remaining records is sent in full.
+    let two_records = vec![b'a'; MAX_FRAGMENT_LEN + 1];
+    client
+        .writer()
+        .write_all(&two_records)
+        .unwrap();
+    let (received, peer_closed) = receive(&mut client, &mut server);
+    assert!(!peer_closed);
+    assert_eq!(received, two_records);
+
+    // With one record left, none of a two-record write is sent.
+    client
+        .writer()
+        .write_all(&two_records)
+        .unwrap();
+    let (received, peer_closed) = receive(&mut client, &mut server);
+    assert!(peer_closed);
+    assert_eq!(received.len(), 0);
+}
+
+/// Complete a TLS 1.2 handshake using a suite limited to [`CONFIDENTIALITY_LIMIT`] records.
+///
+/// The client's `Finished` message used sequence number 0. The server has secret extraction
+/// enabled.
+#[cfg(feature = "tls12")]
+fn tls12_pair_with_limited_confidentiality() -> (ClientConnection, ServerConnection) {
+    let provider = aes_128_gcm_with_1024_confidentiality_limit(provider::default_provider());
+
+    let client_config = finish_client_config(
+        KeyType::Ed25519,
+        ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap(),
+    );
+    let mut server_config = finish_server_config(
+        KeyType::Ed25519,
+        ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap(),
+    );
+    server_config.enable_secret_extraction = true;
+
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+    (client, server)
+}
+
+/// Deliver the client's pending TLS data to the server.
+///
+/// Returns the application data received, and whether the client has closed.
+#[cfg(feature = "tls12")]
+fn receive(client: &mut ClientConnection, server: &mut ServerConnection) -> (Vec<u8>, bool) {
+    transfer(client, server);
+    let state = server.process_new_packets().unwrap();
+    let mut received = vec![0u8; state.plaintext_bytes_to_read()];
+    server
+        .reader()
+        .read_exact(&mut received)
+        .unwrap();
+    (received, state.peer_has_closed())
 }
 
 #[test]
@@ -8623,6 +9238,10 @@ impl ActiveKeyExchange for FakeHybridActive {
 }
 
 const CONFIDENTIALITY_LIMIT: u64 = 1024;
+
+/// Default maximum plaintext length of a record.
+#[cfg(feature = "tls12")]
+const MAX_FRAGMENT_LEN: usize = 16_384;
 
 #[test]
 fn tls13_ticket_request_new_vs_resumed() {

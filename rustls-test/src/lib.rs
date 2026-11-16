@@ -1025,6 +1025,11 @@ impl io::Write for TestNonBlockIo {
 
 impl Drop for TestNonBlockIo {
     fn drop(&mut self) {
+        // avoid aborting on a double panic, which would hide the original failure
+        if std::thread::panicking() {
+            return;
+        }
+
         // ensure the object was exhausted as expected
         assert!(self.reads.is_empty());
         assert!(self.writes.is_empty());
@@ -1432,12 +1437,16 @@ impl RawTls {
 
         let encrypter = match (tx_keys, suite) {
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls13(tls13),
             ) => tls13.aead_alg.encrypter(key, iv),
 
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls12(tls12),
             ) => tls12
                 .aead_alg
@@ -1448,12 +1457,16 @@ impl RawTls {
 
         let decrypter = match (rx_keys, suite) {
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls13(tls13),
             ) => tls13.aead_alg.decrypter(key, iv),
 
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls12(tls12),
             ) => tls12
                 .aead_alg
@@ -1475,14 +1488,20 @@ impl RawTls {
         msg: &PlainMessage,
         peer: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
     ) {
+        let data = self.encrypt(msg);
+        peer.read_tls(&mut io::Cursor::new(data))
+            .unwrap();
+    }
+
+    /// Encrypt `msg` into a complete TLS record, including its header
+    pub fn encrypt(&mut self, msg: &PlainMessage) -> Vec<u8> {
         let data = self
             .encrypter
             .encrypt(msg.borrow_outbound(), self.enc_seq)
             .unwrap()
             .encode();
         self.enc_seq += 1;
-        peer.read_tls(&mut io::Cursor::new(data))
-            .unwrap();
+        data
     }
 
     pub fn receive_and_decrypt(
